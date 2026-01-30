@@ -573,6 +573,8 @@ func (s *Service) Run(ctx context.Context) error {
 		nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
 		normalizeStrategy := func(strategy string) string {
 			switch strategy {
+			case "quota-aware", "quotaaware", "quota", "qa":
+				return "quota-aware"
 			case "fill-first", "fillfirst", "ff":
 				return "fill-first"
 			default:
@@ -584,6 +586,8 @@ func (s *Service) Run(ctx context.Context) error {
 		if s.coreManager != nil && previousStrategy != nextStrategy {
 			var selector coreauth.Selector
 			switch nextStrategy {
+			case "quota-aware":
+				selector = coreauth.NewQuotaAwareSelector()
 			case "fill-first":
 				selector = &coreauth.FillFirstSelector{}
 			default:

@@ -62,6 +62,19 @@ error-logs-max-files: 10
 # When false, disable in-memory usage statistics aggregation
 usage-statistics-enabled: false
 
+# When true, persist usage statistics to disk and restore them on restart.
+# If you run in Docker, make sure auth-dir (or usage-statistics-file directory) is on a mounted volume.
+usage-statistics-persist: true
+
+# Optional: Path to the JSON file used for persisted usage statistics.
+# If omitted, defaults to "<auth-dir>/usage_stats.json".
+# If relative, it is resolved relative to the config.yaml directory.
+usage-statistics-file: ""
+
+# How often (in seconds) to save usage statistics when persistence is enabled.
+# 0 uses the default interval (60 seconds).
+usage-statistics-save-interval-seconds: 0
+
 # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
 proxy-url: ""
 
@@ -89,7 +102,7 @@ quota-exceeded:
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
-  strategy: "round-robin" # round-robin (default), fill-first
+  strategy: "round-robin" # round-robin (default), fill-first, quota-aware (Codex only)
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false

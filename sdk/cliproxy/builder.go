@@ -213,6 +213,8 @@ func (b *Builder) Build() (*Service, error) {
 		}
 		var selector coreauth.Selector
 		switch strategy {
+		case "quota-aware", "quotaaware", "quota", "qa":
+			selector = coreauth.NewQuotaAwareSelector()
 		case "fill-first", "fillfirst", "ff":
 			selector = &coreauth.FillFirstSelector{}
 		default:
