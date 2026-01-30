@@ -64,6 +64,20 @@ type Config struct {
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
 
+	// UsageStatisticsPersist enables periodic persistence of in-memory usage statistics to disk.
+	// When enabled, the server will restore the persisted snapshot on startup.
+	UsageStatisticsPersist bool `yaml:"usage-statistics-persist" json:"usage-statistics-persist"`
+
+	// UsageStatisticsFile is an optional path to a JSON file where usage statistics snapshots
+	// are stored when UsageStatisticsPersist is enabled. If relative, it is resolved relative
+	// to the directory containing the loaded config file.
+	// If empty and persistence is enabled, the default path is "<auth-dir>/usage_stats.json".
+	UsageStatisticsFile string `yaml:"usage-statistics-file" json:"usage-statistics-file"`
+
+	// UsageStatisticsSaveIntervalSeconds controls how frequently usage snapshots are written to disk.
+	// When set to 0, a default interval is used.
+	UsageStatisticsSaveIntervalSeconds int `yaml:"usage-statistics-save-interval-seconds" json:"usage-statistics-save-interval-seconds"`
+
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
@@ -194,7 +208,7 @@ type QuotaExceeded struct {
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "fill-first".
+	// Supported values: "round-robin" (default), "fill-first", "quota-aware" (Codex only).
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 }
 
@@ -604,6 +618,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.LogsMaxTotalSizeMB = 0
 	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
+	cfg.UsageStatisticsPersist = true
+	cfg.UsageStatisticsFile = ""
+	cfg.UsageStatisticsSaveIntervalSeconds = 0
 	cfg.DisableCooling = false
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr

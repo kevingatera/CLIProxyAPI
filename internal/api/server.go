@@ -144,6 +144,8 @@ type Server struct {
 	requestLogger logging.RequestLogger
 	loggerToggle  func(bool)
 
+	usagePersistence *usage.Persistence
+
 	// configFilePath is the absolute path to the YAML config file for persistence.
 	configFilePath string
 
@@ -274,6 +276,8 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	s.localPassword = optionState.localPassword
 
+	s.configureUsagePersistence(nil, cfg)
+
 	// Setup routes
 	s.setupRoutes()
 
@@ -318,6 +322,89 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 
 	return s
+}
+
+func (s *Server) configureUsagePersistence(oldCfg, newCfg *config.Config) {
+	if s == nil {
+		return
+	}
+	shouldPersist := newCfg != nil && newCfg.UsageStatisticsEnabled && (newCfg.UsageStatisticsPersist || strings.TrimSpace(newCfg.UsageStatisticsFile) != "")
+
+	resolvePath := func() string {
+		if newCfg == nil {
+			return ""
+		}
+		raw := strings.TrimSpace(newCfg.UsageStatisticsFile)
+		if raw == "" {
+			authDir := strings.TrimSpace(newCfg.AuthDir)
+			if authDir == "" {
+				return ""
+			}
+			return filepath.Join(authDir, "usage_stats.json")
+		}
+		if filepath.IsAbs(raw) {
+			return raw
+		}
+		base := filepath.Dir(strings.TrimSpace(s.configFilePath))
+		if base == "" || base == "." {
+			if wd, err := os.Getwd(); err == nil && wd != "" {
+				base = wd
+			}
+		}
+		return filepath.Join(base, raw)
+	}
+
+	desiredPath := ""
+	desiredInterval := 60 * time.Second
+	if newCfg != nil && newCfg.UsageStatisticsSaveIntervalSeconds > 0 {
+		desiredInterval = time.Duration(newCfg.UsageStatisticsSaveIntervalSeconds) * time.Second
+	}
+	if shouldPersist {
+		desiredPath = resolvePath()
+	}
+
+	needsRestart := func() bool {
+		if !shouldPersist {
+			return s.usagePersistence != nil
+		}
+		if s.usagePersistence == nil {
+			return true
+		}
+		if oldCfg == nil {
+			return true
+		}
+		if oldCfg.UsageStatisticsEnabled != newCfg.UsageStatisticsEnabled ||
+			oldCfg.UsageStatisticsPersist != newCfg.UsageStatisticsPersist ||
+			strings.TrimSpace(oldCfg.UsageStatisticsFile) != strings.TrimSpace(newCfg.UsageStatisticsFile) ||
+			oldCfg.UsageStatisticsSaveIntervalSeconds != newCfg.UsageStatisticsSaveIntervalSeconds {
+			return true
+		}
+		return false
+	}
+
+	if !needsRestart() {
+		return
+	}
+
+	if s.usagePersistence != nil {
+		s.usagePersistence.Stop()
+		s.usagePersistence = nil
+	}
+
+	if !shouldPersist || desiredPath == "" {
+		return
+	}
+
+	p := usage.NewPersistence(usage.PersistenceConfig{
+		Stats:    usage.GetRequestStatistics(),
+		Path:     desiredPath,
+		Interval: desiredInterval,
+	})
+	if err := p.Load(); err != nil {
+		log.WithError(err).Warn("usage: failed to load persisted usage statistics")
+	}
+	p.Start()
+	s.usagePersistence = p
 }
 
 // setupRoutes configures the API routes for the server.
@@ -864,6 +951,10 @@ func (s *Server) Stop(ctx context.Context) error {
 		return fmt.Errorf("failed to shutdown HTTP server: %v", err)
 	}
 
+	if s.usagePersistence != nil {
+		s.usagePersistence.Stop()
+	}
+
 	log.Debug("API server stopped")
 	return nil
 }
@@ -938,6 +1029,8 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 			setter.SetErrorLogsMaxFiles(cfg.ErrorLogsMaxFiles)
 		}
 	}
+
+	s.configureUsagePersistence(oldCfg, cfg)
 
 	if oldCfg == nil || oldCfg.DisableCooling != cfg.DisableCooling {
 		auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
