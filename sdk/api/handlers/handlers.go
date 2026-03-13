@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -774,7 +775,98 @@ func statusFromError(err error) int {
 	return 0
 }
 
+func normalizeVariantModelName(modelName string) string {
+	trimmed := strings.TrimSpace(modelName)
+	if trimmed == "" {
+		return modelName
+	}
+	if thinking.ParseSuffix(trimmed).HasSuffix {
+		return trimmed
+	}
+
+	lastSlash := strings.LastIndex(trimmed, "/")
+	if lastSlash <= 0 || lastSlash == len(trimmed)-1 {
+		return trimmed
+	}
+
+	baseModel := strings.TrimSpace(trimmed[:lastSlash])
+	variant := strings.TrimSpace(trimmed[lastSlash+1:])
+	if baseModel == "" || variant == "" {
+		return trimmed
+	}
+
+	if baseModel == "auto" {
+		baseModel = util.ResolveAutoModel("auto")
+	} else if len(util.GetProviderName(baseModel)) == 0 {
+		return trimmed
+	}
+
+	suffix, ok := normalizeVariantSuffix(baseModel, variant)
+	if !ok {
+		return trimmed
+	}
+	return fmt.Sprintf("%s(%s)", baseModel, suffix)
+}
+
+func normalizeVariantSuffix(baseModel, variant string) (string, bool) {
+	trimmed := strings.ToLower(strings.TrimSpace(variant))
+	if trimmed == "" {
+		return "", false
+	}
+
+	if _, ok := thinking.ParseSpecialSuffix(trimmed); ok {
+		return trimmed, true
+	}
+	if _, ok := thinking.ParseLevelSuffix(trimmed); ok {
+		return trimmed, true
+	}
+	if _, ok := thinking.ParseNumericSuffix(trimmed); ok {
+		return trimmed, true
+	}
+	if trimmed != "fast" {
+		return "", false
+	}
+
+	modelInfo := registry.LookupModelInfo(baseModel)
+	if modelInfo == nil || modelInfo.Thinking == nil {
+		return "", false
+	}
+	if suffix, ok := fastestVariantSuffix(modelInfo.Thinking); ok {
+		return suffix, true
+	}
+	return "", false
+}
+
+func fastestVariantSuffix(support *registry.ThinkingSupport) (string, bool) {
+	if support == nil {
+		return "", false
+	}
+
+	levels := make(map[string]struct{}, len(support.Levels))
+	for _, level := range support.Levels {
+		trimmed := strings.ToLower(strings.TrimSpace(level))
+		if trimmed != "" {
+			levels[trimmed] = struct{}{}
+		}
+	}
+
+	for _, candidate := range []string{"minimal", "low", "none", "medium", "high", "xhigh", "max"} {
+		if _, ok := levels[candidate]; ok {
+			return candidate, true
+		}
+	}
+
+	if support.ZeroAllowed {
+		return "none", true
+	}
+	if support.Min > 0 || support.Max > 0 || support.DynamicAllowed {
+		return "low", true
+	}
+	return "", false
+}
+
 func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
+	modelName = normalizeVariantModelName(modelName)
 	resolvedModelName := modelName
 	initialSuffix := thinking.ParseSuffix(modelName)
 	if initialSuffix.ModelName == "auto" {
