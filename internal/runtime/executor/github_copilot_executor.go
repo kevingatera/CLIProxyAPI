@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	copilotauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -521,9 +522,9 @@ func detectLastConversationRole(body []byte) string {
 			}
 
 			switch item.Get("type").String() {
-			case "function_call", "function_call_arguments":
+			case "function_call", "function_call_arguments", "computer_call":
 				return "assistant"
-			case "function_call_output", "function_call_response", "tool_result":
+			case "function_call_output", "function_call_response", "tool_result", "computer_call_output":
 				return "tool"
 			}
 		}
@@ -652,6 +653,7 @@ func normalizeGitHubCopilotChatTools(body []byte) []byte {
 }
 
 func normalizeGitHubCopilotResponsesInput(body []byte) []byte {
+	body = stripGitHubCopilotResponsesUnsupportedFields(body)
 	input := gjson.GetBytes(body, "input")
 	if input.Exists() {
 		// If input is already a string or array, keep it as-is.
@@ -824,6 +826,12 @@ func normalizeGitHubCopilotResponsesInput(body []byte) []byte {
 	return body
 }
 
+func stripGitHubCopilotResponsesUnsupportedFields(body []byte) []byte {
+	// GitHub Copilot /responses rejects service_tier, so always remove it.
+	body, _ = sjson.DeleteBytes(body, "service_tier")
+	return body
+}
+
 func normalizeGitHubCopilotResponsesTools(body []byte) []byte {
 	tools := gjson.GetBytes(body, "tools")
 	if tools.Exists() {
@@ -831,6 +839,10 @@ func normalizeGitHubCopilotResponsesTools(body []byte) []byte {
 		if tools.IsArray() {
 			for _, tool := range tools.Array() {
 				toolType := tool.Get("type").String()
+				if isGitHubCopilotResponsesBuiltinTool(toolType) {
+					filtered, _ = sjson.SetRaw(filtered, "-1", tool.Raw)
+					continue
+				}
 				// Accept OpenAI format (type="function") and Claude format
 				// (no type field, but has top-level name + input_schema).
 				if toolType != "" && toolType != "function" {
@@ -878,6 +890,10 @@ func normalizeGitHubCopilotResponsesTools(body []byte) []byte {
 	}
 	if toolChoice.Type == gjson.JSON {
 		choiceType := toolChoice.Get("type").String()
+		if isGitHubCopilotResponsesBuiltinTool(choiceType) {
+			body, _ = sjson.SetRawBytes(body, "tool_choice", []byte(toolChoice.Raw))
+			return body
+		}
 		if choiceType == "function" {
 			name := toolChoice.Get("name").String()
 			if name == "" {
@@ -893,6 +909,15 @@ func normalizeGitHubCopilotResponsesTools(body []byte) []byte {
 	}
 	body, _ = sjson.SetBytes(body, "tool_choice", "auto")
 	return body
+}
+
+func isGitHubCopilotResponsesBuiltinTool(toolType string) bool {
+	switch strings.TrimSpace(toolType) {
+	case "computer", "computer_use_preview":
+		return true
+	default:
+		return false
+	}
 }
 
 func collectTextFromNode(node gjson.Result) string {
@@ -1263,4 +1288,100 @@ func translateGitHubCopilotResponsesStreamToClaude(line []byte, param *any) []st
 // isHTTPSuccess checks if the status code indicates success (2xx).
 func isHTTPSuccess(statusCode int) bool {
 	return statusCode >= 200 && statusCode < 300
+}
+
+const (
+	// defaultCopilotContextLength is the default context window for unknown Copilot models.
+	defaultCopilotContextLength = 128000
+	// defaultCopilotMaxCompletionTokens is the default max output tokens for unknown Copilot models.
+	defaultCopilotMaxCompletionTokens = 16384
+)
+
+// FetchGitHubCopilotModels dynamically fetches available models from the GitHub Copilot API.
+// It exchanges the GitHub access token stored in auth.Metadata for a Copilot API token,
+// then queries the /models endpoint. Falls back to the static registry on any failure.
+func FetchGitHubCopilotModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.Config) []*registry.ModelInfo {
+	if auth == nil {
+		log.Debug("github-copilot: auth is nil, using static models")
+		return registry.GetGitHubCopilotModels()
+	}
+
+	accessToken := metaStringValue(auth.Metadata, "access_token")
+	if accessToken == "" {
+		log.Debug("github-copilot: no access_token in auth metadata, using static models")
+		return registry.GetGitHubCopilotModels()
+	}
+
+	copilotAuth := copilotauth.NewCopilotAuth(cfg)
+
+	entries, err := copilotAuth.ListModelsWithGitHubToken(ctx, accessToken)
+	if err != nil {
+		log.Warnf("github-copilot: failed to fetch dynamic models: %v, using static models", err)
+		return registry.GetGitHubCopilotModels()
+	}
+
+	if len(entries) == 0 {
+		log.Debug("github-copilot: API returned no models, using static models")
+		return registry.GetGitHubCopilotModels()
+	}
+
+	// Build a lookup from the static definitions so we can enrich dynamic entries
+	// with known context lengths, thinking support, etc.
+	staticMap := make(map[string]*registry.ModelInfo)
+	for _, m := range registry.GetGitHubCopilotModels() {
+		staticMap[m.ID] = m
+	}
+
+	now := time.Now().Unix()
+	models := make([]*registry.ModelInfo, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry.ID == "" {
+			continue
+		}
+		// Deduplicate model IDs to avoid incorrect reference counting.
+		if _, dup := seen[entry.ID]; dup {
+			continue
+		}
+		seen[entry.ID] = struct{}{}
+
+		m := &registry.ModelInfo{
+			ID:      entry.ID,
+			Object:  "model",
+			Created: now,
+			OwnedBy: "github-copilot",
+			Type:    "github-copilot",
+		}
+
+		if entry.Created > 0 {
+			m.Created = entry.Created
+		}
+		if entry.Name != "" {
+			m.DisplayName = entry.Name
+		} else {
+			m.DisplayName = entry.ID
+		}
+
+		// Merge known metadata from the static fallback list
+		if static, ok := staticMap[entry.ID]; ok {
+			if m.DisplayName == entry.ID && static.DisplayName != "" {
+				m.DisplayName = static.DisplayName
+			}
+			m.Description = static.Description
+			m.ContextLength = static.ContextLength
+			m.MaxCompletionTokens = static.MaxCompletionTokens
+			m.SupportedEndpoints = static.SupportedEndpoints
+			m.Thinking = static.Thinking
+		} else {
+			// Sensible defaults for models not in the static list
+			m.Description = entry.ID + " via GitHub Copilot"
+			m.ContextLength = defaultCopilotContextLength
+			m.MaxCompletionTokens = defaultCopilotMaxCompletionTokens
+		}
+
+		models = append(models, m)
+	}
+
+	log.Infof("github-copilot: fetched %d models from API", len(models))
+	return models
 }
