@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -692,17 +693,20 @@ func (h *Handler) authIDForPath(path string) string {
 	if path == "" {
 		return ""
 	}
-	if h == nil || h.cfg == nil {
-		return path
+	id := path
+	if h != nil && h.cfg != nil {
+		authDir := strings.TrimSpace(h.cfg.AuthDir)
+		if authDir != "" {
+			if rel, errRel := filepath.Rel(authDir, path); errRel == nil && rel != "" {
+				id = rel
+			}
+		}
 	}
-	authDir := strings.TrimSpace(h.cfg.AuthDir)
-	if authDir == "" {
-		return path
+	// On Windows, normalize ID casing to avoid duplicate auth entries caused by case-insensitive paths.
+	if runtime.GOOS == "windows" {
+		id = strings.ToLower(id)
 	}
-	if rel, err := filepath.Rel(authDir, path); err == nil && rel != "" {
-		return rel
-	}
-	return path
+	return id
 }
 
 func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []byte) error {
@@ -1302,12 +1306,12 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			projects, errAll := onboardAllGeminiProjects(ctx, gemClient, &ts)
 			if errAll != nil {
 				log.Errorf("Failed to complete Gemini CLI onboarding: %v", errAll)
-				SetOAuthSessionError(state, "Failed to complete Gemini CLI onboarding")
+				SetOAuthSessionError(state, fmt.Sprintf("Failed to complete Gemini CLI onboarding: %v", errAll))
 				return
 			}
 			if errVerify := ensureGeminiProjectsEnabled(ctx, gemClient, projects); errVerify != nil {
 				log.Errorf("Failed to verify Cloud AI API status: %v", errVerify)
-				SetOAuthSessionError(state, "Failed to verify Cloud AI API status")
+				SetOAuthSessionError(state, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errVerify))
 				return
 			}
 			ts.ProjectID = strings.Join(projects, ",")
@@ -1316,7 +1320,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			ts.Auto = false
 			if errSetup := performGeminiCLISetup(ctx, gemClient, &ts, ""); errSetup != nil {
 				log.Errorf("Google One auto-discovery failed: %v", errSetup)
-				SetOAuthSessionError(state, "Google One auto-discovery failed")
+				SetOAuthSessionError(state, fmt.Sprintf("Google One auto-discovery failed: %v", errSetup))
 				return
 			}
 			if strings.TrimSpace(ts.ProjectID) == "" {
@@ -1327,19 +1331,19 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, gemClient, ts.ProjectID)
 			if errCheck != nil {
 				log.Errorf("Failed to verify Cloud AI API status: %v", errCheck)
-				SetOAuthSessionError(state, "Failed to verify Cloud AI API status")
+				SetOAuthSessionError(state, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errCheck))
 				return
 			}
 			ts.Checked = isChecked
 			if !isChecked {
 				log.Error("Cloud AI API is not enabled for the auto-discovered project")
-				SetOAuthSessionError(state, "Cloud AI API not enabled")
+				SetOAuthSessionError(state, fmt.Sprintf("Cloud AI API not enabled for project %s", ts.ProjectID))
 				return
 			}
 		} else {
 			if errEnsure := ensureGeminiProjectAndOnboard(ctx, gemClient, &ts, requestedProjectID); errEnsure != nil {
 				log.Errorf("Failed to complete Gemini CLI onboarding: %v", errEnsure)
-				SetOAuthSessionError(state, "Failed to complete Gemini CLI onboarding")
+				SetOAuthSessionError(state, fmt.Sprintf("Failed to complete Gemini CLI onboarding: %v", errEnsure))
 				return
 			}
 
@@ -1352,13 +1356,13 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, gemClient, ts.ProjectID)
 			if errCheck != nil {
 				log.Errorf("Failed to verify Cloud AI API status: %v", errCheck)
-				SetOAuthSessionError(state, "Failed to verify Cloud AI API status")
+				SetOAuthSessionError(state, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errCheck))
 				return
 			}
 			ts.Checked = isChecked
 			if !isChecked {
 				log.Error("Cloud AI API is not enabled for the selected project")
-				SetOAuthSessionError(state, "Cloud AI API not enabled")
+				SetOAuthSessionError(state, fmt.Sprintf("Cloud AI API not enabled for project %s", ts.ProjectID))
 				return
 			}
 		}
