@@ -325,27 +325,7 @@ func (s *Server) configureUsagePersistence(oldCfg, newCfg *config.Config) {
 	shouldPersist := newCfg != nil && newCfg.UsageStatisticsEnabled && (newCfg.UsageStatisticsPersist || strings.TrimSpace(newCfg.UsageStatisticsFile) != "")
 
 	resolvePath := func() string {
-		if newCfg == nil {
-			return ""
-		}
-		raw := strings.TrimSpace(newCfg.UsageStatisticsFile)
-		if raw == "" {
-			authDir := strings.TrimSpace(newCfg.AuthDir)
-			if authDir == "" {
-				return ""
-			}
-			return filepath.Join(authDir, "usage_stats.json")
-		}
-		if filepath.IsAbs(raw) {
-			return raw
-		}
-		base := filepath.Dir(strings.TrimSpace(s.configFilePath))
-		if base == "" || base == "." {
-			if wd, err := os.Getwd(); err == nil && wd != "" {
-				base = wd
-			}
-		}
-		return filepath.Join(base, raw)
+		return resolveUsageStatisticsPath(newCfg, s.configFilePath)
 	}
 
 	desiredPath := ""
@@ -388,6 +368,11 @@ func (s *Server) configureUsagePersistence(oldCfg, newCfg *config.Config) {
 
 	if !shouldPersist || desiredPath == "" {
 		return
+	}
+	if newCfg != nil && strings.TrimSpace(newCfg.UsageStatisticsFile) == "" {
+		if err := migrateUsageStatisticsFile(resolveLegacyUsageStatisticsPath(newCfg), desiredPath); err != nil {
+			log.WithError(err).Warn("usage: failed to migrate persisted usage statistics")
+		}
 	}
 
 	p := usage.NewPersistence(usage.PersistenceConfig{
