@@ -783,7 +783,7 @@ func (s *Server) serveManagementStaticAsset(c *gin.Context) {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
-	cleanAsset := filepath.Clean(asset)
+	cleanAsset := filepath.Clean(filepath.Join("model-prices", asset))
 	if cleanAsset == "." || cleanAsset == ".." || strings.HasPrefix(cleanAsset, ".."+string(os.PathSeparator)) {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
