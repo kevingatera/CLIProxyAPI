@@ -105,17 +105,45 @@ func (h *Handler) deleteFromStringList(c *gin.Context, target *[]string, after f
 }
 
 // api-keys
-func (h *Handler) GetAPIKeys(c *gin.Context) { c.JSON(200, gin.H{"api-keys": h.cfg.APIKeys}) }
+func (h *Handler) GetAPIKeys(c *gin.Context) {
+	c.JSON(200, gin.H{"api-keys": h.cfg.APIKeys, "api-key-labels": config.NormalizeAPIKeyLabels(h.cfg.APIKeyLabels)})
+}
 func (h *Handler) PutAPIKeys(c *gin.Context) {
 	h.putStringList(c, func(v []string) {
 		h.cfg.APIKeys = append([]string(nil), v...)
-	}, nil)
+	}, h.cfg.PruneAPIKeyLabels)
 }
 func (h *Handler) PatchAPIKeys(c *gin.Context) {
-	h.patchStringList(c, &h.cfg.APIKeys, func() {})
+	h.patchStringList(c, &h.cfg.APIKeys, h.cfg.PruneAPIKeyLabels)
 }
 func (h *Handler) DeleteAPIKeys(c *gin.Context) {
-	h.deleteFromStringList(c, &h.cfg.APIKeys, func() {})
+	h.deleteFromStringList(c, &h.cfg.APIKeys, h.cfg.PruneAPIKeyLabels)
+}
+
+func (h *Handler) GetAPIKeyLabels(c *gin.Context) {
+	c.JSON(200, gin.H{"api-key-labels": config.NormalizeAPIKeyLabels(h.cfg.APIKeyLabels)})
+}
+
+func (h *Handler) PutAPIKeyLabels(c *gin.Context) {
+	data, err := c.GetRawData()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	labels := map[string]string{}
+	if err = json.Unmarshal(data, &labels); err != nil {
+		var body struct {
+			Items map[string]string `json:"items"`
+		}
+		if err2 := json.Unmarshal(data, &body); err2 != nil {
+			c.JSON(400, gin.H{"error": "invalid body"})
+			return
+		}
+		labels = body.Items
+	}
+	h.cfg.APIKeyLabels = config.NormalizeAPIKeyLabels(labels)
+	h.cfg.PruneAPIKeyLabels()
+	h.persist(c)
 }
 
 // gemini-api-key: []GeminiKey
