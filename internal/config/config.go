@@ -656,6 +656,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 
+	// Drop API key labels that no longer correspond to configured proxy auth keys.
+	cfg.PruneAPIKeyLabels()
+
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
 

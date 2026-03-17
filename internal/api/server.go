@@ -391,6 +391,7 @@ func (s *Server) configureUsagePersistence(oldCfg, newCfg *config.Config) {
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/model-prices/*asset", s.serveManagementStaticAsset)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -606,6 +607,11 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)
 		mgmt.PATCH("/api-keys", s.mgmt.PatchAPIKeys)
 		mgmt.DELETE("/api-keys", s.mgmt.DeleteAPIKeys)
+		mgmt.GET("/api-key-labels", s.mgmt.GetAPIKeyLabels)
+		mgmt.PUT("/api-key-labels", s.mgmt.PutAPIKeyLabels)
+		mgmt.GET("/ui-preferences/:key", s.mgmt.GetUIPreference)
+		mgmt.PUT("/ui-preferences/:key", s.mgmt.PutUIPreference)
+		mgmt.DELETE("/ui-preferences/:key", s.mgmt.DeleteUIPreference)
 
 		mgmt.GET("/gemini-api-key", s.mgmt.GetGeminiKeys)
 		mgmt.PUT("/gemini-api-key", s.mgmt.PutGeminiKeys)
@@ -765,6 +771,56 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 			c.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
+	}
+
+	c.File(filePath)
+}
+
+func (s *Server) serveManagementStaticAsset(c *gin.Context) {
+	cfg := s.cfg
+	if cfg == nil || cfg.RemoteManagement.DisableControlPanel {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	asset := strings.TrimSpace(strings.TrimPrefix(c.Param("asset"), "/"))
+	if asset == "" {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	cleanAsset := filepath.Clean(filepath.Join("model-prices", asset))
+	if cleanAsset == "." || cleanAsset == ".." || strings.HasPrefix(cleanAsset, ".."+string(os.PathSeparator)) {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	staticDir := managementasset.StaticDir(s.configFilePath)
+	if strings.TrimSpace(staticDir) == "" {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	baseDir := filepath.Clean(staticDir)
+	filePath := filepath.Join(baseDir, cleanAsset)
+	rel, err := filepath.Rel(baseDir, filePath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	info, err := os.Stat(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
+		log.WithError(err).Error("failed to stat management static asset")
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+	if info.IsDir() {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
 	}
 
 	c.File(filePath)
