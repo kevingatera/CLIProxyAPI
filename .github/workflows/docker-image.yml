@@ -12,6 +12,7 @@ permissions:
 env:
   APP_NAME: CLIProxyAPI
   IMAGE_REPO: ghcr.io/kevingatera/cli-proxy-api
+  VERSION_TAG: ${{ github.ref_name }}
 
 jobs:
   docker_amd64:
@@ -33,7 +34,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Generate Build Metadata
         run: |
-          echo VERSION=`git describe --tags --always --dirty` >> $GITHUB_ENV
+          echo VERSION=${VERSION_TAG} >> $GITHUB_ENV
           echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
           echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
       - name: Build and push (amd64)
@@ -69,7 +70,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Generate Build Metadata
         run: |
-          echo VERSION=`git describe --tags --always --dirty` >> $GITHUB_ENV
+          echo VERSION=${VERSION_TAG} >> $GITHUB_ENV
           echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
           echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
       - name: Build and push (arm64)
@@ -104,16 +105,22 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Generate Build Metadata
         run: |
-          echo VERSION=`git describe --tags --always --dirty` >> $GITHUB_ENV
+          echo VERSION=${VERSION_TAG} >> $GITHUB_ENV
           echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
           echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
       - name: Create and push multi-arch manifests
         run: |
+          docker buildx imagetools inspect "${IMAGE_REPO}:${VERSION}-amd64"
+          docker buildx imagetools inspect "${IMAGE_REPO}:${VERSION}-arm64"
           docker buildx imagetools create \
             --tag "${IMAGE_REPO}:latest" \
             "${IMAGE_REPO}:latest-amd64" \
             "${IMAGE_REPO}:latest-arm64"
           docker buildx imagetools create \
             --tag "${IMAGE_REPO}:${VERSION}" \
+            "${IMAGE_REPO}:${VERSION}-amd64" \
+            "${IMAGE_REPO}:${VERSION}-arm64"
+          docker buildx imagetools create \
+            --tag "${IMAGE_REPO}:homelab" \
             "${IMAGE_REPO}:${VERSION}-amd64" \
             "${IMAGE_REPO}:${VERSION}-arm64"
