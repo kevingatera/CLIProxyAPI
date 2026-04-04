@@ -19,7 +19,10 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 		{ID: "gemini-2.5-flash", Created: now + 25},
 	})
 	modelRegistry.RegisterClient("test-request-details-openai", "openai", []*registry.ModelInfo{
+		{ID: "gpt-5", Created: now + 22, Thinking: &registry.ThinkingSupport{Levels: []string{"minimal", "low", "medium", "high"}}},
 		{ID: "gpt-5.2", Created: now + 20},
+		{ID: "gpt-5.4", Created: now + 18, Thinking: &registry.ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}}},
+		{ID: "team/gpt-5.4", Created: now + 17, Thinking: &registry.ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}}},
 	})
 	modelRegistry.RegisterClient("test-request-details-claude", "claude", []*registry.ModelInfo{
 		{ID: "claude-sonnet-4-5", Created: now + 5},
@@ -59,6 +62,34 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 			inputModel:    "gpt-5.2(high)",
 			wantProviders: []string{"openai"},
 			wantModel:     "gpt-5.2(high)",
+			wantErr:       false,
+		},
+		{
+			name:          "gpt 5.4 resolves without suffix",
+			inputModel:    "gpt-5.4",
+			wantProviders: []string{"openai"},
+			wantModel:     "gpt-5.4",
+			wantErr:       false,
+		},
+		{
+			name:          "slash fast variant maps to fastest supported effort",
+			inputModel:    "gpt-5.4/fast",
+			wantProviders: []string{"openai"},
+			wantModel:     "gpt-5.4(low)",
+			wantErr:       false,
+		},
+		{
+			name:          "slash variant preserves minimal when supported",
+			inputModel:    "gpt-5/fast",
+			wantProviders: []string{"openai"},
+			wantModel:     "gpt-5(minimal)",
+			wantErr:       false,
+		},
+		{
+			name:          "prefixed slash fast variant maps correctly",
+			inputModel:    "team/gpt-5.4/fast",
+			wantProviders: []string{"openai"},
+			wantModel:     "team/gpt-5.4(low)",
 			wantErr:       false,
 		},
 		{
