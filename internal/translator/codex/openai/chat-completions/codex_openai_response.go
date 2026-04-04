@@ -8,6 +8,7 @@ package chat_completions
 import (
 	"bytes"
 	"context"
+	"strings"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -307,15 +308,10 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 					}
 				}
 			case "message":
-				// Extract message content
-				if contentResult := outputItem.Get("content"); contentResult.IsArray() {
-					contentArray := contentResult.Array()
-					for _, contentItem := range contentArray {
-						if contentItem.Get("type").String() == "output_text" {
-							contentText = contentItem.Get("text").String()
-							break
-						}
-					}
+				// Keep the last non-empty assistant message so an empty final_answer
+				// item does not wipe out earlier commentary/tool-planning text.
+				if text := extractCodexMessageText(outputItem); text != "" {
+					contentText = text
 				}
 			case "function_call":
 				// Handle function call content
@@ -373,6 +369,38 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 	}
 
 	return template
+}
+
+func extractCodexMessageText(outputItem gjson.Result) string {
+	content := outputItem.Get("content")
+	if !content.Exists() {
+		return ""
+	}
+
+	if content.IsArray() {
+		var parts []string
+		content.ForEach(func(_, part gjson.Result) bool {
+			if part.Get("type").String() != "output_text" {
+				return true
+			}
+			text := strings.TrimSpace(part.Get("text").String())
+			if text != "" {
+				parts = append(parts, text)
+			}
+			return true
+		})
+		return strings.Join(parts, "\n")
+	}
+
+	if content.IsObject() {
+		text := strings.TrimSpace(content.Get("text").String())
+		if text != "" {
+			return text
+		}
+		return strings.TrimSpace(content.String())
+	}
+
+	return strings.TrimSpace(content.String())
 }
 
 // buildReverseMapFromOriginalOpenAI builds a map of shortened tool name -> original tool name

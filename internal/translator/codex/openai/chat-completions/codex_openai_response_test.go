@@ -45,3 +45,82 @@ func TestConvertCodexResponseToOpenAI_FirstChunkUsesRequestModelName(t *testing.
 		t.Fatalf("expected model %q, got %q", modelName, gotModel)
 	}
 }
+
+func TestConvertCodexResponseToOpenAINonStream_PreservesLastNonEmptyMessage(t *testing.T) {
+	raw := []byte(`{
+		"type":"response.completed",
+		"response":{
+			"id":"resp_123",
+			"created_at":1700000000,
+			"model":"gpt-5.4",
+			"status":"completed",
+			"output":[
+				{
+					"type":"message",
+					"phase":"commentary",
+					"content":[{"type":"output_text","text":"{\"tool\":\"search_entities\"}"}]
+				},
+				{
+					"type":"message",
+					"phase":"final_answer",
+					"content":[{"type":"output_text","text":""}]
+				}
+			]
+		}
+	}`)
+
+	out := ConvertCodexResponseToOpenAINonStream(context.Background(), "gpt-5.4", nil, nil, raw, nil)
+	if got := gjson.Get(out, "choices.0.message.content").String(); got != `{"tool":"search_entities"}` {
+		t.Fatalf("content = %q, want preserved non-empty commentary text", got)
+	}
+}
+
+func TestConvertCodexResponseToOpenAINonStream_JoinsNonEmptyOutputTextParts(t *testing.T) {
+	raw := []byte(`{
+		"type":"response.completed",
+		"response":{
+			"id":"resp_123",
+			"created_at":1700000000,
+			"model":"gpt-5.4",
+			"status":"completed",
+			"output":[
+				{
+					"type":"message",
+					"content":[
+						{"type":"output_text","text":""},
+						{"type":"output_text","text":"first"},
+						{"type":"output_text","text":"second"}
+					]
+				}
+			]
+		}
+	}`)
+
+	out := ConvertCodexResponseToOpenAINonStream(context.Background(), "gpt-5.4", nil, nil, raw, nil)
+	if got := gjson.Get(out, "choices.0.message.content").String(); got != "first\nsecond" {
+		t.Fatalf("content = %q, want joined non-empty text parts", got)
+	}
+}
+
+func TestConvertCodexResponseToOpenAINonStream_AcceptsScalarMessageContent(t *testing.T) {
+	raw := []byte(`{
+		"type":"response.completed",
+		"response":{
+			"id":"resp_123",
+			"created_at":1700000000,
+			"model":"gpt-5.4",
+			"status":"completed",
+			"output":[
+				{
+					"type":"message",
+					"content":"direct scalar content"
+				}
+			]
+		}
+	}`)
+
+	out := ConvertCodexResponseToOpenAINonStream(context.Background(), "gpt-5.4", nil, nil, raw, nil)
+	if got := gjson.Get(out, "choices.0.message.content").String(); got != "direct scalar content" {
+		t.Fatalf("content = %q, want scalar content", got)
+	}
+}

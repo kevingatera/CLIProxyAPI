@@ -4,6 +4,12 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
+import (
+	"fmt"
+	"hash/fnv"
+	"strings"
+)
+
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
@@ -19,6 +25,9 @@ type SDKConfig struct {
 
 	// APIKeys is a list of keys for authenticating clients to this proxy server.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
+
+	// APIKeyLabels stores optional operator-friendly labels keyed by API key fingerprint.
+	APIKeyLabels map[string]string `yaml:"api-key-labels,omitempty" json:"api-key-labels,omitempty"`
 
 	// PassthroughHeaders controls whether upstream response headers are forwarded to downstream clients.
 	// Default is false (disabled).
@@ -42,4 +51,62 @@ type StreamingConfig struct {
 	// to allow auth rotation / transient recovery.
 	// <= 0 disables bootstrap retries. Default is 0.
 	BootstrapRetries int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
+}
+
+// APIKeyFingerprint returns the stable fingerprint used to associate operator-facing metadata with an API key.
+func APIKeyFingerprint(value string) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(value))
+	return fmt.Sprintf("%08x", h.Sum32())
+}
+
+// NormalizeAPIKeyLabels trims and filters API key label entries.
+func NormalizeAPIKeyLabels(labels map[string]string) map[string]string {
+	if len(labels) == 0 {
+		return nil
+	}
+	normalized := make(map[string]string, len(labels))
+	for fingerprint, label := range labels {
+		fingerprint = strings.ToLower(strings.TrimSpace(fingerprint))
+		label = strings.TrimSpace(label)
+		if fingerprint == "" || label == "" {
+			continue
+		}
+		normalized[fingerprint] = label
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+// PruneAPIKeyLabels drops label entries that do not correspond to a current top-level API key.
+func (cfg *SDKConfig) PruneAPIKeyLabels() {
+	if cfg == nil {
+		return
+	}
+	cfg.APIKeyLabels = NormalizeAPIKeyLabels(cfg.APIKeyLabels)
+	if len(cfg.APIKeyLabels) == 0 {
+		cfg.APIKeyLabels = nil
+		return
+	}
+	allowed := make(map[string]struct{}, len(cfg.APIKeys))
+	for _, apiKey := range cfg.APIKeys {
+		trimmed := strings.TrimSpace(apiKey)
+		if trimmed == "" {
+			continue
+		}
+		allowed[APIKeyFingerprint(trimmed)] = struct{}{}
+	}
+	pruned := make(map[string]string, len(cfg.APIKeyLabels))
+	for fingerprint, label := range cfg.APIKeyLabels {
+		if _, ok := allowed[fingerprint]; ok {
+			pruned[fingerprint] = label
+		}
+	}
+	if len(pruned) == 0 {
+		cfg.APIKeyLabels = nil
+		return
+	}
+	cfg.APIKeyLabels = pruned
 }
