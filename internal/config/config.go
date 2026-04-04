@@ -71,7 +71,7 @@ type Config struct {
 	// UsageStatisticsFile is an optional path to a JSON file where usage statistics snapshots
 	// are stored when UsageStatisticsPersist is enabled. If relative, it is resolved relative
 	// to the directory containing the loaded config file.
-	// If empty and persistence is enabled, the default path is "<auth-dir>/usage_stats.json".
+	// If empty and persistence is enabled, the default path is "<logs-dir>/usage_stats.json".
 	UsageStatisticsFile string `yaml:"usage-statistics-file" json:"usage-statistics-file"`
 
 	// UsageStatisticsSaveIntervalSeconds controls how frequently usage snapshots are written to disk.

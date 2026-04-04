@@ -63,11 +63,11 @@ error-logs-max-files: 10
 usage-statistics-enabled: false
 
 # When true, persist usage statistics to disk and restore them on restart.
-# If you run in Docker, make sure auth-dir (or usage-statistics-file directory) is on a mounted volume.
+# If you run in Docker, make sure logs (or usage-statistics-file directory) is on a mounted volume.
 usage-statistics-persist: true
 
 # Optional: Path to the JSON file used for persisted usage statistics.
-# If omitted, defaults to "<auth-dir>/usage_stats.json".
+# If omitted, defaults to "<logs-dir>/usage_stats.json".
 # If relative, it is resolved relative to the config.yaml directory.
 usage-statistics-file: ""
 
