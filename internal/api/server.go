@@ -738,6 +738,20 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		return
 	}
 
+	if managementasset.OverridePath() != "" {
+		if _, err := os.Stat(filePath); err != nil {
+			if os.IsNotExist(err) {
+				c.AbortWithStatus(http.StatusNotFound)
+				return
+			}
+			log.WithError(err).Error("failed to stat overridden management control panel asset")
+			c.AbortWithStatus(http.StatusInternalServerError)
+			return
+		}
+		c.File(filePath)
+		return
+	}
+
 	if _, err := os.Stat(filePath); err != nil {
 		if os.IsNotExist(err) {
 			// Synchronously ensure management.html is available with a detached context.
