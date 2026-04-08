@@ -1,6 +1,7 @@
 package management
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -12,7 +13,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -1785,27 +1788,100 @@ func (h *Handler) RequestCursorToken(c *gin.Context) {
 	state := fmt.Sprintf("cur-%d", time.Now().UnixNano())
 	RegisterOAuthSession(state, "cursor")
 
-	// Cursor login uses cursor-agent local auth flow. We still expose a stateful
-	// management API shape so WebUI can poll status consistently with other providers.
+	cursorPath, errLookup := exec.LookPath("cursor-agent")
+	if errLookup != nil {
+		for _, candidate := range []string{
+			"/usr/local/bin/cursor-agent",
+			"/root/.local/bin/cursor-agent",
+			"/root/.local/bin/agent",
+		} {
+			if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+				cursorPath = candidate
+				errLookup = nil
+				break
+			}
+		}
+	}
+	if errLookup != nil {
+		SetOAuthSessionError(state, "cursor-agent not found in server runtime")
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "cursor-agent not found in server runtime"})
+		return
+	}
+
+	type cursorAuthURL struct {
+		URL string
+	}
+	urlCh := make(chan cursorAuthURL, 1)
+
 	go func() {
+		cmd := exec.CommandContext(ctx, cursorPath, "login")
+		cmd.Env = append(os.Environ(), "NO_OPEN_BROWSER=1")
+
+		stdout, errStdout := cmd.StdoutPipe()
+		if errStdout != nil {
+			SetOAuthSessionError(state, errStdout.Error())
+			return
+		}
+		stderr, errStderr := cmd.StderrPipe()
+		if errStderr != nil {
+			SetOAuthSessionError(state, errStderr.Error())
+			return
+		}
+		if errStart := cmd.Start(); errStart != nil {
+			SetOAuthSessionError(state, errStart.Error())
+			return
+		}
+
+		urlPattern := regexp.MustCompile(`https://[^\s]+`)
+		readAndExtract := func(reader io.Reader) {
+			scanner := bufio.NewScanner(reader)
+			for scanner.Scan() {
+				line := strings.TrimSpace(scanner.Text())
+				if line == "" {
+					continue
+				}
+				if match := urlPattern.FindString(line); match != "" {
+					select {
+					case urlCh <- cursorAuthURL{URL: match}:
+					default:
+					}
+				}
+			}
+		}
+
+		done := make(chan struct{}, 2)
+		go func() { readAndExtract(stdout); done <- struct{}{} }()
+		go func() { readAndExtract(stderr); done <- struct{}{} }()
+		<-done
+		<-done
+
+		if errWait := cmd.Wait(); errWait != nil {
+			SetOAuthSessionError(state, fmt.Sprintf("cursor-agent login failed: %v", errWait))
+			return
+		}
+
 		manager := sdkAuth.NewManager(h.tokenStore, sdkAuth.NewCursorAuthenticator())
 		_, _, err := manager.Login(ctx, "cursor", h.cfg, &sdkAuth.LoginOptions{
-			Metadata: map[string]string{},
+			Metadata: map[string]string{"skip_login": "true"},
 		})
 		if err != nil {
-			SetOAuthSessionError(state, err.Error())
-			log.Errorf("Cursor authentication failed: %v", err)
+			SetOAuthSessionError(state, fmt.Sprintf("cursor auth save failed: %v", err))
 			return
 		}
 		CompleteOAuthSession(state)
 		CompleteOAuthSessionsByProvider("cursor")
 	}()
 
-	c.JSON(http.StatusOK, gin.H{
-		"status": "ok",
-		"url":    "https://cursor.com",
-		"state":  state,
-	})
+	authURL := "https://cursor.com/login"
+	select {
+	case evt := <-urlCh:
+		if u := strings.TrimSpace(evt.URL); u != "" {
+			authURL = u
+		}
+	case <-time.After(5 * time.Second):
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
 func (h *Handler) RequestKimiToken(c *gin.Context) {

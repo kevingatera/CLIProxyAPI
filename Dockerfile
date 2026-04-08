@@ -14,12 +14,16 @@ ARG BUILD_DATE=unknown
 
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" -o ./CLIProxyAPI ./cmd/server/
 
-FROM alpine:3.22.0
+FROM debian:bookworm-slim
 
-RUN apk add --no-cache tzdata bash curl ca-certificates gcompat libstdc++
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tzdata bash curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
 # Install Cursor Agent CLI for cursor-based auth flows in management API.
-RUN curl -fsSL https://cursor.com/install | bash
+RUN curl -fsSL https://cursor.com/install | bash \
+ && ln -sf /root/.local/bin/cursor-agent /usr/local/bin/cursor-agent \
+ && ln -sf /root/.local/bin/agent /usr/local/bin/agent
 
 ENV PATH="/root/.local/bin:${PATH}"
 
@@ -35,6 +39,6 @@ EXPOSE 8317
 
 ENV TZ=Asia/Shanghai
 
-RUN cp /usr/share/zoneinfo/${TZ} /etc/localtime && echo "${TZ}" > /etc/timezone
+RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && echo "${TZ}" > /etc/timezone
 
 CMD ["./CLIProxyAPI"]

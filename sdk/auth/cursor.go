@@ -47,21 +47,33 @@ func (a CursorAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 		opts = &LoginOptions{}
 	}
 
-	cursorAgentPath, err := exec.LookPath("cursor-agent")
+	cursorAgentPath, err := resolveCursorAgentPath()
 	if err != nil {
 		return nil, fmt.Errorf("cursor login requires `cursor-agent` in PATH: %w", err)
 	}
 
-	if opts.NoBrowser {
+	skipLogin := false
+	if opts.Metadata != nil {
+		if v, ok := opts.Metadata["skip_login"]; ok && strings.EqualFold(strings.TrimSpace(v), "true") {
+			skipLogin = true
+		}
+	}
+
+	if opts.NoBrowser && !skipLogin {
 		fmt.Println("`--no-browser` requested: please complete Cursor login manually if browser auto-open is unavailable.")
 	}
 
-	loginCmd := exec.CommandContext(ctx, cursorAgentPath, "login")
-	loginCmd.Stdout = os.Stdout
-	loginCmd.Stderr = os.Stderr
-	loginCmd.Stdin = os.Stdin
-	if err = loginCmd.Run(); err != nil {
-		return nil, fmt.Errorf("cursor-agent login failed: %w", err)
+	if !skipLogin {
+		loginCmd := exec.CommandContext(ctx, cursorAgentPath, "login")
+		loginCmd.Stdout = os.Stdout
+		loginCmd.Stderr = os.Stderr
+		loginCmd.Stdin = os.Stdin
+		if opts.NoBrowser {
+			loginCmd.Env = append(os.Environ(), "NO_OPEN_BROWSER=1")
+		}
+		if err = loginCmd.Run(); err != nil {
+			return nil, fmt.Errorf("cursor-agent login failed: %w", err)
+		}
 	}
 
 	models := fetchCursorModels(ctx, cursorAgentPath)
@@ -110,6 +122,26 @@ func (a CursorAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 		Attributes: attrs,
 		Metadata:   metadata,
 	}, nil
+}
+
+func resolveCursorAgentPath() (string, error) {
+	if path, err := exec.LookPath("cursor-agent"); err == nil {
+		return path, nil
+	}
+	candidates := []string{
+		"/usr/local/bin/cursor-agent",
+		"/root/.local/bin/cursor-agent",
+		"/root/.local/bin/agent",
+	}
+	for _, p := range candidates {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("cursor-agent binary not found")
 }
 
 func resolveCursorBaseURL() string {
