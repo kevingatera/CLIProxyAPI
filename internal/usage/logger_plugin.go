@@ -90,7 +90,9 @@ type modelStats struct {
 // RequestDetail stores the timestamp and token usage for a single request.
 type RequestDetail struct {
 	Timestamp time.Time  `json:"timestamp"`
+	AuthID    string     `json:"auth_id,omitempty"`
 	Source    string     `json:"source"`
+	Provider  string     `json:"provider,omitempty"`
 	AuthIndex string     `json:"auth_index"`
 	Tokens    TokenStats `json:"tokens"`
 	Failed    bool       `json:"failed"`
@@ -198,7 +200,9 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	}
 	s.updateAPIStats(stats, modelName, RequestDetail{
 		Timestamp: timestamp,
+		AuthID:    record.AuthID,
 		Source:    record.Source,
+		Provider:  record.Provider,
 		AuthIndex: record.AuthIndex,
 		Tokens:    detail,
 		Failed:    failed,
@@ -379,11 +383,13 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 	timestamp := detail.Timestamp.UTC().Format(time.RFC3339Nano)
 	tokens := normaliseTokenStats(detail.Tokens)
 	return fmt.Sprintf(
-		"%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d",
+		"%s|%s|%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d",
 		apiName,
 		modelName,
 		timestamp,
+		detail.AuthID,
 		detail.Source,
+		detail.Provider,
 		detail.AuthIndex,
 		detail.Failed,
 		tokens.InputTokens,
