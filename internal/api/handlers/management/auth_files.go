@@ -1778,6 +1778,36 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
+func (h *Handler) RequestCursorToken(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	state := fmt.Sprintf("cur-%d", time.Now().UnixNano())
+	RegisterOAuthSession(state, "cursor")
+
+	// Cursor login uses cursor-agent local auth flow. We still expose a stateful
+	// management API shape so WebUI can poll status consistently with other providers.
+	go func() {
+		manager := sdkAuth.NewManager(h.tokenStore, sdkAuth.NewCursorAuthenticator())
+		_, _, err := manager.Login(ctx, "cursor", h.cfg, &sdkAuth.LoginOptions{
+			Metadata: map[string]string{},
+		})
+		if err != nil {
+			SetOAuthSessionError(state, err.Error())
+			log.Errorf("Cursor authentication failed: %v", err)
+			return
+		}
+		CompleteOAuthSession(state)
+		CompleteOAuthSessionsByProvider("cursor")
+	}()
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "ok",
+		"url":    "https://cursor.com",
+		"state":  state,
+	})
+}
+
 func (h *Handler) RequestKimiToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)

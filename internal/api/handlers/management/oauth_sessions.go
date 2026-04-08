@@ -223,6 +223,8 @@ func NormalizeOAuthProvider(provider string) (string, error) {
 		return "anthropic", nil
 	case "codex", "openai":
 		return "codex", nil
+	case "cursor":
+		return "cursor", nil
 	case "gemini", "google":
 		return "gemini", nil
 	case "iflow", "i-flow":
