@@ -764,11 +764,21 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 		"path":   path,
 		"source": path,
 	}
+	prefix := ""
+	if rawPrefix, ok := metadata["prefix"].(string); ok {
+		prefix = strings.TrimSpace(rawPrefix)
+	}
+	proxyURL := ""
+	if rawProxyURL, ok := metadata["proxy_url"].(string); ok {
+		proxyURL = strings.TrimSpace(rawProxyURL)
+	}
 	auth := &coreauth.Auth{
 		ID:         authID,
 		Provider:   provider,
 		FileName:   filepath.Base(path),
 		Label:      label,
+		Prefix:     prefix,
+		ProxyURL:   proxyURL,
 		Status:     coreauth.StatusActive,
 		Attributes: attr,
 		Metadata:   metadata,

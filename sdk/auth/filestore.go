@@ -79,6 +79,16 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 			return "", err
 		}
 	case auth.Metadata != nil:
+		if trimmedPrefix := strings.TrimSpace(auth.Prefix); trimmedPrefix != "" {
+			auth.Metadata["prefix"] = trimmedPrefix
+		} else {
+			delete(auth.Metadata, "prefix")
+		}
+		if trimmedProxyURL := strings.TrimSpace(auth.ProxyURL); trimmedProxyURL != "" {
+			auth.Metadata["proxy_url"] = trimmedProxyURL
+		} else {
+			delete(auth.Metadata, "proxy_url")
+		}
 		auth.Metadata["disabled"] = auth.Disabled
 		raw, errMarshal := json.Marshal(auth.Metadata)
 		if errMarshal != nil {
@@ -250,6 +260,12 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 		UpdatedAt:        info.ModTime(),
 		LastRefreshedAt:  time.Time{},
 		NextRefreshAfter: time.Time{},
+	}
+	if rawPrefix, ok := metadata["prefix"].(string); ok {
+		auth.Prefix = strings.TrimSpace(rawPrefix)
+	}
+	if rawProxyURL, ok := metadata["proxy_url"].(string); ok {
+		auth.ProxyURL = strings.TrimSpace(rawProxyURL)
 	}
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		auth.Attributes["email"] = email

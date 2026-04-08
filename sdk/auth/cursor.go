@@ -87,6 +87,7 @@ func (a CursorAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 		"type":         "cursor",
 		"provider_key": "cursor",
 		"compat_name":  "cursor",
+		"prefix":       "cursor",
 		"base_url":     baseURL,
 		"timestamp":    now.UnixMilli(),
 	}
