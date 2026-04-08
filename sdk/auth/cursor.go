@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -198,7 +199,7 @@ func parseCursorModelsOutput(raw []byte) []string {
 	out := make([]string, 0, len(lines))
 	seen := make(map[string]struct{}, len(lines))
 	for _, line := range lines {
-		val := strings.TrimSpace(line)
+		val := sanitizeCursorModelLine(line)
 		if val == "" {
 			continue
 		}
@@ -208,9 +209,7 @@ func parseCursorModelsOutput(raw []byte) []string {
 				val = strings.TrimSpace(parts[1])
 			}
 		}
-		if val == "" {
-			continue
-		}
+		val = sanitizeCursorModelLine(val)
 		key := strings.ToLower(val)
 		if _, ok := seen[key]; ok {
 			continue
@@ -231,19 +230,19 @@ func normalizeCursorModelEntries(entries []any) []string {
 		val := ""
 		switch v := entry.(type) {
 		case string:
-			val = strings.TrimSpace(v)
+			val = sanitizeCursorModelLine(v)
 		case map[string]any:
 			if id, ok := v["id"].(string); ok {
-				val = strings.TrimSpace(id)
+				val = sanitizeCursorModelLine(id)
 			}
 			if val == "" {
 				if name, ok := v["name"].(string); ok {
-					val = strings.TrimSpace(name)
+					val = sanitizeCursorModelLine(name)
 				}
 			}
 			if val == "" {
 				if model, ok := v["model"].(string); ok {
-					val = strings.TrimSpace(model)
+					val = sanitizeCursorModelLine(model)
 				}
 			}
 		}
@@ -258,4 +257,27 @@ func normalizeCursorModelEntries(entries []any) []string {
 		out = append(out, val)
 	}
 	return out
+}
+
+var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
+
+func sanitizeCursorModelLine(line string) string {
+	val := strings.TrimSpace(ansiEscapeRE.ReplaceAllString(line, ""))
+	if val == "" {
+		return ""
+	}
+	lower := strings.ToLower(val)
+	if strings.HasPrefix(lower, "loading models") ||
+		strings.HasPrefix(lower, "available models") ||
+		strings.HasPrefix(lower, "tip:") {
+		return ""
+	}
+	// Cursor CLI output is often "<id> - <display label>".
+	if parts := strings.SplitN(val, " - ", 2); len(parts) == 2 {
+		val = strings.TrimSpace(parts[0])
+	}
+	// Remove common suffix decorations while keeping model id stable.
+	val = strings.TrimSuffix(val, "(default)")
+	val = strings.TrimSpace(val)
+	return val
 }

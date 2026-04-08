@@ -1015,6 +1015,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 
 func cursorModelsFromAuthMetadata(metadata map[string]any) []*ModelInfo {
 	modelIDs := extractModelIDsFromMetadata(metadata, "models")
+	modelIDs = sanitizeCursorModelIDs(modelIDs)
 	if len(modelIDs) == 0 {
 		modelIDs = defaultCursorModelIDs()
 	}
@@ -1035,6 +1036,41 @@ func cursorModelsFromAuthMetadata(metadata map[string]any) []*ModelInfo {
 			UserDefined: false,
 			Thinking:    &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}},
 		})
+	}
+	return out
+}
+
+func sanitizeCursorModelIDs(modelIDs []string) []string {
+	if len(modelIDs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(modelIDs))
+	seen := make(map[string]struct{}, len(modelIDs))
+	for _, raw := range modelIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		lower := strings.ToLower(id)
+		if strings.HasPrefix(lower, "loading models") ||
+			strings.HasPrefix(lower, "available models") ||
+			strings.HasPrefix(lower, "tip:") {
+			continue
+		}
+		if parts := strings.SplitN(id, " - ", 2); len(parts) == 2 {
+			id = strings.TrimSpace(parts[0])
+		}
+		id = strings.TrimSuffix(id, "(default)")
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		key := strings.ToLower(id)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, id)
 	}
 	return out
 }
