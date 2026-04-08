@@ -64,6 +64,8 @@ var (
 	callbackForwarders   = make(map[int]*callbackForwarder)
 )
 
+var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
+
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
 	if len(meta) == 0 {
 		return time.Time{}, false
@@ -1832,18 +1834,49 @@ func (h *Handler) RequestCursorToken(c *gin.Context) {
 			return
 		}
 
-		urlPattern := regexp.MustCompile(`https://[^\s]+`)
+		emitURL := func(candidate string) {
+			candidate = strings.TrimSpace(candidate)
+			if candidate == "" {
+				return
+			}
+			select {
+			case urlCh <- cursorAuthURL{URL: candidate}:
+			default:
+			}
+		}
+
+		sanitize := func(line string) string {
+			clean := ansiEscapeRE.ReplaceAllString(line, "")
+			return strings.TrimSpace(clean)
+		}
+
+		var pendingURL string
 		readAndExtract := func(reader io.Reader) {
 			scanner := bufio.NewScanner(reader)
 			for scanner.Scan() {
-				line := strings.TrimSpace(scanner.Text())
+				line := sanitize(scanner.Text())
 				if line == "" {
 					continue
 				}
-				if match := urlPattern.FindString(line); match != "" {
-					select {
-					case urlCh <- cursorAuthURL{URL: match}:
-					default:
+
+				// Cursor prints wrapped auth URLs across lines; reconstruct until we
+				// see the known end marker.
+				if idx := strings.Index(line, "https://cursor.com/loginDeepControl?"); idx >= 0 {
+					pendingURL = line[idx:]
+					compact := strings.Join(strings.Fields(pendingURL), "")
+					if strings.Contains(compact, "redirectTarget=cli") {
+						emitURL(compact)
+						pendingURL = ""
+					}
+					continue
+				}
+
+				if pendingURL != "" {
+					pendingURL += line
+					compact := strings.Join(strings.Fields(pendingURL), "")
+					if strings.Contains(compact, "redirectTarget=cli") {
+						emitURL(compact)
+						pendingURL = ""
 					}
 				}
 			}
