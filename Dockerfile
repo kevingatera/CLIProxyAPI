@@ -16,7 +16,12 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X 'main.Version=${VERSION
 
 FROM alpine:3.22.0
 
-RUN apk add --no-cache tzdata
+RUN apk add --no-cache tzdata bash curl ca-certificates gcompat libstdc++
+
+# Install Cursor Agent CLI for cursor-based auth flows in management API.
+RUN curl -fsSL https://cursor.com/install | bash
+
+ENV PATH="/root/.local/bin:${PATH}"
 
 RUN mkdir /CLIProxyAPI
 
