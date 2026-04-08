@@ -1,6 +1,10 @@
 package cliproxy
 
-import "testing"
+import (
+	"testing"
+
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+)
 
 func TestCursorModelsFromAuthMetadata_UsesMetadataModels(t *testing.T) {
 	models := cursorModelsFromAuthMetadata(map[string]any{
@@ -28,5 +32,19 @@ func TestCursorModelsFromAuthMetadata_FallsBackToDefaults(t *testing.T) {
 	}
 	if !foundAuto {
 		t.Fatal("expected default cursor models to include auto")
+	}
+}
+
+func TestOpenAICompatInfoFromAuth_CursorProviderIsNotTreatedAsCompat(t *testing.T) {
+	auth := &coreauth.Auth{
+		Provider: "cursor",
+		Attributes: map[string]string{
+			"provider_key": "cursor",
+			"compat_name":  "cursor",
+		},
+	}
+	providerKey, compatName, ok := openAICompatInfoFromAuth(auth)
+	if ok || providerKey != "" || compatName != "" {
+		t.Fatalf("expected cursor auth to stay native, got provider=%q compat=%q ok=%v", providerKey, compatName, ok)
 	}
 }

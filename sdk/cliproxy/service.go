@@ -351,6 +351,13 @@ func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName 
 	if a == nil {
 		return "", "", false
 	}
+	provider := strings.ToLower(strings.TrimSpace(a.Provider))
+	// Cursor is a first-class native provider in cliproxy even though its auth
+	// payload carries compat_name/provider_key metadata for downstream proxying.
+	// Do not reinterpret it as generic openai-compatibility.
+	if provider == "cursor" {
+		return "", "", false
+	}
 	if len(a.Attributes) > 0 {
 		providerKey = strings.TrimSpace(a.Attributes["provider_key"])
 		compatName = strings.TrimSpace(a.Attributes["compat_name"])
@@ -361,7 +368,7 @@ func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName 
 			return strings.ToLower(providerKey), compatName, true
 		}
 	}
-	if strings.EqualFold(strings.TrimSpace(a.Provider), "openai-compatibility") {
+	if provider == "openai-compatibility" {
 		return "openai-compatibility", strings.TrimSpace(a.Label), true
 	}
 	return "", "", false
