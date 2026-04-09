@@ -270,6 +270,7 @@ func runCursorAgent(ctx context.Context, model, prompt string) (cursorRunResult,
 		"--print",
 		"--output-format", "json",
 		"--mode", "ask",
+		"--trust",
 		"--model", model,
 		prompt,
 	}
