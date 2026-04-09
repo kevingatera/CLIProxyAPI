@@ -434,7 +434,7 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
 	case "cursor":
-		s.coreManager.RegisterExecutor(executor.NewOpenAICompatExecutor("cursor", s.cfg))
+		s.coreManager.RegisterExecutor(executor.NewCursorExecutor(s.cfg))
 	default:
 		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
 		if providerKey == "" {
@@ -1013,7 +1013,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		if key == "" {
 			key = strings.ToLower(strings.TrimSpace(a.Provider))
 		}
-		s.registerResolvedModelsForAuth(a, key, applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
+		s.registerResolvedModelsForAuth(a, key, applyModelPrefixes(models, a.Prefix, forceModelPrefixForProvider(key, s.cfg != nil && s.cfg.ForceModelPrefix)))
 		return
 	}
 
@@ -1404,6 +1404,13 @@ func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix boo
 		addModel(&clone)
 	}
 	return out
+}
+
+func forceModelPrefixForProvider(provider string, globalForce bool) bool {
+	if globalForce {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(provider), "cursor")
 }
 
 // matchWildcard performs case-insensitive wildcard matching where '*' matches any substring.

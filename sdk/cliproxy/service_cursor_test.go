@@ -48,3 +48,15 @@ func TestOpenAICompatInfoFromAuth_CursorProviderIsNotTreatedAsCompat(t *testing.
 		t.Fatalf("expected cursor auth to stay native, got provider=%q compat=%q ok=%v", providerKey, compatName, ok)
 	}
 }
+
+func TestForceModelPrefixForProvider_CursorAlwaysForced(t *testing.T) {
+	if !forceModelPrefixForProvider("cursor", false) {
+		t.Fatal("expected cursor model prefix forcing to be enabled")
+	}
+	if forceModelPrefixForProvider("codex", false) {
+		t.Fatal("expected non-cursor providers to follow global setting")
+	}
+	if !forceModelPrefixForProvider("codex", true) {
+		t.Fatal("expected global force flag to force all providers")
+	}
+}
