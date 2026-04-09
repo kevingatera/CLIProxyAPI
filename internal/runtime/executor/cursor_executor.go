@@ -5,8 +5,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -25,10 +28,16 @@ import (
 
 // CursorExecutor executes requests through cursor-agent CLI.
 type CursorExecutor struct {
-	cfg *config.Config
+	cfg    *config.Config
+	compat *OpenAICompatExecutor
 }
 
-func NewCursorExecutor(cfg *config.Config) *CursorExecutor { return &CursorExecutor{cfg: cfg} }
+func NewCursorExecutor(cfg *config.Config) *CursorExecutor {
+	return &CursorExecutor{
+		cfg:    cfg,
+		compat: NewOpenAICompatExecutor("cursor", cfg),
+	}
+}
 
 func (e *CursorExecutor) Identifier() string { return "cursor" }
 
@@ -67,6 +76,21 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	model := cursorProviderModelID(thinking.ParseSuffix(req.Model).ModelName)
 	if model == "" {
 		model = "auto"
+	}
+	canonicalModel := cursorCanonicalRequestModel(req.Model)
+
+	if e.shouldTryCursorACP(auth) {
+		compatReq := req
+		compatReq.Model = canonicalModel
+		if e.cursorACPReachable(ctx, auth) {
+			compatResp, compatErr := e.compat.Execute(ctx, auth, compatReq, opts)
+			if compatErr == nil {
+				return compatResp, nil
+			}
+			if !shouldFallbackToCursorAgent(compatErr) {
+				return resp, compatErr
+			}
+		}
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), model, auth)
@@ -122,6 +146,21 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	model := cursorProviderModelID(thinking.ParseSuffix(req.Model).ModelName)
 	if model == "" {
 		model = "auto"
+	}
+	canonicalModel := cursorCanonicalRequestModel(req.Model)
+
+	if e.shouldTryCursorACP(auth) {
+		compatReq := req
+		compatReq.Model = canonicalModel
+		if e.cursorACPReachable(ctx, auth) {
+			compatStream, compatErr := e.compat.ExecuteStream(ctx, auth, compatReq, opts)
+			if compatErr == nil {
+				return compatStream, nil
+			}
+			if !shouldFallbackToCursorAgent(compatErr) {
+				return nil, compatErr
+			}
+		}
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), model, auth)
@@ -552,4 +591,110 @@ func cursorTotalTokens(detail usage.Detail) int64 {
 		return detail.TotalTokens
 	}
 	return detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
+}
+
+func cursorCanonicalRequestModel(model string) string {
+	parsed := thinking.ParseSuffix(strings.TrimSpace(model))
+	base := cursorProviderModelID(parsed.ModelName)
+	if base == "" {
+		base = "auto"
+	}
+	if parsed.HasSuffix && strings.TrimSpace(parsed.RawSuffix) != "" {
+		return base + "(" + strings.TrimSpace(parsed.RawSuffix) + ")"
+	}
+	return base
+}
+
+func (e *CursorExecutor) shouldTryCursorACP(auth *cliproxyauth.Auth) bool {
+	if e == nil || e.compat == nil {
+		return false
+	}
+	return cursorACPBaseURL(auth) != ""
+}
+
+func cursorACPBaseURL(auth *cliproxyauth.Auth) string {
+	if auth == nil || auth.Attributes == nil {
+		return ""
+	}
+	return strings.TrimSpace(auth.Attributes["base_url"])
+}
+
+func (e *CursorExecutor) cursorACPReachable(ctx context.Context, auth *cliproxyauth.Auth) bool {
+	baseURL := cursorACPBaseURL(auth)
+	if baseURL == "" {
+		return false
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil || strings.TrimSpace(parsed.Host) == "" {
+		return false
+	}
+	hostPort := strings.TrimSpace(parsed.Host)
+	if !strings.Contains(hostPort, ":") {
+		switch strings.ToLower(strings.TrimSpace(parsed.Scheme)) {
+		case "https":
+			hostPort += ":443"
+		default:
+			hostPort += ":80"
+		}
+	}
+	timeout := 150 * time.Millisecond
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		if remaining < timeout {
+			timeout = remaining
+		}
+	}
+	if timeout <= 0 {
+		return false
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	dialer := &net.Dialer{}
+	conn, err := dialer.DialContext(probeCtx, "tcp", hostPort)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func shouldFallbackToCursorAgent(err error) bool {
+	if err == nil {
+		return false
+	}
+	var status statusErr
+	if errors.As(err, &status) {
+		switch status.StatusCode() {
+		case http.StatusUnauthorized,
+			http.StatusForbidden,
+			http.StatusNotFound,
+			http.StatusRequestTimeout,
+			http.StatusTooManyRequests,
+			http.StatusInternalServerError,
+			http.StatusBadGateway,
+			http.StatusServiceUnavailable,
+			http.StatusGatewayTimeout:
+			return true
+		default:
+			return false
+		}
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	lower := strings.ToLower(strings.TrimSpace(err.Error()))
+	if lower == "" {
+		return false
+	}
+	return strings.Contains(lower, "connection refused") ||
+		strings.Contains(lower, "connect: cannot assign requested address") ||
+		strings.Contains(lower, "no such host") ||
+		strings.Contains(lower, "network is unreachable") ||
+		strings.Contains(lower, "context deadline exceeded") ||
+		strings.Contains(lower, "timeout") ||
+		strings.Contains(lower, "eof")
 }
