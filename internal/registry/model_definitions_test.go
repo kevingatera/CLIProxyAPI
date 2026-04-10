@@ -2,24 +2,38 @@ package registry
 
 import "testing"
 
-func TestCodexTeamModelsIncludeGPT54(t *testing.T) {
-	models := GetCodexTeamModels()
-	if !containsModelID(models, "gpt-5.4") {
-		t.Fatal("expected codex team models to include gpt-5.4")
+func TestCodexTierModelsIncludeMini(t *testing.T) {
+	tests := []struct {
+		name   string
+		models []*ModelInfo
+	}{
+		{name: "free", models: GetCodexFreeModels()},
+		{name: "team", models: GetCodexTeamModels()},
+		{name: "plus", models: GetCodexPlusModels()},
+		{name: "pro", models: GetCodexProModels()},
+	}
+
+	for _, tc := range tests {
+		if !containsModelID(tc.models, "gpt-5.4-mini") {
+			t.Fatalf("expected codex %s models to include gpt-5.4-mini", tc.name)
+		}
 	}
 }
 
-func TestCodexPlusModelsIncludeGPT54(t *testing.T) {
-	models := GetCodexPlusModels()
-	if !containsModelID(models, "gpt-5.4") {
-		t.Fatal("expected codex plus models to include gpt-5.4")
+func TestCodexPaidTiersIncludeGPT54(t *testing.T) {
+	tests := []struct {
+		name   string
+		models []*ModelInfo
+	}{
+		{name: "team", models: GetCodexTeamModels()},
+		{name: "plus", models: GetCodexPlusModels()},
+		{name: "pro", models: GetCodexProModels()},
 	}
-}
 
-func TestCodexProModelsIncludeGPT54(t *testing.T) {
-	models := GetCodexProModels()
-	if !containsModelID(models, "gpt-5.4") {
-		t.Fatal("expected codex pro models to include gpt-5.4")
+	for _, tc := range tests {
+		if !containsModelID(tc.models, "gpt-5.4") {
+			t.Fatalf("expected codex %s models to include gpt-5.4", tc.name)
+		}
 	}
 }
 
