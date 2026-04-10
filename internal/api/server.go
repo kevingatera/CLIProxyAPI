@@ -402,6 +402,17 @@ func (s *Server) setupRoutes() {
 	v1 := s.engine.Group("/v1")
 	v1.Use(AuthMiddleware(s.accessManager))
 	{
+		v1.GET("", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{
+				"message": "CLI Proxy API v1",
+				"endpoints": []string{
+					"GET /v1/models",
+					"POST /v1/chat/completions",
+					"POST /v1/completions",
+					"POST /v1/responses",
+				},
+			})
+		})
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
 		v1.POST("/completions", openaiHandlers.Completions)
