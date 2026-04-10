@@ -157,6 +157,12 @@ type Manager struct {
 	// It is initialized in NewManager; never Load() before first Store().
 	runtimeConfig atomic.Value
 
+	// routing trace ring buffer for management observability endpoints.
+	routingTraceMu sync.Mutex
+	routingTraces  []RoutingTrace
+	// routingTraceLimit is stored atomically to allow lock-free reads in hot paths.
+	routingTraceLimit atomic.Int32
+
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
 
@@ -187,6 +193,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
+	manager.setRoutingTraceLimitFromConfig(nil)
 	return manager
 }
 
@@ -274,6 +281,7 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	}
 	m.runtimeConfig.Store(cfg)
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	m.setRoutingTraceLimitFromConfig(cfg)
 }
 
 func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string) string {
@@ -886,27 +894,45 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	plan := m.buildRoutingExecutionPlan(normalized, req.Model, opts)
+	trace := m.newRoutingTraceRuntime("execute", req.Model, normalized, plan)
+	var (
+		finalStatus = "failed"
+		stopReason  = "unknown"
+		finalErr    error
+	)
+	defer func() {
+		m.finalizeRoutingTrace(trace, finalStatus, stopReason, finalErr)
+	}()
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 
 	var lastErr error
 	for attempt := 0; ; attempt++ {
-		resp, errExec := m.executeMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
+		resp, errExec := m.executeMixedOnce(ctx, plan, req, opts, maxRetryCredentials, trace)
 		if errExec == nil {
+			finalStatus = "success"
+			stopReason = "completed"
 			return resp, nil
 		}
 		lastErr = errExec
-		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, req.Model, maxWait)
+		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, plan.OrderedProviders, req.Model, maxWait)
 		if !shouldRetry {
 			break
 		}
 		if errWait := waitForCooldown(ctx, wait); errWait != nil {
+			finalErr = errWait
+			stopReason = "cooldown_wait_interrupted"
 			return cliproxyexecutor.Response{}, errWait
 		}
 	}
 	if lastErr != nil {
+		finalErr = lastErr
+		stopReason = "terminal_error"
 		return cliproxyexecutor.Response{}, lastErr
 	}
+	finalErr = &Error{Code: "auth_not_found", Message: "no auth available"}
+	stopReason = "no_auth_available"
 	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
 
@@ -917,27 +943,45 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	plan := m.buildRoutingExecutionPlan(normalized, req.Model, opts)
+	trace := m.newRoutingTraceRuntime("count_tokens", req.Model, normalized, plan)
+	var (
+		finalStatus = "failed"
+		stopReason  = "unknown"
+		finalErr    error
+	)
+	defer func() {
+		m.finalizeRoutingTrace(trace, finalStatus, stopReason, finalErr)
+	}()
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 
 	var lastErr error
 	for attempt := 0; ; attempt++ {
-		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
+		resp, errExec := m.executeCountMixedOnce(ctx, plan, req, opts, maxRetryCredentials, trace)
 		if errExec == nil {
+			finalStatus = "success"
+			stopReason = "completed"
 			return resp, nil
 		}
 		lastErr = errExec
-		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, req.Model, maxWait)
+		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, plan.OrderedProviders, req.Model, maxWait)
 		if !shouldRetry {
 			break
 		}
 		if errWait := waitForCooldown(ctx, wait); errWait != nil {
+			finalErr = errWait
+			stopReason = "cooldown_wait_interrupted"
 			return cliproxyexecutor.Response{}, errWait
 		}
 	}
 	if lastErr != nil {
+		finalErr = lastErr
+		stopReason = "terminal_error"
 		return cliproxyexecutor.Response{}, lastErr
 	}
+	finalErr = &Error{Code: "auth_not_found", Message: "no auth available"}
+	stopReason = "no_auth_available"
 	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
 
@@ -948,31 +992,50 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	plan := m.buildRoutingExecutionPlan(normalized, req.Model, opts)
+	trace := m.newRoutingTraceRuntime("stream", req.Model, normalized, plan)
+	var (
+		finalStatus = "failed"
+		stopReason  = "unknown"
+		finalErr    error
+	)
+	defer func() {
+		m.finalizeRoutingTrace(trace, finalStatus, stopReason, finalErr)
+	}()
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 
 	var lastErr error
 	for attempt := 0; ; attempt++ {
-		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
+		result, errStream := m.executeStreamMixedOnce(ctx, plan, req, opts, maxRetryCredentials, trace)
 		if errStream == nil {
+			finalStatus = "success"
+			stopReason = "completed"
 			return result, nil
 		}
 		lastErr = errStream
-		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, normalized, req.Model, maxWait)
+		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, plan.OrderedProviders, req.Model, maxWait)
 		if !shouldRetry {
 			break
 		}
 		if errWait := waitForCooldown(ctx, wait); errWait != nil {
+			finalErr = errWait
+			stopReason = "cooldown_wait_interrupted"
 			return nil, errWait
 		}
 	}
 	if lastErr != nil {
+		finalErr = lastErr
+		stopReason = "terminal_error"
 		return nil, lastErr
 	}
+	finalErr = &Error{Code: "auth_not_found", Message: "no auth available"}
+	stopReason = "no_auth_available"
 	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
 
-func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int) (cliproxyexecutor.Response, error) {
+func (m *Manager) executeMixedOnce(ctx context.Context, plan routingExecutionPlan, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, trace *routingTraceRuntime) (cliproxyexecutor.Response, error) {
+	providers := plan.OrderedProviders
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -980,6 +1043,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	tried := make(map[string]struct{})
 	var lastErr error
+	explicitCursor := 0
 	for {
 		if maxRetryCredentials > 0 && len(tried) >= maxRetryCredentials {
 			if lastErr != nil {
@@ -987,12 +1051,37 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
-		if errPick != nil {
-			if lastErr != nil {
-				return cliproxyexecutor.Response{}, lastErr
+		var (
+			auth     *Auth
+			executor ProviderExecutor
+			provider string
+			errPick  error
+			stage    string
+		)
+		for explicitCursor < len(plan.ExplicitCandidates) {
+			candidate := plan.ExplicitCandidates[explicitCursor]
+			explicitCursor++
+			if _, used := tried[candidate.AuthID]; used {
+				continue
 			}
-			return cliproxyexecutor.Response{}, errPick
+			stage = "policy-explicit"
+			auth, executor, errPick = m.pickPinnedCandidate(ctx, candidate.Provider, routeModel, opts, tried, candidate.AuthID)
+			if errPick != nil {
+				m.appendRoutingTraceAttempt(trace, traceAttemptFromError(candidate.Provider, candidate.AuthID, stage, errPick, true, "candidate_unavailable"))
+				continue
+			}
+			provider = candidate.Provider
+			break
+		}
+		if auth == nil {
+			stage = "strategy"
+			auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, opts, tried)
+			if errPick != nil {
+				if lastErr != nil {
+					return cliproxyexecutor.Response{}, lastErr
+				}
+				return cliproxyexecutor.Response{}, errPick
+			}
 		}
 
 		entry := logEntryWithRequestID(ctx)
@@ -1026,16 +1115,24 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
+					m.appendRoutingTraceAttempt(trace, traceAttemptFromError(provider, auth.ID, stage, errExec, false, "non_retryable"))
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			m.appendRoutingTraceAttempt(trace, traceAttemptSuccess(provider, auth.ID, stage))
 			return resp, nil
 		}
 		if authErr != nil {
 			if isRequestInvalidError(authErr) {
+				m.appendRoutingTraceAttempt(trace, traceAttemptFromError(provider, auth.ID, stage, authErr, false, "non_retryable"))
+				return cliproxyexecutor.Response{}, authErr
+			}
+			shouldFallback, fallbackReason := m.shouldFallbackAfterExecutionError(authErr, plan)
+			m.appendRoutingTraceAttempt(trace, traceAttemptFromError(provider, auth.ID, stage, authErr, shouldFallback, fallbackReason))
+			if !shouldFallback {
 				return cliproxyexecutor.Response{}, authErr
 			}
 			lastErr = authErr
@@ -1044,7 +1141,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	}
 }
 
-func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int) (cliproxyexecutor.Response, error) {
+func (m *Manager) executeCountMixedOnce(ctx context.Context, plan routingExecutionPlan, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, trace *routingTraceRuntime) (cliproxyexecutor.Response, error) {
+	providers := plan.OrderedProviders
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -1052,6 +1150,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	tried := make(map[string]struct{})
 	var lastErr error
+	explicitCursor := 0
 	for {
 		if maxRetryCredentials > 0 && len(tried) >= maxRetryCredentials {
 			if lastErr != nil {
@@ -1059,12 +1158,37 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
-		if errPick != nil {
-			if lastErr != nil {
-				return cliproxyexecutor.Response{}, lastErr
+		var (
+			auth     *Auth
+			executor ProviderExecutor
+			provider string
+			errPick  error
+			stage    string
+		)
+		for explicitCursor < len(plan.ExplicitCandidates) {
+			candidate := plan.ExplicitCandidates[explicitCursor]
+			explicitCursor++
+			if _, used := tried[candidate.AuthID]; used {
+				continue
 			}
-			return cliproxyexecutor.Response{}, errPick
+			stage = "policy-explicit"
+			auth, executor, errPick = m.pickPinnedCandidate(ctx, candidate.Provider, routeModel, opts, tried, candidate.AuthID)
+			if errPick != nil {
+				m.appendRoutingTraceAttempt(trace, traceAttemptFromError(candidate.Provider, candidate.AuthID, stage, errPick, true, "candidate_unavailable"))
+				continue
+			}
+			provider = candidate.Provider
+			break
+		}
+		if auth == nil {
+			stage = "strategy"
+			auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, opts, tried)
+			if errPick != nil {
+				if lastErr != nil {
+					return cliproxyexecutor.Response{}, lastErr
+				}
+				return cliproxyexecutor.Response{}, errPick
+			}
 		}
 
 		entry := logEntryWithRequestID(ctx)
@@ -1098,16 +1222,24 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				}
 				m.hook.OnResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
+					m.appendRoutingTraceAttempt(trace, traceAttemptFromError(provider, auth.ID, stage, errExec, false, "non_retryable"))
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
 				continue
 			}
 			m.hook.OnResult(execCtx, result)
+			m.appendRoutingTraceAttempt(trace, traceAttemptSuccess(provider, auth.ID, stage))
 			return resp, nil
 		}
 		if authErr != nil {
 			if isRequestInvalidError(authErr) {
+				m.appendRoutingTraceAttempt(trace, traceAttemptFromError(provider, auth.ID, stage, authErr, false, "non_retryable"))
+				return cliproxyexecutor.Response{}, authErr
+			}
+			shouldFallback, fallbackReason := m.shouldFallbackAfterExecutionError(authErr, plan)
+			m.appendRoutingTraceAttempt(trace, traceAttemptFromError(provider, auth.ID, stage, authErr, shouldFallback, fallbackReason))
+			if !shouldFallback {
 				return cliproxyexecutor.Response{}, authErr
 			}
 			lastErr = authErr
@@ -1116,7 +1248,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 }
 
-func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamMixedOnce(ctx context.Context, plan routingExecutionPlan, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, trace *routingTraceRuntime) (*cliproxyexecutor.StreamResult, error) {
+	providers := plan.OrderedProviders
 	if len(providers) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -1124,6 +1257,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	tried := make(map[string]struct{})
 	var lastErr error
+	explicitCursor := 0
 	for {
 		if maxRetryCredentials > 0 && len(tried) >= maxRetryCredentials {
 			if lastErr != nil {
@@ -1131,12 +1265,37 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
-		if errPick != nil {
-			if lastErr != nil {
-				return nil, lastErr
+		var (
+			auth     *Auth
+			executor ProviderExecutor
+			provider string
+			errPick  error
+			stage    string
+		)
+		for explicitCursor < len(plan.ExplicitCandidates) {
+			candidate := plan.ExplicitCandidates[explicitCursor]
+			explicitCursor++
+			if _, used := tried[candidate.AuthID]; used {
+				continue
 			}
-			return nil, errPick
+			stage = "policy-explicit"
+			auth, executor, errPick = m.pickPinnedCandidate(ctx, candidate.Provider, routeModel, opts, tried, candidate.AuthID)
+			if errPick != nil {
+				m.appendRoutingTraceAttempt(trace, traceAttemptFromError(candidate.Provider, candidate.AuthID, stage, errPick, true, "candidate_unavailable"))
+				continue
+			}
+			provider = candidate.Provider
+			break
+		}
+		if auth == nil {
+			stage = "strategy"
+			auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, opts, tried)
+			if errPick != nil {
+				if lastErr != nil {
+					return nil, lastErr
+				}
+				return nil, errPick
+			}
 		}
 
 		entry := logEntryWithRequestID(ctx)
@@ -1155,11 +1314,18 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				return nil, errCtx
 			}
 			if isRequestInvalidError(errStream) {
+				m.appendRoutingTraceAttempt(trace, traceAttemptFromError(provider, auth.ID, stage, errStream, false, "non_retryable"))
+				return nil, errStream
+			}
+			shouldFallback, fallbackReason := m.shouldFallbackAfterExecutionError(errStream, plan)
+			m.appendRoutingTraceAttempt(trace, traceAttemptFromError(provider, auth.ID, stage, errStream, shouldFallback, fallbackReason))
+			if !shouldFallback {
 				return nil, errStream
 			}
 			lastErr = errStream
 			continue
 		}
+		m.appendRoutingTraceAttempt(trace, traceAttemptSuccess(provider, auth.ID, stage))
 		return streamResult, nil
 	}
 }
