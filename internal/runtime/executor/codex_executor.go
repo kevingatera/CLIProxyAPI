@@ -28,8 +28,8 @@ import (
 )
 
 const (
-	codexClientVersion = "0.101.0"
-	codexUserAgent     = "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
+	codexClientVersion = "0.124.0"
+	codexUserAgent     = "codex_cli_rs/0.124.0 (Linux 6.0.0; x86_64) xterm/0"
 )
 
 var dataTag = []byte("data:")
@@ -173,6 +173,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 
 		line = bytes.TrimSpace(line[5:])
+		if terminalErr, ok := codexStreamTerminalError(line); ok {
+			err = terminalErr
+			return resp, err
+		}
 		if gjson.GetBytes(line, "type").String() != "response.completed" {
 			continue
 		}
@@ -378,6 +382,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
+				if terminalErr, ok := codexStreamTerminalError(data); ok {
+					recordAPIResponseError(ctx, e.cfg, terminalErr)
+					reporter.publishFailure(ctx)
+					out <- cliproxyexecutor.StreamChunk{Err: terminalErr}
+					return
+				}
 				if gjson.GetBytes(data, "type").String() == "response.completed" {
 					if detail, ok := parseCodexUsage(data); ok {
 						reporter.publish(ctx, detail)
@@ -684,6 +694,47 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 		err.retryAfter = retryAfter
 	}
 	return err
+}
+
+func codexStreamTerminalError(data []byte) (statusErr, bool) {
+	eventType := strings.TrimSpace(gjson.GetBytes(data, "type").String())
+	switch eventType {
+	case "error":
+		msg := strings.TrimSpace(gjson.GetBytes(data, "error.message").String())
+		if msg == "" {
+			msg = strings.TrimSpace(gjson.GetBytes(data, "error.code").String())
+		}
+		if msg == "" {
+			msg = string(data)
+		}
+		return statusErr{code: codexStreamErrorStatus(data), msg: msg}, true
+	case "response.failed":
+		msg := strings.TrimSpace(gjson.GetBytes(data, "response.error.message").String())
+		if msg == "" {
+			msg = strings.TrimSpace(gjson.GetBytes(data, "response.error.code").String())
+		}
+		if msg == "" {
+			msg = string(data)
+		}
+		return statusErr{code: codexStreamErrorStatus(data), msg: msg}, true
+	default:
+		return statusErr{}, false
+	}
+}
+
+func codexStreamErrorStatus(data []byte) int {
+	code := strings.TrimSpace(gjson.GetBytes(data, "error.code").String())
+	if code == "" {
+		code = strings.TrimSpace(gjson.GetBytes(data, "response.error.code").String())
+	}
+	switch code {
+	case "model_not_found":
+		return http.StatusNotFound
+	case "rate_limit_exceeded", "usage_limit_reached":
+		return http.StatusTooManyRequests
+	default:
+		return http.StatusBadGateway
+	}
 }
 
 func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time.Duration {
