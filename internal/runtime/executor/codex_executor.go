@@ -166,6 +166,8 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
 
+	var completedLine []byte
+	var completedOutputItems []string
 	lines := bytes.Split(data, []byte("\n"))
 	for _, line := range lines {
 		if !bytes.HasPrefix(line, dataTag) {
@@ -177,21 +179,62 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			err = terminalErr
 			return resp, err
 		}
-		if gjson.GetBytes(line, "type").String() != "response.completed" {
-			continue
+		switch gjson.GetBytes(line, "type").String() {
+		case "response.output_item.done":
+			if item := gjson.GetBytes(line, "item"); item.Exists() {
+				completedOutputItems = append(completedOutputItems, item.Raw)
+			}
+		case "response.completed":
+			completedLine = bytes.Clone(line)
 		}
-
-		if detail, ok := parseCodexUsage(line); ok {
+	}
+	if len(completedLine) > 0 {
+		completedLine = hydrateCodexCompletedOutput(completedLine, completedOutputItems)
+		if detail, ok := parseCodexUsage(completedLine); ok {
 			reporter.publish(ctx, detail)
 		}
 
 		var param any
-		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, line, &param)
+		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, completedLine, &param)
 		resp = cliproxyexecutor.Response{Payload: []byte(out), Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
 	err = statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
 	return resp, err
+}
+
+func hydrateCodexCompletedOutput(completed []byte, outputItems []string) []byte {
+	if len(outputItems) == 0 {
+		return completed
+	}
+	output := gjson.GetBytes(completed, "response.output")
+	if output.IsArray() && len(output.Array()) > 0 {
+		return completed
+	}
+
+	var b strings.Builder
+	b.WriteByte('[')
+	wrote := false
+	for _, item := range outputItems {
+		if strings.TrimSpace(item) == "" {
+			continue
+		}
+		if wrote {
+			b.WriteByte(',')
+		}
+		b.WriteString(item)
+		wrote = true
+	}
+	b.WriteByte(']')
+	if !wrote {
+		return completed
+	}
+
+	out, err := sjson.SetRawBytes(completed, "response.output", []byte(b.String()))
+	if err != nil {
+		return completed
+	}
+	return out
 }
 
 func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {

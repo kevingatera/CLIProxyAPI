@@ -3,6 +3,8 @@ package executor
 import (
 	"net/http"
 	"testing"
+
+	"github.com/tidwall/gjson"
 )
 
 func TestCodexStreamTerminalErrorResponseFailed(t *testing.T) {
@@ -32,5 +34,29 @@ func TestCodexStreamTerminalErrorEvent(t *testing.T) {
 	}
 	if err.Error() != "quota exhausted" {
 		t.Fatalf("message = %q", err.Error())
+	}
+}
+
+func TestHydrateCodexCompletedOutputUsesOutputItemDone(t *testing.T) {
+	completed := []byte(`{"type":"response.completed","response":{"status":"completed","output":[]}}`)
+	item := `{"id":"msg_1","type":"message","status":"completed","content":[{"type":"output_text","text":"ok"}],"role":"assistant"}`
+
+	out := hydrateCodexCompletedOutput(completed, []string{item})
+
+	text := gjson.GetBytes(out, "response.output.0.content.0.text").String()
+	if text != "ok" {
+		t.Fatalf("hydrated text = %q, want ok; payload=%s", text, string(out))
+	}
+}
+
+func TestHydrateCodexCompletedOutputPreservesExistingOutput(t *testing.T) {
+	completed := []byte(`{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"existing"}]}]}}`)
+	item := `{"type":"message","content":[{"type":"output_text","text":"replacement"}]}`
+
+	out := hydrateCodexCompletedOutput(completed, []string{item})
+
+	text := gjson.GetBytes(out, "response.output.0.content.0.text").String()
+	if text != "existing" {
+		t.Fatalf("hydrated text = %q, want existing; payload=%s", text, string(out))
 	}
 }
