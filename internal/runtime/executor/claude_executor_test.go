@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -1062,5 +1063,29 @@ func TestCheckSystemInstructionsWithMode_StringWithSpecialChars(t *testing.T) {
 	}
 	if blocks[2].Get("text").String() != `Use <xml> tags & "quotes" in output.` {
 		t.Fatalf("blocks[2] text mangled, got %q", blocks[2].Get("text").String())
+	}
+}
+
+func TestShouldUseClaudeAPIKeyHeader_CustomHTTPSAPIKeyProvider(t *testing.T) {
+	u, err := url.Parse("https://opencode.ai/zen/go/v1/messages")
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test"}}
+
+	if !shouldUseClaudeAPIKeyHeader(u, auth) {
+		t.Fatal("expected custom HTTPS Claude API-key provider to use x-api-key")
+	}
+}
+
+func TestShouldUseClaudeAPIKeyHeader_OAuthAuthDoesNotUseAPIKeyHeader(t *testing.T) {
+	u, err := url.Parse("https://api.anthropic.com/v1/messages")
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"access_token": "sk-ant-oat-test"}}
+
+	if shouldUseClaudeAPIKeyHeader(u, auth) {
+		t.Fatal("expected OAuth/file-backed Claude auth to keep bearer authorization")
 	}
 }
