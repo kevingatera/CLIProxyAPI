@@ -277,6 +277,9 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 		}
 		chunks = append(chunks, bytes.TrimSpace(line[5:]))
 	}
+	if len(chunks) == 0 && gjson.ValidBytes(rawJSON) {
+		return convertClaudeMessageJSONToOpenAI(rawJSON)
+	}
 
 	// Base OpenAI non-streaming response template
 	out := `{"id":"","object":"chat.completion","created":0,"model":"","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`
@@ -427,6 +430,67 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 	} else {
 		out, _ = sjson.Set(out, "choices.0.finish_reason", mapAnthropicStopReasonToOpenAI(stopReason))
 	}
+
+	return out
+}
+
+func convertClaudeMessageJSONToOpenAI(rawJSON []byte) string {
+	root := gjson.ParseBytes(rawJSON)
+	out := `{"id":"","object":"chat.completion","created":0,"model":"","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`
+
+	out, _ = sjson.Set(out, "id", root.Get("id").String())
+	out, _ = sjson.Set(out, "created", time.Now().Unix())
+	out, _ = sjson.Set(out, "model", root.Get("model").String())
+
+	var textParts []string
+	var reasoningParts []string
+	toolCallIndex := 0
+	content := root.Get("content")
+	if content.IsArray() {
+		content.ForEach(func(_, part gjson.Result) bool {
+			switch part.Get("type").String() {
+			case "text":
+				if text := part.Get("text"); text.Exists() {
+					textParts = append(textParts, text.String())
+				}
+			case "thinking":
+				if thinking := part.Get("thinking"); thinking.Exists() {
+					reasoningParts = append(reasoningParts, thinking.String())
+				}
+			case "tool_use":
+				base := fmt.Sprintf("choices.0.message.tool_calls.%d", toolCallIndex)
+				out, _ = sjson.Set(out, base+".id", part.Get("id").String())
+				out, _ = sjson.Set(out, base+".type", "function")
+				out, _ = sjson.Set(out, base+".function.name", part.Get("name").String())
+				args := part.Get("input").Raw
+				if args == "" {
+					args = "{}"
+				}
+				out, _ = sjson.Set(out, base+".function.arguments", args)
+				toolCallIndex++
+			}
+			return true
+		})
+	}
+
+	out, _ = sjson.Set(out, "choices.0.message.content", strings.Join(textParts, ""))
+	if len(reasoningParts) > 0 {
+		out, _ = sjson.Set(out, "choices.0.message.reasoning", strings.Join(reasoningParts, ""))
+	}
+	if toolCallIndex > 0 {
+		out, _ = sjson.Set(out, "choices.0.finish_reason", "tool_calls")
+	} else {
+		out, _ = sjson.Set(out, "choices.0.finish_reason", mapAnthropicStopReasonToOpenAI(root.Get("stop_reason").String()))
+	}
+
+	inputTokens := root.Get("usage.input_tokens").Int()
+	outputTokens := root.Get("usage.output_tokens").Int()
+	cacheReadInputTokens := root.Get("usage.cache_read_input_tokens").Int()
+	cacheCreationInputTokens := root.Get("usage.cache_creation_input_tokens").Int()
+	out, _ = sjson.Set(out, "usage.prompt_tokens", inputTokens+cacheCreationInputTokens)
+	out, _ = sjson.Set(out, "usage.completion_tokens", outputTokens)
+	out, _ = sjson.Set(out, "usage.total_tokens", inputTokens+outputTokens+cacheCreationInputTokens)
+	out, _ = sjson.Set(out, "usage.prompt_tokens_details.cached_tokens", cacheReadInputTokens)
 
 	return out
 }
