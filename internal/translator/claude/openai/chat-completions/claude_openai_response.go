@@ -267,15 +267,20 @@ func mapAnthropicStopReasonToOpenAI(anthropicReason string) string {
 //
 // Returns:
 //   - string: An OpenAI-compatible JSON response containing all message content and metadata
-func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) string {
+func ConvertClaudeResponseToOpenAINonStream(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) string {
 	chunks := make([][]byte, 0)
 
 	lines := bytes.Split(rawJSON, []byte("\n"))
 	for _, line := range lines {
-		if !bytes.HasPrefix(line, dataTag) {
+		line = bytes.TrimSpace(line)
+		if bytes.HasPrefix(line, dataTag) {
+			chunks = append(chunks, bytes.TrimSpace(line[5:]))
 			continue
 		}
-		chunks = append(chunks, bytes.TrimSpace(line[5:]))
+		if !gjson.ValidBytes(line) {
+			continue
+		}
+		chunks = append(chunks, line)
 	}
 	if len(chunks) == 0 && gjson.ValidBytes(rawJSON) {
 		return convertClaudeMessageJSONToOpenAI(rawJSON)
@@ -382,6 +387,12 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 	}
 
 	// Set basic response fields including message ID, creation time, and model
+	if createdAt == 0 {
+		createdAt = time.Now().Unix()
+	}
+	if model == "" {
+		model = modelName
+	}
 	out, _ = sjson.Set(out, "id", messageID)
 	out, _ = sjson.Set(out, "created", createdAt)
 	out, _ = sjson.Set(out, "model", model)
