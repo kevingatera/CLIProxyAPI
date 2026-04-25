@@ -297,6 +297,10 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 		eventType := root.Get("type").String()
 
 		switch eventType {
+		case "message":
+			if root.Get("content").Exists() {
+				return convertClaudeMessageJSONToOpenAI(chunk)
+			}
 		case "message_start":
 			// Extract initial message metadata including ID, model, and input token count
 			if message := root.Get("message"); message.Exists() {
