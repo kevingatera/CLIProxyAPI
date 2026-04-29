@@ -402,6 +402,17 @@ func (s *Server) setupRoutes() {
 	v1 := s.engine.Group("/v1")
 	v1.Use(AuthMiddleware(s.accessManager))
 	{
+		v1.GET("", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{
+				"message": "CLI Proxy API v1",
+				"endpoints": []string{
+					"GET /v1/models",
+					"POST /v1/chat/completions",
+					"POST /v1/completions",
+					"POST /v1/responses",
+				},
+			})
+		})
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
 		v1.POST("/completions", openaiHandlers.Completions)
@@ -668,6 +679,11 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/routing/strategy", s.mgmt.GetRoutingStrategy)
 		mgmt.PUT("/routing/strategy", s.mgmt.PutRoutingStrategy)
 		mgmt.PATCH("/routing/strategy", s.mgmt.PutRoutingStrategy)
+		mgmt.GET("/routing/policy", s.mgmt.GetRoutingPolicy)
+		mgmt.PUT("/routing/policy", s.mgmt.PutRoutingPolicy)
+		mgmt.PATCH("/routing/policy", s.mgmt.PutRoutingPolicy)
+		mgmt.POST("/routing/preview", s.mgmt.PreviewRoutingPolicy)
+		mgmt.GET("/routing/traces", s.mgmt.GetRoutingTraces)
 
 		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
 		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)
@@ -711,6 +727,7 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
 		mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexToken)
+		mgmt.GET("/cursor-auth-url", s.mgmt.RequestCursorToken)
 		mgmt.GET("/gemini-cli-auth-url", s.mgmt.RequestGeminiCLIToken)
 		mgmt.GET("/antigravity-auth-url", s.mgmt.RequestAntigravityToken)
 		mgmt.GET("/qwen-auth-url", s.mgmt.RequestQwenToken)

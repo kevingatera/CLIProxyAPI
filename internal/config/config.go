@@ -205,6 +205,53 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first", "quota-aware" (Codex only).
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+	// Policy configures explicit provider/auth ordering and fallback rules.
+	Policy RoutingPolicy `yaml:"policy,omitempty" json:"policy,omitempty"`
+}
+
+// RoutingPolicy configures explicit model routing order and fallback behavior.
+type RoutingPolicy struct {
+	// Enabled toggles policy-driven routing.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// Defaults applies when no model-specific override matches.
+	Defaults RoutingPolicyRule `yaml:"defaults,omitempty" json:"defaults,omitempty"`
+	// ModelOverrides applies per exact model ID.
+	ModelOverrides map[string]RoutingPolicyRule `yaml:"model-overrides,omitempty" json:"model-overrides,omitempty"`
+	// Fallback defines which error classes trigger next-candidate fallback.
+	Fallback RoutingFallbackPolicy `yaml:"fallback,omitempty" json:"fallback,omitempty"`
+	// Observability configures runtime route tracing.
+	Observability RoutingPolicyObservability `yaml:"observability,omitempty" json:"observability,omitempty"`
+}
+
+// RoutingPolicyRule defines provider/auth ordering behavior for a scope.
+type RoutingPolicyRule struct {
+	// Route lists preferred providers (and optional auth order per provider).
+	Route []RoutingPolicyRoute `yaml:"route,omitempty" json:"route,omitempty"`
+	// IncludeRemainingProviders appends providers not explicitly listed in Route.
+	IncludeRemainingProviders bool `yaml:"include-remaining-providers,omitempty" json:"include-remaining-providers,omitempty"`
+}
+
+// RoutingPolicyRoute defines one provider step in policy routing.
+type RoutingPolicyRoute struct {
+	// Provider is the provider key (e.g. "codex", "claude", "gemini").
+	Provider string `yaml:"provider,omitempty" json:"provider,omitempty"`
+	// AuthOrder lists auth IDs in preferred order for this provider.
+	AuthOrder []string `yaml:"auth-order,omitempty" json:"auth-order,omitempty"`
+	// IncludeRemainingAuth appends provider auths not explicitly listed in AuthOrder.
+	IncludeRemainingAuth bool `yaml:"include-remaining-auth,omitempty" json:"include-remaining-auth,omitempty"`
+}
+
+// RoutingFallbackPolicy configures which failure classes trigger fallback.
+type RoutingFallbackPolicy struct {
+	// On is the enabled trigger list:
+	// exhausted, rate_limited, server_error, transport_error.
+	On []string `yaml:"on,omitempty" json:"on,omitempty"`
+}
+
+// RoutingPolicyObservability configures route trace collection.
+type RoutingPolicyObservability struct {
+	// TraceLimit controls in-memory route trace retention.
+	TraceLimit int `yaml:"trace-limit,omitempty" json:"trace-limit,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -665,6 +712,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
+	// Normalize routing policy fields.
+	cfg.SanitizeRoutingPolicy()
+
 	// NOTE: Legacy migration persistence is intentionally disabled together with
 	// startup legacy migration to keep startup read-only for config.yaml.
 	// Re-enable the block below if automatic startup migration is needed again.
@@ -726,6 +776,106 @@ func sanitizePayloadRawRules(rules []PayloadRule, section string) []PayloadRule 
 		out = append(out, rule)
 	}
 	return out
+}
+
+// SanitizeRoutingPolicy normalizes routing policy fields and drops invalid entries.
+func (cfg *Config) SanitizeRoutingPolicy() {
+	if cfg == nil {
+		return
+	}
+
+	normalizeTrigger := func(trigger string) (string, bool) {
+		switch strings.ToLower(strings.TrimSpace(trigger)) {
+		case "exhausted", "quota", "quota_exhausted":
+			return "exhausted", true
+		case "rate_limited", "ratelimited", "rate-limited", "429":
+			return "rate_limited", true
+		case "server_error", "server", "5xx":
+			return "server_error", true
+		case "transport_error", "transport", "network", "timeout":
+			return "transport_error", true
+		default:
+			return "", false
+		}
+	}
+
+	canonicalizeRule := func(rule RoutingPolicyRule) RoutingPolicyRule {
+		out := RoutingPolicyRule{
+			IncludeRemainingProviders: rule.IncludeRemainingProviders,
+			Route:                     make([]RoutingPolicyRoute, 0, len(rule.Route)),
+		}
+		seenProviders := make(map[string]struct{}, len(rule.Route))
+		for _, route := range rule.Route {
+			provider := strings.ToLower(strings.TrimSpace(route.Provider))
+			if provider == "" {
+				continue
+			}
+			if _, exists := seenProviders[provider]; exists {
+				continue
+			}
+			seenProviders[provider] = struct{}{}
+
+			seenAuthIDs := make(map[string]struct{}, len(route.AuthOrder))
+			authOrder := make([]string, 0, len(route.AuthOrder))
+			for _, authID := range route.AuthOrder {
+				trimmedID := strings.TrimSpace(authID)
+				if trimmedID == "" {
+					continue
+				}
+				if _, exists := seenAuthIDs[trimmedID]; exists {
+					continue
+				}
+				seenAuthIDs[trimmedID] = struct{}{}
+				authOrder = append(authOrder, trimmedID)
+			}
+
+			out.Route = append(out.Route, RoutingPolicyRoute{
+				Provider:             provider,
+				AuthOrder:            authOrder,
+				IncludeRemainingAuth: route.IncludeRemainingAuth,
+			})
+		}
+		return out
+	}
+
+	cfg.Routing.Policy.Defaults = canonicalizeRule(cfg.Routing.Policy.Defaults)
+
+	if len(cfg.Routing.Policy.ModelOverrides) > 0 {
+		normalizedOverrides := make(map[string]RoutingPolicyRule, len(cfg.Routing.Policy.ModelOverrides))
+		for modelID, rule := range cfg.Routing.Policy.ModelOverrides {
+			modelKey := strings.TrimSpace(modelID)
+			if modelKey == "" {
+				continue
+			}
+			normalizedOverrides[modelKey] = canonicalizeRule(rule)
+		}
+		cfg.Routing.Policy.ModelOverrides = normalizedOverrides
+	}
+
+	seenTriggers := make(map[string]struct{}, len(cfg.Routing.Policy.Fallback.On))
+	normalizedTriggers := make([]string, 0, len(cfg.Routing.Policy.Fallback.On))
+	for _, trigger := range cfg.Routing.Policy.Fallback.On {
+		normalized, ok := normalizeTrigger(trigger)
+		if !ok {
+			continue
+		}
+		if _, exists := seenTriggers[normalized]; exists {
+			continue
+		}
+		seenTriggers[normalized] = struct{}{}
+		normalizedTriggers = append(normalizedTriggers, normalized)
+	}
+	if len(normalizedTriggers) == 0 {
+		normalizedTriggers = []string{"exhausted", "rate_limited", "server_error", "transport_error"}
+	}
+	cfg.Routing.Policy.Fallback.On = normalizedTriggers
+
+	if cfg.Routing.Policy.Observability.TraceLimit < 0 {
+		cfg.Routing.Policy.Observability.TraceLimit = 0
+	}
+	if cfg.Routing.Policy.Observability.TraceLimit > 2000 {
+		cfg.Routing.Policy.Observability.TraceLimit = 2000
+	}
 }
 
 func payloadRawString(value any) ([]byte, bool) {

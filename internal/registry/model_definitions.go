@@ -6,6 +6,11 @@ import (
 	"strings"
 )
 
+const (
+	codexPrimaryModelID = "gpt-5.4"
+	codexMiniModelID    = "gpt-5.4-mini"
+)
+
 // staticModelsJSON mirrors the top-level structure of models.json.
 type staticModelsJSON struct {
 	Claude      []*ModelInfo `json:"claude"`
@@ -50,22 +55,22 @@ func GetAIStudioModels() []*ModelInfo {
 
 // GetCodexFreeModels returns model definitions for the Codex free plan tier.
 func GetCodexFreeModels() []*ModelInfo {
-	return cloneModelInfos(getModels().CodexFree)
+	return ensureCodexMiniModel(cloneModelInfos(getModels().CodexFree))
 }
 
 // GetCodexTeamModels returns model definitions for the Codex team plan tier.
 func GetCodexTeamModels() []*ModelInfo {
-	return cloneModelInfos(getModels().CodexTeam)
+	return ensureCodexMiniModel(cloneModelInfos(getModels().CodexTeam))
 }
 
 // GetCodexPlusModels returns model definitions for the Codex plus plan tier.
 func GetCodexPlusModels() []*ModelInfo {
-	return cloneModelInfos(getModels().CodexPlus)
+	return ensureCodexMiniModel(cloneModelInfos(getModels().CodexPlus))
 }
 
 // GetCodexProModels returns model definitions for the Codex pro plan tier.
 func GetCodexProModels() []*ModelInfo {
-	return cloneModelInfos(getModels().CodexPro)
+	return ensureCodexMiniModel(cloneModelInfos(getModels().CodexPro))
 }
 
 // GetQwenModels returns the standard Qwen model definitions.
@@ -98,6 +103,53 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 		out[i] = cloneModelInfo(m)
 	}
 	return out
+}
+
+func ensureCodexMiniModel(models []*ModelInfo) []*ModelInfo {
+	if len(models) == 0 {
+		return []*ModelInfo{
+			{
+				ID:          codexMiniModelID,
+				Object:      "model",
+				OwnedBy:     "openai",
+				Type:        "codex",
+				DisplayName: codexMiniModelID,
+				Thinking:    &ThinkingSupport{Levels: []string{"low", "medium", "high"}},
+			},
+		}
+	}
+	if hasModelID(models, codexMiniModelID) {
+		return models
+	}
+	for _, model := range models {
+		if model == nil || model.ID != codexPrimaryModelID {
+			continue
+		}
+		mini := cloneModelInfo(model)
+		if mini == nil {
+			break
+		}
+		mini.ID = codexMiniModelID
+		mini.DisplayName = codexMiniModelID
+		return append(models, mini)
+	}
+	return append(models, &ModelInfo{
+		ID:          codexMiniModelID,
+		Object:      "model",
+		OwnedBy:     "openai",
+		Type:        "codex",
+		DisplayName: codexMiniModelID,
+		Thinking:    &ThinkingSupport{Levels: []string{"low", "medium", "high"}},
+	})
+}
+
+func hasModelID(models []*ModelInfo, target string) bool {
+	for _, model := range models {
+		if model != nil && model.ID == target {
+			return true
+		}
+	}
+	return false
 }
 
 // GetStaticModelDefinitionsByChannel returns static model definitions for a given channel/provider.

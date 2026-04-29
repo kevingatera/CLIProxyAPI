@@ -54,6 +54,12 @@ func TestAmpProviderModelRoutes(t *testing.T) {
 		wantContains string
 	}{
 		{
+			name:         "openai v1 root",
+			path:         "/v1",
+			wantStatus:   http.StatusOK,
+			wantContains: `"message":"CLI Proxy API v1"`,
+		},
+		{
 			name:         "openai root models",
 			path:         "/api/provider/openai/models",
 			wantStatus:   http.StatusOK,

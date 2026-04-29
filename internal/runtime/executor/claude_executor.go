@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"runtime"
 	"strings"
 	"time"
@@ -58,9 +59,7 @@ func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 	if strings.TrimSpace(apiKey) == "" {
 		return nil
 	}
-	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
-	isAnthropicBase := req.URL != nil && strings.EqualFold(req.URL.Scheme, "https") && strings.EqualFold(req.URL.Host, "api.anthropic.com")
-	if isAnthropicBase && useAPIKey {
+	if shouldUseClaudeAPIKeyHeader(req.URL, auth) {
 		req.Header.Del("Authorization")
 		req.Header.Set("x-api-key", apiKey)
 	} else {
@@ -241,6 +240,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	} else {
 		reporter.publish(ctx, parseClaudeUsage(data))
 	}
+	reporter.ensurePublished(ctx)
 	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 		data = stripClaudeToolPrefixFromResponse(data, claudeToolPrefix)
 	}
@@ -451,6 +451,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			reporter.publishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
 		}
+		reporter.ensurePublished(ctx)
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
@@ -810,9 +811,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		hd = cfg.ClaudeHeaderDefaults
 	}
 
-	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
-	isAnthropicBase := r.URL != nil && strings.EqualFold(r.URL.Scheme, "https") && strings.EqualFold(r.URL.Host, "api.anthropic.com")
-	if isAnthropicBase && useAPIKey {
+	if shouldUseClaudeAPIKeyHeader(r.URL, auth) {
 		r.Header.Del("Authorization")
 		r.Header.Set("x-api-key", apiKey)
 	} else {
@@ -910,6 +909,19 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if stream {
 		r.Header.Set("Accept-Encoding", "identity")
 	}
+}
+
+func shouldUseClaudeAPIKeyHeader(url *url.URL, auth *cliproxyauth.Auth) bool {
+	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
+	if !useAPIKey {
+		return false
+	}
+	if url == nil {
+		return false
+	}
+	// File-backed Claude Code OAuth uses bearer tokens. Configured Claude API-key
+	// entries, including Anthropic-compatible custom base URLs, use x-api-key.
+	return strings.EqualFold(url.Scheme, "https")
 }
 
 func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {

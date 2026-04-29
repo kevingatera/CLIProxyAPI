@@ -1,6 +1,7 @@
 package management
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -12,7 +13,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -60,6 +63,8 @@ var (
 	callbackForwardersMu sync.Mutex
 	callbackForwarders   = make(map[int]*callbackForwarder)
 )
+
+var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
 
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
 	if len(meta) == 0 {
@@ -759,11 +764,21 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 		"path":   path,
 		"source": path,
 	}
+	prefix := ""
+	if rawPrefix, ok := metadata["prefix"].(string); ok {
+		prefix = strings.TrimSpace(rawPrefix)
+	}
+	proxyURL := ""
+	if rawProxyURL, ok := metadata["proxy_url"].(string); ok {
+		proxyURL = strings.TrimSpace(rawProxyURL)
+	}
 	auth := &coreauth.Auth{
 		ID:         authID,
 		Provider:   provider,
 		FileName:   filepath.Base(path),
 		Label:      label,
+		Prefix:     prefix,
+		ProxyURL:   proxyURL,
 		Status:     coreauth.StatusActive,
 		Attributes: attr,
 		Metadata:   metadata,
@@ -1776,6 +1791,140 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+func (h *Handler) RequestCursorToken(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	state := fmt.Sprintf("cur-%d", time.Now().UnixNano())
+	RegisterOAuthSession(state, "cursor")
+
+	cursorPath, errLookup := exec.LookPath("cursor-agent")
+	if errLookup != nil {
+		for _, candidate := range []string{
+			"/usr/local/bin/cursor-agent",
+			"/root/.local/bin/cursor-agent",
+			"/root/.local/bin/agent",
+		} {
+			if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+				cursorPath = candidate
+				errLookup = nil
+				break
+			}
+		}
+	}
+	if errLookup != nil {
+		SetOAuthSessionError(state, "cursor-agent not found in server runtime")
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "cursor-agent not found in server runtime"})
+		return
+	}
+
+	type cursorAuthURL struct {
+		URL string
+	}
+	urlCh := make(chan cursorAuthURL, 1)
+
+	go func() {
+		cmd := exec.CommandContext(ctx, cursorPath, "login")
+		cmd.Env = append(os.Environ(), "NO_OPEN_BROWSER=1")
+
+		stdout, errStdout := cmd.StdoutPipe()
+		if errStdout != nil {
+			SetOAuthSessionError(state, errStdout.Error())
+			return
+		}
+		stderr, errStderr := cmd.StderrPipe()
+		if errStderr != nil {
+			SetOAuthSessionError(state, errStderr.Error())
+			return
+		}
+		if errStart := cmd.Start(); errStart != nil {
+			SetOAuthSessionError(state, errStart.Error())
+			return
+		}
+
+		emitURL := func(candidate string) {
+			candidate = strings.TrimSpace(candidate)
+			if candidate == "" {
+				return
+			}
+			select {
+			case urlCh <- cursorAuthURL{URL: candidate}:
+			default:
+			}
+		}
+
+		sanitize := func(line string) string {
+			clean := ansiEscapeRE.ReplaceAllString(line, "")
+			return strings.TrimSpace(clean)
+		}
+
+		var pendingURL string
+		readAndExtract := func(reader io.Reader) {
+			scanner := bufio.NewScanner(reader)
+			for scanner.Scan() {
+				line := sanitize(scanner.Text())
+				if line == "" {
+					continue
+				}
+
+				// Cursor prints wrapped auth URLs across lines; reconstruct until we
+				// see the known end marker.
+				if idx := strings.Index(line, "https://cursor.com/loginDeepControl?"); idx >= 0 {
+					pendingURL = line[idx:]
+					compact := strings.Join(strings.Fields(pendingURL), "")
+					if strings.Contains(compact, "redirectTarget=cli") {
+						emitURL(compact)
+						pendingURL = ""
+					}
+					continue
+				}
+
+				if pendingURL != "" {
+					pendingURL += line
+					compact := strings.Join(strings.Fields(pendingURL), "")
+					if strings.Contains(compact, "redirectTarget=cli") {
+						emitURL(compact)
+						pendingURL = ""
+					}
+				}
+			}
+		}
+
+		done := make(chan struct{}, 2)
+		go func() { readAndExtract(stdout); done <- struct{}{} }()
+		go func() { readAndExtract(stderr); done <- struct{}{} }()
+		<-done
+		<-done
+
+		if errWait := cmd.Wait(); errWait != nil {
+			SetOAuthSessionError(state, fmt.Sprintf("cursor-agent login failed: %v", errWait))
+			return
+		}
+
+		manager := sdkAuth.NewManager(h.tokenStore, sdkAuth.NewCursorAuthenticator())
+		_, _, err := manager.Login(ctx, "cursor", h.cfg, &sdkAuth.LoginOptions{
+			Metadata: map[string]string{"skip_login": "true"},
+		})
+		if err != nil {
+			SetOAuthSessionError(state, fmt.Sprintf("cursor auth save failed: %v", err))
+			return
+		}
+		CompleteOAuthSession(state)
+		CompleteOAuthSessionsByProvider("cursor")
+	}()
+
+	authURL := "https://cursor.com/login"
+	select {
+	case evt := <-urlCh:
+		if u := strings.TrimSpace(evt.URL); u != "" {
+			authURL = u
+		}
+	case <-time.After(5 * time.Second):
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
 func (h *Handler) RequestKimiToken(c *gin.Context) {

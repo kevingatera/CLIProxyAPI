@@ -7,11 +7,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -1062,5 +1064,57 @@ func TestCheckSystemInstructionsWithMode_StringWithSpecialChars(t *testing.T) {
 	}
 	if blocks[2].Get("text").String() != `Use <xml> tags & "quotes" in output.` {
 		t.Fatalf("blocks[2] text mangled, got %q", blocks[2].Get("text").String())
+	}
+}
+
+func TestShouldUseClaudeAPIKeyHeader_CustomHTTPSAPIKeyProvider(t *testing.T) {
+	u, err := url.Parse("https://opencode.ai/zen/go/v1/messages")
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test"}}
+
+	if !shouldUseClaudeAPIKeyHeader(u, auth) {
+		t.Fatal("expected custom HTTPS Claude API-key provider to use x-api-key")
+	}
+}
+
+func TestShouldUseClaudeAPIKeyHeader_OAuthAuthDoesNotUseAPIKeyHeader(t *testing.T) {
+	u, err := url.Parse("https://api.anthropic.com/v1/messages")
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"access_token": "sk-ant-oat-test"}}
+
+	if shouldUseClaudeAPIKeyHeader(u, auth) {
+		t.Fatal("expected OAuth/file-backed Claude auth to keep bearer authorization")
+	}
+}
+
+func TestClaudeExecutor_Execute_OpenAIToClaudePlainJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"deepseek-v4-flash","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"model":"opencode-go/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}`)
+
+	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "deepseek-v4-flash",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); got != "ok" {
+		t.Fatalf("content = %q, want ok; payload=%s", got, string(resp.Payload))
 	}
 }

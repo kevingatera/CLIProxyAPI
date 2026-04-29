@@ -33,7 +33,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Generate Build Metadata
         run: |
-          echo VERSION=`git describe --tags --always --dirty` >> $GITHUB_ENV
+          echo VERSION=`git describe --tags --always` >> $GITHUB_ENV
           echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
           echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
       - name: Build and push (amd64)
@@ -69,7 +69,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Generate Build Metadata
         run: |
-          echo VERSION=`git describe --tags --always --dirty` >> $GITHUB_ENV
+          echo VERSION=`git describe --tags --always` >> $GITHUB_ENV
           echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
           echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
       - name: Build and push (arm64)
@@ -111,6 +111,10 @@ jobs:
         run: |
           docker buildx imagetools create \
             --tag "${IMAGE_REPO}:latest" \
+            "${IMAGE_REPO}:latest-amd64" \
+            "${IMAGE_REPO}:latest-arm64"
+          docker buildx imagetools create \
+            --tag "${IMAGE_REPO}:homelab" \
             "${IMAGE_REPO}:latest-amd64" \
             "${IMAGE_REPO}:latest-arm64"
           docker buildx imagetools create \

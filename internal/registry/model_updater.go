@@ -120,6 +120,7 @@ func tryRefreshModels(ctx context.Context, label string) {
 		log.Warnf("%s: fetch failed from all URLs, keeping current data", label)
 		return
 	}
+	fillOptionalModelSections(parsed, oldData)
 
 	// Detect changes before updating store.
 	changed := detectChangedProviders(oldData, parsed)
@@ -335,8 +336,6 @@ func validateModelsCatalog(data *staticModelsJSON) error {
 		{name: "codex-team", models: data.CodexTeam},
 		{name: "codex-plus", models: data.CodexPlus},
 		{name: "codex-pro", models: data.CodexPro},
-		{name: "qwen", models: data.Qwen},
-		{name: "iflow", models: data.IFlow},
 		{name: "kimi", models: data.Kimi},
 		{name: "antigravity", models: data.Antigravity},
 	}
@@ -346,7 +345,35 @@ func validateModelsCatalog(data *staticModelsJSON) error {
 			return err
 		}
 	}
+
+	optionalSections := []struct {
+		name   string
+		models []*ModelInfo
+	}{
+		{name: "qwen", models: data.Qwen},
+		{name: "iflow", models: data.IFlow},
+	}
+	for _, section := range optionalSections {
+		if len(section.models) == 0 {
+			continue
+		}
+		if err := validateModelSection(section.name, section.models); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func fillOptionalModelSections(data, fallback *staticModelsJSON) {
+	if data == nil || fallback == nil {
+		return
+	}
+	if len(data.Qwen) == 0 && len(fallback.Qwen) > 0 {
+		data.Qwen = cloneModelInfos(fallback.Qwen)
+	}
+	if len(data.IFlow) == 0 && len(fallback.IFlow) > 0 {
+		data.IFlow = cloneModelInfos(fallback.IFlow)
+	}
 }
 
 func validateModelSection(section string, models []*ModelInfo) error {
