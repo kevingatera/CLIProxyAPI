@@ -163,6 +163,8 @@ func createAuthForChannel(channel string) *Auth {
 		return &Auth{Provider: "iflow"}
 	case "kimi":
 		return &Auth{Provider: "kimi"}
+	case "cursor":
+		return &Auth{Provider: "cursor"}
 	default:
 		return &Auth{Provider: channel}
 	}
@@ -173,6 +175,14 @@ func TestOAuthModelAliasChannel_Kimi(t *testing.T) {
 
 	if got := OAuthModelAliasChannel("kimi", "oauth"); got != "kimi" {
 		t.Fatalf("OAuthModelAliasChannel() = %q, want %q", got, "kimi")
+	}
+}
+
+func TestOAuthModelAliasChannel_Cursor(t *testing.T) {
+	t.Parallel()
+
+	if got := OAuthModelAliasChannel("cursor", "oauth"); got != "cursor" {
+		t.Fatalf("OAuthModelAliasChannel() = %q, want %q", got, "cursor")
 	}
 }
 

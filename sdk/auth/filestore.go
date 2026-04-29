@@ -254,6 +254,26 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		auth.Attributes["email"] = email
 	}
+	if baseURL, ok := metadata["base_url"].(string); ok {
+		if trimmed := strings.TrimSpace(baseURL); trimmed != "" {
+			auth.Attributes["base_url"] = trimmed
+		}
+	}
+	if apiKey, ok := metadata["api_key"].(string); ok {
+		if trimmed := strings.TrimSpace(apiKey); trimmed != "" {
+			auth.Attributes["api_key"] = trimmed
+		}
+	}
+	if providerKey, ok := metadata["provider_key"].(string); ok {
+		if trimmed := strings.TrimSpace(providerKey); trimmed != "" {
+			auth.Attributes["provider_key"] = strings.ToLower(trimmed)
+		}
+	}
+	if compatName, ok := metadata["compat_name"].(string); ok {
+		if trimmed := strings.TrimSpace(compatName); trimmed != "" {
+			auth.Attributes["compat_name"] = trimmed
+		}
+	}
 	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
 	return auth, nil
 }
