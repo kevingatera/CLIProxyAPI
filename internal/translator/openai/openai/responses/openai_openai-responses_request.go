@@ -185,8 +185,14 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				function, _ = sjson.Set(function, "description", description.String())
 			}
 
-			if parameters := tool.Get("parameters"); parameters.Exists() {
+			if parameters := tool.Get("parameters"); hasUsableToolParameters(parameters) {
 				function, _ = sjson.SetRaw(function, "parameters", parameters.Raw)
+				if !parameters.Get("type").Exists() {
+					function, _ = sjson.Set(function, "parameters.type", "object")
+				}
+				if !parameters.Get("properties").Exists() {
+					function, _ = sjson.SetRaw(function, "parameters.properties", `{}`)
+				}
 			}
 
 			chatTool, _ = sjson.SetRaw(chatTool, "function", function)
@@ -213,4 +219,8 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	}
 
 	return []byte(out)
+}
+
+func hasUsableToolParameters(parameters gjson.Result) bool {
+	return parameters.Exists() && parameters.IsObject() && strings.TrimSpace(parameters.Raw) != "{}"
 }

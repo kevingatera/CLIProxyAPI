@@ -42,3 +42,40 @@ func TestResponsesRequestDefaultsMissingToolParametersToObjectSchema(t *testing.
 		t.Fatalf("parameters.properties missing; body=%s", string(out))
 	}
 }
+
+func TestResponsesRequestDefaultsEmptyToolParametersToObjectSchema(t *testing.T) {
+	input := []byte(`{
+		"input": "hello",
+		"tools": [
+			{"type": "function", "name": "search", "description": "valid", "parameters": {}}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("minimax-test", input, false)
+	if got := gjson.GetBytes(out, "tools.0.function.parameters.type").String(); got != "object" {
+		t.Fatalf("parameters.type = %q, want object; body=%s", got, string(out))
+	}
+	if !gjson.GetBytes(out, "tools.0.function.parameters.properties").Exists() {
+		t.Fatalf("parameters.properties missing; body=%s", string(out))
+	}
+}
+
+func TestResponsesRequestCompletesPartialToolParameterSchema(t *testing.T) {
+	input := []byte(`{
+		"input": "hello",
+		"tools": [
+			{"type": "function", "name": "search", "description": "valid", "parameters": {"required": ["query"]}}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("minimax-test", input, false)
+	if got := gjson.GetBytes(out, "tools.0.function.parameters.type").String(); got != "object" {
+		t.Fatalf("parameters.type = %q, want object; body=%s", got, string(out))
+	}
+	if !gjson.GetBytes(out, "tools.0.function.parameters.properties").Exists() {
+		t.Fatalf("parameters.properties missing; body=%s", string(out))
+	}
+	if got := gjson.GetBytes(out, "tools.0.function.parameters.required.0").String(); got != "query" {
+		t.Fatalf("parameters.required[0] = %q, want query; body=%s", got, string(out))
+	}
+}
