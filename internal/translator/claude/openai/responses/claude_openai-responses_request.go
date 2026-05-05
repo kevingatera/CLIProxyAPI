@@ -343,18 +343,39 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
 		toolsJSON := "[]"
 		tools.ForEach(func(_, tool gjson.Result) bool {
-			tJSON := `{"name":"","description":"","input_schema":{}}`
-			if n := tool.Get("name"); n.Exists() {
-				tJSON, _ = sjson.Set(tJSON, "name", n.String())
+			toolType := tool.Get("type").String()
+			if toolType != "" && toolType != "function" {
+				return true
 			}
+
+			name := strings.TrimSpace(tool.Get("name").String())
+			if name == "" {
+				return true
+			}
+
+			tJSON := `{"name":"","description":"","input_schema":{"type":"object","properties":{}}}`
+			tJSON, _ = sjson.Set(tJSON, "name", name)
+
 			if d := tool.Get("description"); d.Exists() {
 				tJSON, _ = sjson.Set(tJSON, "description", d.String())
 			}
 
-			if params := tool.Get("parameters"); params.Exists() {
+			if params := tool.Get("parameters"); hasUsableClaudeToolSchema(params) {
 				tJSON, _ = sjson.SetRaw(tJSON, "input_schema", params.Raw)
-			} else if params = tool.Get("parametersJsonSchema"); params.Exists() {
+				if !params.Get("type").Exists() {
+					tJSON, _ = sjson.Set(tJSON, "input_schema.type", "object")
+				}
+				if !params.Get("properties").Exists() {
+					tJSON, _ = sjson.SetRaw(tJSON, "input_schema.properties", `{}`)
+				}
+			} else if params = tool.Get("parametersJsonSchema"); hasUsableClaudeToolSchema(params) {
 				tJSON, _ = sjson.SetRaw(tJSON, "input_schema", params.Raw)
+				if !params.Get("type").Exists() {
+					tJSON, _ = sjson.Set(tJSON, "input_schema.type", "object")
+				}
+				if !params.Get("properties").Exists() {
+					tJSON, _ = sjson.SetRaw(tJSON, "input_schema.properties", `{}`)
+				}
 			}
 
 			toolsJSON, _ = sjson.SetRaw(toolsJSON, "-1", tJSON)
@@ -390,4 +411,8 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	}
 
 	return []byte(out)
+}
+
+func hasUsableClaudeToolSchema(params gjson.Result) bool {
+	return params.Exists() && params.IsObject() && strings.TrimSpace(params.Raw) != "{}"
 }
