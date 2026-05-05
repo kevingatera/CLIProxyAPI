@@ -170,14 +170,16 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				return true
 			}
 
-			chatTool := `{"type":"function","function":{}}`
-
 			// Convert tool structure from responses format to chat completions format
-			function := `{"name":"","description":"","parameters":{}}`
-
-			if name := tool.Get("name"); name.Exists() {
-				function, _ = sjson.Set(function, "name", name.String())
+			name := strings.TrimSpace(tool.Get("name").String())
+			if name == "" {
+				return true
 			}
+
+			chatTool := `{"type":"function","function":{}}`
+			function := `{"name":"","description":"","parameters":{"type":"object","properties":{}}}`
+
+			function, _ = sjson.Set(function, "name", name)
 
 			if description := tool.Get("description"); description.Exists() {
 				function, _ = sjson.Set(function, "description", description.String())
