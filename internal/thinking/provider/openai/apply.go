@@ -45,6 +45,8 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		modelID := ""
 		if modelInfo != nil {
 			modelID = modelInfo.ID
+		} else if gjson.ValidBytes(body) {
+			modelID = gjson.GetBytes(body, "model").String()
 		}
 		return applyCompatibleOpenAI(body, config, modelID)
 	}

@@ -114,3 +114,15 @@ func TestApplyThinking_UserDefinedDeepSeekV4StripsReasoningEffort(t *testing.T) 
 		t.Fatalf("reasoning_effort should be stripped for DeepSeek v4 compatible models, body=%s", string(out))
 	}
 }
+
+func TestApplyThinking_UnknownDeepSeekV4StripsReasoningEffort(t *testing.T) {
+	modelID := "unknown-client/deepseek-v4-pro"
+	body := []byte(`{"model":"unknown-client/deepseek-v4-pro","reasoning_effort":"medium","messages":[{"role":"user","content":"hi"}]}`)
+	out, err := thinking.ApplyThinking(body, modelID, "openai", "openai", "unknown-client")
+	if err != nil {
+		t.Fatalf("ApplyThinking() error = %v", err)
+	}
+	if gjson.GetBytes(out, "reasoning_effort").Exists() {
+		t.Fatalf("reasoning_effort should be stripped for unknown DeepSeek v4 compatible models, body=%s", string(out))
+	}
+}
