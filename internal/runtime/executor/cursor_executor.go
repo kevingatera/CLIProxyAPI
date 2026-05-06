@@ -210,13 +210,17 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		assistantText := strings.TrimLeft(result.Content, "\n")
 		chunkID := "chatcmpl-" + uuid.NewString()
 		created := time.Now().Unix()
-		sseChunks, buildErr := buildCursorChatCompletionStreamChunks(chunkID, created, req.Model, assistantText, result.Usage)
+		upstreamChunks, buildErr := buildCursorChatCompletionStreamChunks(chunkID, created, req.Model, assistantText, result.Usage)
 		if buildErr != nil {
 			out <- cliproxyexecutor.StreamChunk{Err: buildErr}
 			return
 		}
-		for _, payload := range sseChunks {
-			out <- cliproxyexecutor.StreamChunk{Payload: payload}
+		var param any
+		for _, payload := range upstreamChunks {
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, payload, &param)
+			for i := range chunks {
+				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+			}
 		}
 	}()
 

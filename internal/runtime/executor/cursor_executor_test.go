@@ -9,6 +9,7 @@ import (
 	"time"
 
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 )
 
 func TestCursorProviderModelID(t *testing.T) {
@@ -69,6 +70,29 @@ func TestBuildCursorChatCompletionStreamChunks(t *testing.T) {
 	}
 	if !strings.Contains(string(chunks[2]), "data: [DONE]") {
 		t.Fatalf("missing done chunk: %q", chunks[2])
+	}
+}
+
+func TestCursorChatCompletionStreamChunksTranslateToResponses(t *testing.T) {
+	upstreamChunks, err := buildCursorChatCompletionStreamChunks("chatcmpl-test", 123, "cursor/auto", "ok", parseCursorAgentUsage([]byte(`{"usage":{"inputTokens":1,"outputTokens":2}}`)))
+	if err != nil {
+		t.Fatalf("buildCursorChatCompletionStreamChunks() error: %v", err)
+	}
+
+	from := sdktranslator.FromString("openai-response")
+	to := sdktranslator.FromString("openai")
+	var param any
+	var translated []string
+	for _, chunk := range upstreamChunks {
+		translated = append(translated, sdktranslator.TranslateStream(context.Background(), to, from, "cursor/auto", nil, []byte(`{"model":"cursor/auto"}`), chunk, &param)...)
+	}
+
+	stream := strings.Join(translated, "\n")
+	if strings.Contains(stream, `"object":"chat.completion.chunk"`) {
+		t.Fatalf("chat completion chunk leaked into responses stream: %s", stream)
+	}
+	if !strings.Contains(stream, "event: response.completed") {
+		t.Fatalf("translated stream missing response.completed: %s", stream)
 	}
 }
 
