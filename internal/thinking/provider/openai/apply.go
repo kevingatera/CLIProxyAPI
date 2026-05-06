@@ -6,6 +6,8 @@
 package openai
 
 import (
+	"strings"
+
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/tidwall/gjson"
@@ -40,7 +42,11 @@ func init() {
 //	}
 func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *registry.ModelInfo) ([]byte, error) {
 	if thinking.IsUserDefinedModel(modelInfo) {
-		return applyCompatibleOpenAI(body, config)
+		modelID := ""
+		if modelInfo != nil {
+			modelID = modelInfo.ID
+		}
+		return applyCompatibleOpenAI(body, config, modelID)
 	}
 	if modelInfo.Thinking == nil {
 		return body, nil
@@ -81,9 +87,13 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 	return result, nil
 }
 
-func applyCompatibleOpenAI(body []byte, config thinking.ThinkingConfig) ([]byte, error) {
+func applyCompatibleOpenAI(body []byte, config thinking.ThinkingConfig, modelID string) ([]byte, error) {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		body = []byte(`{}`)
+	}
+
+	if shouldStripCompatibleReasoning(modelID) {
+		return thinking.StripThinkingConfig(body, "openai"), nil
 	}
 
 	var effort string
@@ -114,4 +124,12 @@ func applyCompatibleOpenAI(body []byte, config thinking.ThinkingConfig) ([]byte,
 
 	result, _ := sjson.SetBytes(body, "reasoning_effort", effort)
 	return result, nil
+}
+
+func shouldStripCompatibleReasoning(modelID string) bool {
+	id := strings.ToLower(strings.TrimSpace(modelID))
+	// DeepSeek v4's OpenAI-compatible endpoint requires provider-specific
+	// reasoning_content to be echoed in subsequent tool turns. Codex Responses
+	// does not carry that field, so disabling reasoning is the safe default.
+	return strings.Contains(id, "deepseek-v4")
 }

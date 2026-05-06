@@ -95,3 +95,22 @@ func TestApplyThinking_UserDefinedOpenAILevelSetsReasoningEffort(t *testing.T) {
 		t.Fatalf("reasoning_effort = %q, want %q, body=%s", got, "medium", string(out))
 	}
 }
+
+func TestApplyThinking_UserDefinedDeepSeekV4StripsReasoningEffort(t *testing.T) {
+	reg := registry.GetGlobalRegistry()
+	clientID := "test-user-defined-openai-deepseek-" + t.Name()
+	modelID := "opencode-go/deepseek-v4-pro"
+	reg.RegisterClient(clientID, "openai", []*registry.ModelInfo{{ID: modelID, UserDefined: true}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(clientID)
+	})
+
+	body := []byte(`{"model":"opencode-go/deepseek-v4-pro","reasoning_effort":"medium","messages":[{"role":"user","content":"hi"}]}`)
+	out, err := thinking.ApplyThinking(body, modelID, "openai", "openai", "openai")
+	if err != nil {
+		t.Fatalf("ApplyThinking() error = %v", err)
+	}
+	if gjson.GetBytes(out, "reasoning_effort").Exists() {
+		t.Fatalf("reasoning_effort should be stripped for DeepSeek v4 compatible models, body=%s", string(out))
+	}
+}
