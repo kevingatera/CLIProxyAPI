@@ -117,7 +117,7 @@ func TestApplyThinking_UserDefinedDeepSeekV4StripsReasoningEffort(t *testing.T) 
 
 func TestApplyThinking_UnknownDeepSeekV4StripsReasoningEffort(t *testing.T) {
 	modelID := "unknown-client/deepseek-v4-pro"
-	body := []byte(`{"model":"unknown-client/deepseek-v4-pro","reasoning_effort":"medium","messages":[{"role":"user","content":"hi"}]}`)
+	body := []byte(`{"model":"deepseek-reasoner","reasoning_effort":"medium","messages":[{"role":"user","content":"hi"}]}`)
 	out, err := thinking.ApplyThinking(body, modelID, "openai", "openai", "unknown-client")
 	if err != nil {
 		t.Fatalf("ApplyThinking() error = %v", err)

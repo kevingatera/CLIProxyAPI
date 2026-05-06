@@ -288,8 +288,20 @@ func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromForma
 		"level":    config.Level,
 	}).Debug("thinking: applying config for user-defined model (skip validation)")
 
+	if toFormat == "openai" && shouldStripUserDefinedOpenAIReasoning(modelID) {
+		return StripThinkingConfig(body, "openai"), nil
+	}
+
 	config = normalizeUserDefinedConfig(config, fromFormat, toFormat)
 	return applier.Apply(body, config, modelInfo)
+}
+
+func shouldStripUserDefinedOpenAIReasoning(modelID string) bool {
+	id := strings.ToLower(strings.TrimSpace(modelID))
+	// DeepSeek v4's OpenAI-compatible endpoint requires provider-specific
+	// reasoning_content to be echoed in subsequent tool turns. Codex Responses
+	// does not carry that field, so disabling reasoning is the safe default.
+	return strings.Contains(id, "deepseek-v4")
 }
 
 func normalizeUserDefinedConfig(config ThinkingConfig, fromFormat, toFormat string) ThinkingConfig {
