@@ -63,3 +63,21 @@ func TestClaudeResponsesRequestCompletesPartialToolSchema(t *testing.T) {
 		t.Fatalf("input_schema.required[0] = %q, want cmd; body=%s", got, string(out))
 	}
 }
+
+func TestClaudeResponsesRequestMapsResponsesStyleToolChoiceName(t *testing.T) {
+	input := []byte(`{
+		"input": "hello",
+		"tools": [
+			{"type": "function", "name": "get_magic_number", "parameters": {"type": "object", "properties": {}}}
+		],
+		"tool_choice": {"type": "function", "name": "get_magic_number"}
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-sonnet-4-6", input, false)
+	if got := gjson.GetBytes(out, "tool_choice.type").String(); got != "tool" {
+		t.Fatalf("tool_choice.type = %q, want tool; body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "get_magic_number" {
+		t.Fatalf("tool_choice.name = %q, want get_magic_number; body=%s", got, string(out))
+	}
+}

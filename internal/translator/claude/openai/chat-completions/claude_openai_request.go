@@ -316,6 +316,12 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 			// Specific tool choice mapping
 			if toolChoice.Get("type").String() == "function" {
 				functionName := toolChoice.Get("function.name").String()
+				if functionName == "" {
+					functionName = toolChoice.Get("name").String()
+				}
+				if functionName == "" {
+					break
+				}
 				toolChoiceJSON := `{"type":"tool","name":""}`
 				toolChoiceJSON, _ = sjson.Set(toolChoiceJSON, "name", functionName)
 				out, _ = sjson.SetRaw(out, "tool_choice", toolChoiceJSON)

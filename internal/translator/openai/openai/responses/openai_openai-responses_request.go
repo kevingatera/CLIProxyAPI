@@ -1,6 +1,7 @@
 package responses
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -46,6 +47,12 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 	if parallelToolCalls := root.Get("parallel_tool_calls"); parallelToolCalls.Exists() {
 		out, _ = sjson.Set(out, "parallel_tool_calls", parallelToolCalls.Bool())
+	}
+
+	if textFormat := root.Get("text.format"); textFormat.Exists() {
+		if responseFormat := convertResponsesTextFormatToChatResponseFormat(textFormat); responseFormat != "" {
+			out, _ = sjson.SetRaw(out, "response_format", responseFormat)
+		}
 	}
 
 	// Convert instructions to system message
@@ -215,7 +222,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 	// Convert tool_choice if present
 	if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
-		out, _ = sjson.Set(out, "tool_choice", toolChoice.String())
+		if chatToolChoice := convertResponsesToolChoiceToChatToolChoice(toolChoice); chatToolChoice != "" {
+			out, _ = sjson.SetRaw(out, "tool_choice", chatToolChoice)
+		}
 	}
 
 	return []byte(out)
@@ -223,4 +232,62 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 func hasUsableToolParameters(parameters gjson.Result) bool {
 	return parameters.Exists() && parameters.IsObject() && strings.TrimSpace(parameters.Raw) != "{}"
+}
+
+func convertResponsesTextFormatToChatResponseFormat(format gjson.Result) string {
+	formatType := strings.TrimSpace(format.Get("type").String())
+	switch formatType {
+	case "json_object":
+		return `{"type":"json_object"}`
+	case "json_schema":
+		responseFormat := `{"type":"json_schema","json_schema":{}}`
+		if jsonSchema := format.Get("json_schema"); jsonSchema.Exists() && jsonSchema.IsObject() {
+			responseFormat, _ = sjson.SetRaw(responseFormat, "json_schema", jsonSchema.Raw)
+			return responseFormat
+		}
+		if name := format.Get("name"); name.Exists() {
+			responseFormat, _ = sjson.Set(responseFormat, "json_schema.name", name.String())
+		}
+		if schema := format.Get("schema"); schema.Exists() {
+			responseFormat, _ = sjson.SetRaw(responseFormat, "json_schema.schema", schema.Raw)
+		}
+		if strict := format.Get("strict"); strict.Exists() {
+			responseFormat, _ = sjson.Set(responseFormat, "json_schema.strict", strict.Bool())
+		}
+		return responseFormat
+	case "text":
+		return `{"type":"text"}`
+	default:
+		return ""
+	}
+}
+
+func convertResponsesToolChoiceToChatToolChoice(toolChoice gjson.Result) string {
+	switch toolChoice.Type {
+	case gjson.String:
+		choice := strings.TrimSpace(toolChoice.String())
+		switch choice {
+		case "auto", "none", "required":
+			return strconv.Quote(choice)
+		default:
+			return ""
+		}
+	case gjson.JSON:
+		choiceType := strings.TrimSpace(toolChoice.Get("type").String())
+		if choiceType == "function" {
+			name := strings.TrimSpace(toolChoice.Get("function.name").String())
+			if name == "" {
+				name = strings.TrimSpace(toolChoice.Get("name").String())
+			}
+			if name == "" {
+				return ""
+			}
+			out := `{"type":"function","function":{"name":""}}`
+			out, _ = sjson.Set(out, "function.name", name)
+			return out
+		}
+		return toolChoice.Raw
+	default:
+		return ""
+	}
 }

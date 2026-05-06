@@ -79,3 +79,54 @@ func TestResponsesRequestCompletesPartialToolParameterSchema(t *testing.T) {
 		t.Fatalf("parameters.required[0] = %q, want query; body=%s", got, string(out))
 	}
 }
+
+func TestResponsesRequestMapsTextFormatToResponseFormat(t *testing.T) {
+	input := []byte(`{
+		"input": "hello",
+		"text": {
+			"format": {
+				"type": "json_schema",
+				"name": "answer_schema",
+				"strict": true,
+				"schema": {
+					"type": "object",
+					"properties": {"answer": {"type": "string"}},
+					"required": ["answer"],
+					"additionalProperties": false
+				}
+			}
+		}
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("minimax-test", input, false)
+	if got := gjson.GetBytes(out, "response_format.type").String(); got != "json_schema" {
+		t.Fatalf("response_format.type = %q, want json_schema; body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "response_format.json_schema.name").String(); got != "answer_schema" {
+		t.Fatalf("response_format.json_schema.name = %q, want answer_schema; body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "response_format.json_schema.schema.required.0").String(); got != "answer" {
+		t.Fatalf("response_format schema missing required field; body=%s", string(out))
+	}
+}
+
+func TestResponsesRequestMapsResponsesToolChoiceObjectToChatToolChoice(t *testing.T) {
+	input := []byte(`{
+		"input": "hello",
+		"tools": [
+			{"type": "function", "name": "get_magic_number"}
+		],
+		"tool_choice": {"type": "function", "name": "get_magic_number"}
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("minimax-test", input, false)
+	if got := gjson.GetBytes(out, "messages.0.content").String(); got != "hello" {
+		t.Fatalf("messages.0.content = %q, want hello; body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tool_choice.type").String(); got != "function" {
+		t.Fatalf("tool_choice.type = %q, want function; body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tool_choice.function.name").String(); got != "get_magic_number" {
+		t.Fatalf("tool_choice.function.name = %q, want get_magic_number; body=%s", got, string(out))
+	}
+}

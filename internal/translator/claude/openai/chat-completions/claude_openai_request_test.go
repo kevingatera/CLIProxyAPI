@@ -135,3 +135,29 @@ func TestConvertOpenAIRequestToClaude_ToolResultURLImageOnly(t *testing.T) {
 		t.Fatalf("Unexpected image URL: %q", got)
 	}
 }
+
+func TestConvertOpenAIRequestToClaude_ToolChoiceAcceptsResponsesStyleName(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-sonnet-4-6",
+		"messages": [{"role": "user", "content": "call the tool"}],
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "get_magic_number",
+					"description": "Return magic",
+					"parameters": {"type": "object", "properties": {}}
+				}
+			}
+		],
+		"tool_choice": {"type": "function", "name": "get_magic_number"}
+	}`
+
+	result := ConvertOpenAIRequestToClaude("claude-sonnet-4-6", []byte(inputJSON), false)
+	if got := gjson.GetBytes(result, "tool_choice.type").String(); got != "tool" {
+		t.Fatalf("tool_choice.type = %q, want tool; body=%s", got, string(result))
+	}
+	if got := gjson.GetBytes(result, "tool_choice.name").String(); got != "get_magic_number" {
+		t.Fatalf("tool_choice.name = %q, want get_magic_number; body=%s", got, string(result))
+	}
+}
