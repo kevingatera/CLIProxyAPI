@@ -95,6 +95,12 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 	if fromFormat == "" {
 		fromFormat = providerFormat
 	}
+	suffixResult := ParseSuffix(model)
+	baseModel := suffixResult.ModelName
+	if isOpenAICompatibleThinkingFormat(providerFormat) && shouldStripUserDefinedOpenAIReasoning(baseModel) {
+		return StripThinkingConfig(body, providerFormat), nil
+	}
+
 	// 1. Route check: Get provider applier
 	applier := GetProviderApplier(providerFormat)
 	if applier == nil {
@@ -106,11 +112,6 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 	}
 
 	// 2. Parse suffix and get modelInfo
-	suffixResult := ParseSuffix(model)
-	baseModel := suffixResult.ModelName
-	if providerFormat == "openai" && shouldStripUserDefinedOpenAIReasoning(baseModel) {
-		return StripThinkingConfig(body, providerFormat), nil
-	}
 	// Use provider-specific lookup to handle capability differences across providers.
 	modelInfo := registry.LookupModelInfo(baseModel, providerKey)
 
@@ -305,6 +306,10 @@ func shouldStripUserDefinedOpenAIReasoning(modelID string) bool {
 	// reasoning_content to be echoed in subsequent tool turns. Codex Responses
 	// does not carry that field, so disabling reasoning is the safe default.
 	return strings.Contains(id, "deepseek-v4")
+}
+
+func isOpenAICompatibleThinkingFormat(provider string) bool {
+	return provider == "openai" || provider == "openai-response"
 }
 
 func normalizeUserDefinedConfig(config ThinkingConfig, fromFormat, toFormat string) ThinkingConfig {
