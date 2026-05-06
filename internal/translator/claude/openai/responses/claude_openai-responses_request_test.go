@@ -81,3 +81,24 @@ func TestClaudeResponsesRequestMapsResponsesStyleToolChoiceName(t *testing.T) {
 		t.Fatalf("tool_choice.name = %q, want get_magic_number; body=%s", got, string(out))
 	}
 }
+
+func TestClaudeResponsesRequestMapsStringInputToUserMessage(t *testing.T) {
+	input := []byte(`{
+		"input": "Call get_magic_number now.",
+		"tools": [
+			{"type": "function", "name": "get_magic_number", "parameters": {"type": "object", "properties": {}}}
+		],
+		"tool_choice": {"type": "function", "name": "get_magic_number"}
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("opencode-go/minimax-m2.5", input, false)
+	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "user" {
+		t.Fatalf("messages.0.role = %q, want user; body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "messages.0.content").String(); got != "Call get_magic_number now." {
+		t.Fatalf("messages.0.content = %q, want input text; body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "get_magic_number" {
+		t.Fatalf("tool_choice.name = %q, want get_magic_number; body=%s", got, string(out))
+	}
+}

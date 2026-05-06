@@ -337,6 +337,10 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			}
 			return true
 		})
+	} else if input.Type == gjson.String {
+		msg := `{"role":"user","content":""}`
+		msg, _ = sjson.Set(msg, "content", input.String())
+		out, _ = sjson.SetRaw(out, "messages.-1", msg)
 	}
 
 	// tools mapping: parameters -> input_schema
