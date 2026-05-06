@@ -1,6 +1,7 @@
 package responses
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -128,5 +129,28 @@ func TestResponsesRequestMapsResponsesToolChoiceObjectToChatToolChoice(t *testin
 	}
 	if got := gjson.GetBytes(out, "tool_choice.function.name").String(); got != "get_magic_number" {
 		t.Fatalf("tool_choice.function.name = %q, want get_magic_number; body=%s", got, string(out))
+	}
+}
+
+func TestResponsesRequestTextualizesDeepSeekV4ToolTurns(t *testing.T) {
+	input := []byte(`{
+		"input": [
+			{"type":"function_call","call_id":"call_1","name":"exec","arguments":"{\"cmd\":\"ls\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"file.txt"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("opencode-go/deepseek-v4-pro", input, false)
+	if gjson.GetBytes(out, "messages.0.tool_calls").Exists() {
+		t.Fatalf("tool_calls should be textualized for DeepSeek v4; body=%s", string(out))
+	}
+	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "assistant" {
+		t.Fatalf("messages.0.role = %q, want assistant; body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "messages.1.role").String(); got != "user" {
+		t.Fatalf("messages.1.role = %q, want user; body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "messages.1.content").String(); !strings.Contains(got, "file.txt") {
+		t.Fatalf("tool output content = %q, want file.txt; body=%s", got, string(out))
 	}
 }

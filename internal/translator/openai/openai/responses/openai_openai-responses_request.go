@@ -33,6 +33,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	out := `{"model":"","messages":[],"stream":false}`
 
 	root := gjson.ParseBytes(rawJSON)
+	deepSeekV4TextTools := shouldTextualizeToolTurns(modelName)
 
 	// Set model name
 	out, _ = sjson.Set(out, "model", modelName)
@@ -119,6 +120,22 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				out, _ = sjson.SetRaw(out, "messages.-1", message)
 
 			case "function_call":
+				if deepSeekV4TextTools {
+					assistantMessage := `{"role":"assistant","content":""}`
+					name := strings.TrimSpace(item.Get("name").String())
+					arguments := strings.TrimSpace(item.Get("arguments").String())
+					text := "Called tool"
+					if name != "" {
+						text += " " + name
+					}
+					if arguments != "" {
+						text += " with arguments: " + arguments
+					}
+					assistantMessage, _ = sjson.Set(assistantMessage, "content", text)
+					out, _ = sjson.SetRaw(out, "messages.-1", assistantMessage)
+					return true
+				}
+
 				// Handle function call conversion to assistant message with tool_calls
 				assistantMessage := `{"role":"assistant","tool_calls":[]}`
 
@@ -140,6 +157,20 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				out, _ = sjson.SetRaw(out, "messages.-1", assistantMessage)
 
 			case "function_call_output":
+				if deepSeekV4TextTools {
+					toolMessage := `{"role":"user","content":""}`
+					output := item.Get("output").String()
+					callID := strings.TrimSpace(item.Get("call_id").String())
+					text := "Tool output"
+					if callID != "" {
+						text += " for call " + callID
+					}
+					text += ": " + output
+					toolMessage, _ = sjson.Set(toolMessage, "content", text)
+					out, _ = sjson.SetRaw(out, "messages.-1", toolMessage)
+					return true
+				}
+
 				// Handle function call output conversion to tool message
 				toolMessage := `{"role":"tool","tool_call_id":"","content":""}`
 
@@ -228,6 +259,10 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	}
 
 	return []byte(out)
+}
+
+func shouldTextualizeToolTurns(modelName string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(modelName)), "deepseek-v4")
 }
 
 func hasUsableToolParameters(parameters gjson.Result) bool {
