@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -54,6 +55,49 @@ func TestCursorPromptFromOpenAIPayload(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "ASSISTANT:\nHi there") {
 		t.Fatalf("prompt missing assistant section: %q", prompt)
+	}
+}
+
+func TestCursorPromptFromOpenAIPayloadWithAttachments(t *testing.T) {
+	payload := []byte(`{
+		"messages": [
+			{"role":"user","content":[
+				{"type":"text","text":"What color is this?"},
+				{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}
+			]}
+		]
+	}`)
+	prompt, cleanup, err := cursorPromptFromOpenAIPayloadWithAttachments(payload)
+	if err != nil {
+		t.Fatalf("cursorPromptFromOpenAIPayloadWithAttachments() error: %v", err)
+	}
+	defer cleanup()
+	if strings.Contains(prompt, "data:image/png") {
+		t.Fatalf("prompt leaked image data URL: %q", prompt)
+	}
+	if !strings.Contains(prompt, "[image attached]") {
+		t.Fatalf("prompt missing image placeholder: %q", prompt)
+	}
+	if !strings.Contains(prompt, "Attached image files for this request:") {
+		t.Fatalf("prompt missing attachment list: %q", prompt)
+	}
+	idx := strings.Index(prompt, "- ")
+	if idx < 0 {
+		t.Fatalf("prompt missing attachment path: %q", prompt)
+	}
+	path := strings.Fields(prompt[idx+2:])[0]
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("attachment path was not written: %v", err)
+	}
+}
+
+func TestCursorPayloadHasImage(t *testing.T) {
+	payload := []byte(`{"input":[{"role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}]}]}`)
+	if !cursorPayloadHasImage(payload) {
+		t.Fatal("expected responses image payload to be detected")
+	}
+	if cursorPayloadHasImage([]byte(`{"messages":[{"role":"user","content":"hi"}]}`)) {
+		t.Fatal("unexpected image detection for text-only payload")
 	}
 }
 

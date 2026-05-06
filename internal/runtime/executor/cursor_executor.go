@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -78,8 +80,9 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		model = "auto"
 	}
 	canonicalModel := cursorCanonicalRequestModel(req.Model)
+	forceAgent := cursorRequestHasImage(req, opts)
 
-	if e.shouldTryCursorACP(auth) {
+	if !forceAgent && e.shouldTryCursorACP(auth) {
 		compatReq := req
 		compatReq.Model = canonicalModel
 		if e.cursorACPReachable(ctx, auth) {
@@ -114,7 +117,11 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 
-	prompt := cursorPromptFromOpenAIPayload(translated)
+	prompt, cleanupImages, prepErr := cursorPromptFromOpenAIPayloadWithAttachments(translated)
+	if prepErr != nil {
+		return resp, prepErr
+	}
+	defer cleanupImages()
 	if strings.TrimSpace(prompt) == "" {
 		return resp, statusErr{code: http.StatusBadRequest, msg: "cursor executor: empty prompt"}
 	}
@@ -148,8 +155,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		model = "auto"
 	}
 	canonicalModel := cursorCanonicalRequestModel(req.Model)
+	forceAgent := cursorRequestHasImage(req, opts)
 
-	if e.shouldTryCursorACP(auth) {
+	if !forceAgent && e.shouldTryCursorACP(auth) {
 		compatReq := req
 		compatReq.Model = canonicalModel
 		if e.cursorACPReachable(ctx, auth) {
@@ -184,8 +192,12 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, err
 	}
 
-	prompt := cursorPromptFromOpenAIPayload(translated)
+	prompt, cleanupImages, prepErr := cursorPromptFromOpenAIPayloadWithAttachments(translated)
+	if prepErr != nil {
+		return nil, prepErr
+	}
 	if strings.TrimSpace(prompt) == "" {
+		cleanupImages()
 		return nil, statusErr{code: http.StatusBadRequest, msg: "cursor executor: empty prompt"}
 	}
 
@@ -197,6 +209,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		defer cleanupImages()
 
 		result, runErr := runCursorAgent(ctx, model, prompt)
 		if runErr != nil {
@@ -455,6 +468,31 @@ func cursorPromptFromOpenAIPayload(payload []byte) string {
 	return strings.TrimSpace(strings.Join(segments, "\n\n"))
 }
 
+func cursorPromptFromOpenAIPayloadWithAttachments(payload []byte) (string, func(), error) {
+	prompt := cursorPromptFromOpenAIPayload(payload)
+	attachments, cleanup, err := cursorMaterializeImageAttachments(payload)
+	if err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	if len(attachments) == 0 {
+		return prompt, cleanup, nil
+	}
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(prompt))
+	if b.Len() > 0 {
+		b.WriteString("\n\n")
+	}
+	b.WriteString("Attached image files for this request:\n")
+	for _, path := range attachments {
+		b.WriteString("- ")
+		b.WriteString(path)
+		b.WriteString("\n")
+	}
+	b.WriteString("Inspect the local image files when answering.")
+	return strings.TrimSpace(b.String()), cleanup, nil
+}
+
 func cursorExtractMessageContent(message gjson.Result) string {
 	content := cursorFlattenContent(message.Get("content"))
 	if content == "" {
@@ -491,12 +529,185 @@ func cursorFlattenContent(content gjson.Result) string {
 		}
 		if content.Get("type").String() == "image_url" {
 			if url := strings.TrimSpace(content.Get("image_url.url").String()); url != "" {
-				return "[image] " + url
+				return cursorImageReferenceText(url)
+			}
+		}
+		if content.Get("type").String() == "input_image" {
+			if url := strings.TrimSpace(content.Get("image_url").String()); url != "" {
+				return cursorImageReferenceText(url)
 			}
 		}
 		return strings.TrimSpace(content.Raw)
 	default:
 		return strings.TrimSpace(content.String())
+	}
+}
+
+func cursorImageReferenceText(imageURL string) string {
+	imageURL = strings.TrimSpace(imageURL)
+	if imageURL == "" {
+		return ""
+	}
+	if cursorIsImageDataURL(imageURL) {
+		return "[image attached]"
+	}
+	return "[image] " + imageURL
+}
+
+func cursorRequestHasImage(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
+	if cursorPayloadHasImage(req.Payload) {
+		return true
+	}
+	return cursorPayloadHasImage(opts.OriginalRequest)
+}
+
+func cursorPayloadHasImage(payload []byte) bool {
+	payload = bytes.TrimSpace(payload)
+	if len(payload) == 0 {
+		return false
+	}
+	var root any
+	if err := json.Unmarshal(payload, &root); err != nil {
+		lower := strings.ToLower(string(payload))
+		return strings.Contains(lower, "image_url") || strings.Contains(lower, "input_image") || strings.Contains(lower, "data:image/")
+	}
+	return cursorValueHasImage(root)
+}
+
+func cursorValueHasImage(value any) bool {
+	switch v := value.(type) {
+	case map[string]any:
+		for key, child := range v {
+			lowerKey := strings.ToLower(strings.TrimSpace(key))
+			if lowerKey == "image_url" || lowerKey == "image_url_url" {
+				return true
+			}
+			if lowerKey == "type" {
+				if s, ok := child.(string); ok && strings.Contains(strings.ToLower(s), "image") {
+					return true
+				}
+			}
+			if cursorValueHasImage(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if cursorValueHasImage(child) {
+				return true
+			}
+		}
+	case string:
+		return cursorIsImageDataURL(v)
+	}
+	return false
+}
+
+func cursorMaterializeImageAttachments(payload []byte) ([]string, func(), error) {
+	cleanup := func() {}
+	payload = bytes.TrimSpace(payload)
+	if len(payload) == 0 {
+		return nil, cleanup, nil
+	}
+	var root any
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return nil, cleanup, nil
+	}
+	var dir string
+	var paths []string
+	seen := make(map[string]string)
+	var walk func(any) error
+	walk = func(value any) error {
+		switch v := value.(type) {
+		case map[string]any:
+			for _, child := range v {
+				if err := walk(child); err != nil {
+					return err
+				}
+			}
+		case []any:
+			for _, child := range v {
+				if err := walk(child); err != nil {
+					return err
+				}
+			}
+		case string:
+			imageURL := strings.TrimSpace(v)
+			if !cursorIsImageDataURL(imageURL) {
+				return nil
+			}
+			if path, ok := seen[imageURL]; ok {
+				paths = append(paths, path)
+				return nil
+			}
+			mediaType, data, err := cursorDecodeImageDataURL(imageURL)
+			if err != nil {
+				return err
+			}
+			if dir == "" {
+				dir, err = os.MkdirTemp("", "cliproxy-cursor-images-*")
+				if err != nil {
+					return fmt.Errorf("cursor executor: create image temp dir: %w", err)
+				}
+				cleanup = func() { _ = os.RemoveAll(dir) }
+			}
+			path := filepath.Join(dir, fmt.Sprintf("image-%d%s", len(seen)+1, cursorImageExtension(mediaType)))
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				return fmt.Errorf("cursor executor: write image attachment: %w", err)
+			}
+			seen[imageURL] = path
+			paths = append(paths, path)
+		}
+		return nil
+	}
+	if err := walk(root); err != nil {
+		cleanup()
+		return nil, func() {}, err
+	}
+	return paths, cleanup, nil
+}
+
+func cursorIsImageDataURL(value string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(value)), "data:image/")
+}
+
+func cursorDecodeImageDataURL(value string) (string, []byte, error) {
+	value = strings.TrimSpace(value)
+	comma := strings.IndexByte(value, ',')
+	if comma < 0 {
+		return "", nil, statusErr{code: http.StatusBadRequest, msg: "cursor executor: malformed image data URL"}
+	}
+	meta := strings.TrimSpace(value[len("data:"):comma])
+	dataPart := strings.TrimSpace(value[comma+1:])
+	mediaType := meta
+	if semi := strings.IndexByte(mediaType, ';'); semi >= 0 {
+		mediaType = mediaType[:semi]
+	}
+	if !strings.HasPrefix(strings.ToLower(mediaType), "image/") {
+		return "", nil, statusErr{code: http.StatusBadRequest, msg: "cursor executor: data URL is not an image"}
+	}
+	if !strings.Contains(strings.ToLower(meta), ";base64") {
+		return "", nil, statusErr{code: http.StatusBadRequest, msg: "cursor executor: image data URL must be base64 encoded"}
+	}
+	data, err := base64.StdEncoding.DecodeString(dataPart)
+	if err != nil {
+		return "", nil, statusErr{code: http.StatusBadRequest, msg: "cursor executor: invalid image base64 data"}
+	}
+	return strings.ToLower(mediaType), data, nil
+}
+
+func cursorImageExtension(mediaType string) string {
+	switch strings.ToLower(strings.TrimSpace(mediaType)) {
+	case "image/jpeg", "image/jpg":
+		return ".jpg"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "image/bmp":
+		return ".bmp"
+	default:
+		return ".png"
 	}
 }
 
