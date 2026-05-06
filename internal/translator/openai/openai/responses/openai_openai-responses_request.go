@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -33,7 +34,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	out := `{"model":"","messages":[],"stream":false}`
 
 	root := gjson.ParseBytes(rawJSON)
-	deepSeekV4TextTools := shouldTextualizeToolTurns(modelName)
+	textualizeToolTurns := thinking.RequiresReasoningSideChannelReplay(modelName)
 
 	// Set model name
 	out, _ = sjson.Set(out, "model", modelName)
@@ -120,7 +121,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				out, _ = sjson.SetRaw(out, "messages.-1", message)
 
 			case "function_call":
-				if deepSeekV4TextTools {
+				if textualizeToolTurns {
 					assistantMessage := `{"role":"assistant","content":""}`
 					name := strings.TrimSpace(item.Get("name").String())
 					arguments := strings.TrimSpace(item.Get("arguments").String())
@@ -157,7 +158,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				out, _ = sjson.SetRaw(out, "messages.-1", assistantMessage)
 
 			case "function_call_output":
-				if deepSeekV4TextTools {
+				if textualizeToolTurns {
 					toolMessage := `{"role":"user","content":""}`
 					output := item.Get("output").String()
 					callID := strings.TrimSpace(item.Get("call_id").String())
@@ -259,10 +260,6 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	}
 
 	return []byte(out)
-}
-
-func shouldTextualizeToolTurns(modelName string) bool {
-	return strings.Contains(strings.ToLower(strings.TrimSpace(modelName)), "deepseek-v4")
 }
 
 func hasUsableToolParameters(parameters gjson.Result) bool {

@@ -97,7 +97,7 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 	}
 	suffixResult := ParseSuffix(model)
 	baseModel := suffixResult.ModelName
-	if isOpenAICompatibleThinkingFormat(providerFormat) && shouldStripUserDefinedOpenAIReasoning(baseModel) {
+	if isOpenAICompatibleThinkingFormat(providerFormat) && RequiresReasoningSideChannelReplay(baseModel) {
 		return StripThinkingConfig(body, providerFormat), nil
 	}
 
@@ -292,7 +292,7 @@ func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromForma
 		"level":    config.Level,
 	}).Debug("thinking: applying config for user-defined model (skip validation)")
 
-	if toFormat == "openai" && shouldStripUserDefinedOpenAIReasoning(modelID) {
+	if toFormat == "openai" && RequiresReasoningSideChannelReplay(modelID) {
 		return StripThinkingConfig(body, "openai"), nil
 	}
 
@@ -300,12 +300,26 @@ func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromForma
 	return applier.Apply(body, config, modelInfo)
 }
 
-func shouldStripUserDefinedOpenAIReasoning(modelID string) bool {
+// RequiresReasoningSideChannelReplay reports whether a model family exposes
+// hidden reasoning fields that must be replayed with later tool results.
+//
+// The OpenAI Responses shape used by Codex does not round-trip provider-specific
+// fields such as reasoning_content. For these models, CLIProxy must avoid
+// structured tool replay and avoid enabling provider reasoning unless a dedicated
+// side-channel bridge exists.
+func RequiresReasoningSideChannelReplay(modelID string) bool {
 	id := strings.ToLower(strings.TrimSpace(modelID))
-	// DeepSeek v4's OpenAI-compatible endpoint requires provider-specific
-	// reasoning_content to be echoed in subsequent tool turns. Codex Responses
-	// does not carry that field, so disabling reasoning is the safe default.
-	return strings.Contains(id, "deepseek-v4")
+	for _, pattern := range []string{
+		// Observed on opencode-go DeepSeek v4: upstream streams
+		// reasoning_content and rejects later tool-result turns unless that
+		// provider-specific field is replayed.
+		"deepseek-v4",
+	} {
+		if strings.Contains(id, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 func isOpenAICompatibleThinkingFormat(provider string) bool {

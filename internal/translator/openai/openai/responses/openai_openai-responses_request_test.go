@@ -132,7 +132,7 @@ func TestResponsesRequestMapsResponsesToolChoiceObjectToChatToolChoice(t *testin
 	}
 }
 
-func TestResponsesRequestTextualizesDeepSeekV4ToolTurns(t *testing.T) {
+func TestResponsesRequestTextualizesReasoningSideChannelToolTurns(t *testing.T) {
 	input := []byte(`{
 		"input": [
 			{"type":"function_call","call_id":"call_1","name":"exec","arguments":"{\"cmd\":\"ls\"}"},
@@ -142,7 +142,7 @@ func TestResponsesRequestTextualizesDeepSeekV4ToolTurns(t *testing.T) {
 
 	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("opencode-go/deepseek-v4-pro", input, false)
 	if gjson.GetBytes(out, "messages.0.tool_calls").Exists() {
-		t.Fatalf("tool_calls should be textualized for DeepSeek v4; body=%s", string(out))
+		t.Fatalf("tool_calls should be textualized for reasoning side-channel models; body=%s", string(out))
 	}
 	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "assistant" {
 		t.Fatalf("messages.0.role = %q, want assistant; body=%s", got, string(out))

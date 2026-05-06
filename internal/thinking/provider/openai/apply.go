@@ -6,8 +6,6 @@
 package openai
 
 import (
-	"strings"
-
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/tidwall/gjson"
@@ -94,7 +92,7 @@ func applyCompatibleOpenAI(body []byte, config thinking.ThinkingConfig, modelID 
 		body = []byte(`{}`)
 	}
 
-	if shouldStripCompatibleReasoning(modelID) {
+	if thinking.RequiresReasoningSideChannelReplay(modelID) {
 		return thinking.StripThinkingConfig(body, "openai"), nil
 	}
 
@@ -126,12 +124,4 @@ func applyCompatibleOpenAI(body []byte, config thinking.ThinkingConfig, modelID 
 
 	result, _ := sjson.SetBytes(body, "reasoning_effort", effort)
 	return result, nil
-}
-
-func shouldStripCompatibleReasoning(modelID string) bool {
-	id := strings.ToLower(strings.TrimSpace(modelID))
-	// DeepSeek v4's OpenAI-compatible endpoint requires provider-specific
-	// reasoning_content to be echoed in subsequent tool turns. Codex Responses
-	// does not carry that field, so disabling reasoning is the safe default.
-	return strings.Contains(id, "deepseek-v4")
 }

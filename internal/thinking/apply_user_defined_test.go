@@ -96,9 +96,9 @@ func TestApplyThinking_UserDefinedOpenAILevelSetsReasoningEffort(t *testing.T) {
 	}
 }
 
-func TestApplyThinking_UserDefinedDeepSeekV4StripsReasoningEffort(t *testing.T) {
+func TestApplyThinking_UserDefinedReasoningSideChannelModelStripsReasoningEffort(t *testing.T) {
 	reg := registry.GetGlobalRegistry()
-	clientID := "test-user-defined-openai-deepseek-" + t.Name()
+	clientID := "test-user-defined-openai-sidechannel-" + t.Name()
 	modelID := "opencode-go/deepseek-v4-pro"
 	reg.RegisterClient(clientID, "openai", []*registry.ModelInfo{{ID: modelID, UserDefined: true}})
 	t.Cleanup(func() {
@@ -111,11 +111,11 @@ func TestApplyThinking_UserDefinedDeepSeekV4StripsReasoningEffort(t *testing.T) 
 		t.Fatalf("ApplyThinking() error = %v", err)
 	}
 	if gjson.GetBytes(out, "reasoning_effort").Exists() {
-		t.Fatalf("reasoning_effort should be stripped for DeepSeek v4 compatible models, body=%s", string(out))
+		t.Fatalf("reasoning_effort should be stripped for reasoning side-channel models, body=%s", string(out))
 	}
 }
 
-func TestApplyThinking_UnknownDeepSeekV4StripsReasoningEffort(t *testing.T) {
+func TestApplyThinking_UnknownReasoningSideChannelModelStripsReasoningEffort(t *testing.T) {
 	modelID := "unknown-client/deepseek-v4-pro"
 	body := []byte(`{"model":"deepseek-reasoner","reasoning_effort":"medium","messages":[{"role":"user","content":"hi"}]}`)
 	out, err := thinking.ApplyThinking(body, modelID, "openai", "openai", "unknown-client")
@@ -123,11 +123,11 @@ func TestApplyThinking_UnknownDeepSeekV4StripsReasoningEffort(t *testing.T) {
 		t.Fatalf("ApplyThinking() error = %v", err)
 	}
 	if gjson.GetBytes(out, "reasoning_effort").Exists() {
-		t.Fatalf("reasoning_effort should be stripped for unknown DeepSeek v4 compatible models, body=%s", string(out))
+		t.Fatalf("reasoning_effort should be stripped for unknown reasoning side-channel models, body=%s", string(out))
 	}
 }
 
-func TestApplyThinking_DeepSeekV4OpenAIResponseStripsReasoning(t *testing.T) {
+func TestApplyThinking_OpenAIResponseReasoningSideChannelModelStripsReasoning(t *testing.T) {
 	modelID := "opencode-go/deepseek-v4-pro"
 	body := []byte(`{"model":"deepseek-reasoner","reasoning":{"effort":"medium"},"input":"hi"}`)
 	out, err := thinking.ApplyThinking(body, modelID, "openai-response", "openai-response", "opencode-go")
@@ -135,6 +135,6 @@ func TestApplyThinking_DeepSeekV4OpenAIResponseStripsReasoning(t *testing.T) {
 		t.Fatalf("ApplyThinking() error = %v", err)
 	}
 	if gjson.GetBytes(out, "reasoning").Exists() {
-		t.Fatalf("reasoning should be stripped for DeepSeek v4 responses-compatible models, body=%s", string(out))
+		t.Fatalf("reasoning should be stripped for responses-compatible reasoning side-channel models, body=%s", string(out))
 	}
 }
