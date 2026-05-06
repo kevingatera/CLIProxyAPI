@@ -94,10 +94,10 @@ func applyCompatibleOpenAI(body []byte, config thinking.ThinkingConfig) ([]byte,
 		}
 		effort = string(config.Level)
 	case thinking.ModeNone:
-		effort = string(thinking.LevelNone)
-		if config.Level != "" {
-			effort = string(config.Level)
-		}
+		// User-defined OpenAI-compatible providers vary in what values they
+		// accept. Treat "none" as disabled thinking by removing the field rather
+		// than forwarding a literal value that many upstreams reject.
+		return thinking.StripThinkingConfig(body, "openai"), nil
 	case thinking.ModeAuto:
 		// Auto mode for user-defined models: pass through as "auto"
 		effort = string(thinking.LevelAuto)
