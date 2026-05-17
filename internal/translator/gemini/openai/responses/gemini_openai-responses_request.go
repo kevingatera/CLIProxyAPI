@@ -350,11 +350,18 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				out, _ = sjson.SetRaw(out, "contents.-1", functionContent)
 
 			case "reasoning":
-				thoughtContent := `{"role":"model","parts":[]}`
-				thought := `{"text":"","thoughtSignature":"","thought":true}`
-				thought, _ = sjson.Set(thought, "text", item.Get("summary.0.text").String())
-				thought, _ = sjson.Set(thought, "thoughtSignature", item.Get("encrypted_content").String())
+				reasoningText := responsesReasoningSummaryText(item)
+				thoughtSignature := strings.TrimSpace(item.Get("encrypted_content").String())
+				if !shouldReplayResponsesReasoningAsGeminiThought(modelName, reasoningText, thoughtSignature) {
+					break
+				}
 
+				thoughtContent := `{"role":"model","parts":[]}`
+				thought := `{"text":"","thought":true}`
+				thought, _ = sjson.Set(thought, "text", reasoningText)
+				if thoughtSignature != "" {
+					thought, _ = sjson.Set(thought, "thoughtSignature", thoughtSignature)
+				}
 				thoughtContent, _ = sjson.SetRaw(thoughtContent, "parts.-1", thought)
 				out, _ = sjson.SetRaw(out, "contents.-1", thoughtContent)
 			}
@@ -451,4 +458,35 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 	result := []byte(out)
 	result = common.AttachDefaultSafetySettings(result, "safetySettings")
 	return result
+}
+
+func responsesReasoningSummaryText(item gjson.Result) string {
+	summary := item.Get("summary")
+	if !summary.Exists() || !summary.IsArray() {
+		return ""
+	}
+
+	var parts []string
+	summary.ForEach(func(_, part gjson.Result) bool {
+		if typ := part.Get("type").String(); typ != "" && typ != "summary_text" {
+			return true
+		}
+		text := strings.TrimSpace(part.Get("text").String())
+		if text != "" {
+			parts = append(parts, text)
+		}
+		return true
+	})
+
+	return strings.Join(parts, "\n\n")
+}
+
+func shouldReplayResponsesReasoningAsGeminiThought(modelName, text, thoughtSignature string) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	if strings.Contains(strings.ToLower(modelName), "claude") && strings.TrimSpace(thoughtSignature) == "" {
+		return false
+	}
+	return true
 }
