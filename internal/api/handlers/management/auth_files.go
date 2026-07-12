@@ -38,6 +38,12 @@ type diskAuthFileCandidate struct {
 	info  os.FileInfo
 }
 
+// shouldHideReservedAuthFile reports whether a reserved/internal auth-directory
+// file should be hidden from management auth-file listings.
+func shouldHideReservedAuthFile(name string) bool {
+	return strings.EqualFold(strings.TrimSpace(name), "usage_stats.json")
+}
+
 var (
 	callbackForwardersMu       sync.Mutex
 	callbackForwarders         = make(map[int]*callbackForwarder)
@@ -406,6 +412,9 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, pagination authFilesPagi
 		if !strings.HasSuffix(strings.ToLower(name), ".json") {
 			continue
 		}
+		if shouldHideReservedAuthFile(name) {
+			continue
+		}
 		if info, errInfo := e.Info(); errInfo == nil {
 			matching = append(matching, diskAuthFileCandidate{entry: e, info: info})
 		}
@@ -648,6 +657,9 @@ func reconcileAuthFileCooldownState(auth *coreauth.Auth, now time.Time) (unavail
 
 func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQuotaContext) gin.H {
 	if auth == nil {
+		return nil
+	}
+	if shouldHideReservedAuthFile(auth.FileName) {
 		return nil
 	}
 	auth.EnsureIndex()

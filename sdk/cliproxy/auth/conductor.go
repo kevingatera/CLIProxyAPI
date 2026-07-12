@@ -244,6 +244,11 @@ type Manager struct {
 	// authLoadGate allows concurrent credential transactions, but excludes whole-store reloads.
 	// Mutations acquire one permit; Load acquires all permits before reading the store.
 	authLoadGate *semaphore.Weighted
+
+	// routingTraces holds a bounded ring buffer of recent route execution traces.
+	routingTraces     []RoutingTrace
+	routingTraceMu    sync.Mutex
+	routingTraceLimit atomic.Int32
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
