@@ -20,6 +20,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginstore"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -63,6 +64,7 @@ type Handler struct {
 	pluginReleases          pluginReleaseCache
 	siwcOAuthFactory        func(*config.Config) siwcOAuthService
 	siwcCommitMu            sync.Mutex
+	usageStats *usage.RequestStatistics
 }
 
 type configReloadSnapshot struct {
@@ -83,6 +85,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
+		usageStats:          usage.GetRequestStatistics(),
 	}
 	h.startAttemptCleanup()
 	return h
@@ -207,6 +210,9 @@ func (h *Handler) SetPluginHost(host *pluginhost.Host) {
 	}
 	h.mu.Unlock()
 }
+
+// SetUsageStatistics updates the request statistics aggregator used by the usage endpoints.
+func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
 
 // SetConfigReloadHook updates the callback used after management saves config changes.
 func (h *Handler) SetConfigReloadHook(hook func(context.Context, *config.Config)) {
