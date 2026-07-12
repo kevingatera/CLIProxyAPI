@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -489,50 +490,14 @@ func parseCodexWindow(node gjson.Result) codexUsageWindow {
 	return window
 }
 
+// strconvParseFloat delegates to strconv.ParseFloat. It exists as a named
+// helper so the original hand-rolled parser could be swapped for the stdlib
+// implementation without touching call sites.
 func strconvParseFloat(v string) (float64, error) {
-	v = strings.TrimSpace(v)
-	if v == "" {
-		return 0, fmt.Errorf("empty")
-	}
-	var sign float64 = 1
-	if strings.HasPrefix(v, "-") {
-		sign = -1
-		v = strings.TrimPrefix(v, "-")
-	}
-	// only allow a simple float form
-	dot := strings.IndexByte(v, '.')
-	if dot < 0 {
-		i, err := strconvParseInt(v)
-		if err != nil {
-			return 0, err
-		}
-		return sign * float64(i), nil
-	}
-	intPart := v[:dot]
-	fracPart := v[dot+1:]
-	ii, err := strconvParseInt(intPart)
-	if err != nil {
-		return 0, err
-	}
-	ff, err := strconvParseInt(fracPart)
-	if err != nil {
-		return 0, err
-	}
-	div := math.Pow10(len(fracPart))
-	return sign * (float64(ii) + float64(ff)/div), nil
+	return strconv.ParseFloat(strings.TrimSpace(v), 64)
 }
 
+// strconvParseInt delegates to strconv.ParseInt (base 10, int64 width).
 func strconvParseInt(v string) (int64, error) {
-	if v == "" {
-		return 0, fmt.Errorf("empty")
-	}
-	var n int64
-	for i := 0; i < len(v); i++ {
-		ch := v[i]
-		if ch < '0' || ch > '9' {
-			return 0, fmt.Errorf("invalid digit")
-		}
-		n = n*10 + int64(ch-'0')
-	}
-	return n, nil
+	return strconv.ParseInt(strings.TrimSpace(v), 10, 64)
 }
