@@ -35,6 +35,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/safemode"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
@@ -256,6 +257,9 @@ type Server struct {
 
 	exampleAPIKeySafeModeEnabled bool
 	exampleAPIKeySafeModeActive  atomic.Bool
+
+	// usagePersistence periodically flushes in-memory usage statistics to disk.
+	usagePersistence *usage.Persistence
 }
 
 // NewServer creates and initializes a new API server instance.
@@ -368,6 +372,8 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		s.mgmt.SetPostAuthPersistHook(optionState.postAuthPersistHook)
 	}
 	s.localPassword = optionState.localPassword
+
+	s.configureUsagePersistence(nil, cfg)
 
 	// Home heartbeat gate: when home is enabled, block all endpoints with 503 until the
 	// subscribe-config heartbeat connection is healthy.
@@ -706,6 +712,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/usage-statistics-enabled", s.mgmt.GetUsageStatisticsEnabled)
 		mgmt.PUT("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
 		mgmt.PATCH("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
+
+		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
+		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
+		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
 
 		mgmt.GET("/proxy-url", s.mgmt.GetProxyURL)
 		mgmt.PUT("/proxy-url", s.mgmt.PutProxyURL)
@@ -1724,6 +1734,8 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 
 	applySignatureCacheConfig(oldCfg, cfg)
 
+	s.configureUsagePersistence(oldCfg, cfg)
+
 	if s.handlers != nil && s.handlers.AuthManager != nil {
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
 	}
@@ -1906,3 +1918,68 @@ func configuredSignatureBypassStrict(cfg *config.Config) bool {
 	}
 	return false
 }
+
+// configureUsagePersistence starts, stops, or restarts the background usage
+// statistics persistence goroutine based on the current configuration. It is
+// safe to call repeatedly (during initial server setup and on config reload).
+func (s *Server) configureUsagePersistence(oldCfg, newCfg *config.Config) {
+	if s == nil {
+		return
+	}
+	shouldPersist := newCfg != nil && newCfg.UsageStatisticsEnabled && (newCfg.UsageStatisticsPersist || strings.TrimSpace(newCfg.UsageStatisticsFile) != "")
+	resolvePath := func() string {
+		return resolveUsageStatisticsPath(newCfg, s.configFilePath)
+	}
+	desiredPath := ""
+	desiredInterval := 60 * time.Second
+	if newCfg != nil && newCfg.UsageStatisticsSaveIntervalSeconds > 0 {
+		desiredInterval = time.Duration(newCfg.UsageStatisticsSaveIntervalSeconds) * time.Second
+	}
+	if shouldPersist {
+		desiredPath = resolvePath()
+	}
+	needsRestart := func() bool {
+		if !shouldPersist {
+			return s.usagePersistence != nil
+		}
+		if s.usagePersistence == nil {
+			return true
+		}
+		if oldCfg == nil {
+			return true
+		}
+		if oldCfg.UsageStatisticsEnabled != newCfg.UsageStatisticsEnabled ||
+			oldCfg.UsageStatisticsPersist != newCfg.UsageStatisticsPersist ||
+			strings.TrimSpace(oldCfg.UsageStatisticsFile) != strings.TrimSpace(newCfg.UsageStatisticsFile) ||
+			oldCfg.UsageStatisticsSaveIntervalSeconds != newCfg.UsageStatisticsSaveIntervalSeconds {
+			return true
+		}
+		return false
+	}
+	if !needsRestart() {
+		return
+	}
+	if s.usagePersistence != nil {
+		s.usagePersistence.Stop()
+		s.usagePersistence = nil
+	}
+	if !shouldPersist || desiredPath == "" {
+		return
+	}
+	if newCfg != nil && strings.TrimSpace(newCfg.UsageStatisticsFile) == "" {
+		if err := migrateUsageStatisticsFile(resolveLegacyUsageStatisticsPath(newCfg), desiredPath); err != nil {
+			log.WithError(err).Warn("usage: failed to migrate persisted usage statistics")
+		}
+	}
+	p := usage.NewPersistence(usage.PersistenceConfig{
+		Stats:    usage.GetRequestStatistics(),
+		Path:     desiredPath,
+		Interval: desiredInterval,
+	})
+	if err := p.Load(); err != nil {
+		log.WithError(err).Warn("usage: failed to load persisted usage statistics")
+	}
+	p.Start()
+	s.usagePersistence = p
+}
+

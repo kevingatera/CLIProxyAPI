@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginstore"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -60,6 +61,7 @@ type Handler struct {
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
 	pluginReleaseCacheMu    sync.Mutex
 	pluginReleaseCache      map[string]pluginReleaseCacheEntry
+	usageStats              *usage.RequestStatistics
 }
 
 type configReloadSnapshot struct {
@@ -80,6 +82,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
+		usageStats:          usage.GetRequestStatistics(),
 	}
 	h.startAttemptCleanup()
 	return h
@@ -149,6 +152,9 @@ func (h *Handler) SetPluginHost(host *pluginhost.Host) {
 	h.pluginHost = host
 	h.mu.Unlock()
 }
+
+// SetUsageStatistics updates the request statistics aggregator used by the usage endpoints.
+func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
 
 // SetConfigReloadHook updates the callback used after management saves config changes.
 func (h *Handler) SetConfigReloadHook(hook func(context.Context, *config.Config)) {
