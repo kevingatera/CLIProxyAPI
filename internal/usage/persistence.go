@@ -3,6 +3,7 @@ package usage
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -109,10 +110,40 @@ func (p *Persistence) Flush() error {
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
+	// Fast path: same-directory rename is atomic on POSIX. On a cross-device
+	// link error (EXDEV) fall back to a copy so we never destroy the last-good
+	// snapshot by removing the destination before the rename succeeds.
 	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(path)
-		return os.Rename(tmp, path)
+		return copyFile(tmp, path, 0o600)
 	}
+	return nil
+}
+
+// copyFile copies src to dst using io.Copy. It is used as the cross-device
+// fallback when os.Rename fails with EXDEV. The temporary src is always removed
+// before returning. The destination is truncated and recreated so a partial
+// write does not leave the last-good snapshot half-overwritten.
+func copyFile(src, dst string, perm os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(dst)
+		return err
+	}
+	_ = os.Remove(src)
 	return nil
 }
 
