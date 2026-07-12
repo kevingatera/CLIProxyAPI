@@ -112,6 +112,7 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 	}
 
 	applySignatureCacheConfig(oldCfg, cfg)
+	s.configureUsagePersistence(oldCfg, cfg)
 
 	if oldCfg != nil && !reflect.DeepEqual(oldCfg.Antigravity.ConnectionPool, cfg.Antigravity.ConnectionPool) {
 		executor.ResetAntigravityTransports()
