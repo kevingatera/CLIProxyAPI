@@ -263,6 +263,13 @@ type Manager struct {
 	// refreshLocks serializes credential refresh per auth ID so concurrent
 	// 401 recoveries and auto-refresh workers do not race the same refresh_token.
 	refreshLocks sync.Map
+
+	// routingTraces holds a bounded ring buffer of recent route execution traces
+	// for observability. Guarded by routingTraceMu.
+	routingTraces []RoutingTrace
+	routingTraceMu sync.Mutex
+	// routingTraceLimit is stored atomically to allow lock-free reads in hot paths.
+	routingTraceLimit atomic.Int32
 }
 
 // NewManager constructs a manager with optional custom selector and hook.

@@ -59,6 +59,17 @@ type codexOAuthService interface {
 	CreateTokenStorage(bundle *codex.CodexAuthBundle) *codex.CodexTokenStorage
 }
 
+// shouldHideReservedAuthFile reports whether a reserved/internal auth-directory
+// file should be hidden from management auth-file listings. usage_stats.json is
+// persisted by the usage statistics feature and is not a credential file.
+func shouldHideReservedAuthFile(name string) bool {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return false
+	}
+	return strings.EqualFold(trimmed, "usage_stats.json")
+}
+
 var (
 	callbackForwardersMu  sync.Mutex
 	callbackForwarders    = make(map[int]*callbackForwarder)
@@ -404,6 +415,9 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 		if !strings.HasSuffix(strings.ToLower(name), ".json") {
 			continue
 		}
+		if shouldHideReservedAuthFile(name) {
+			continue
+		}
 		if info, errInfo := e.Info(); errInfo == nil {
 			fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime()}
 
@@ -454,6 +468,9 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if auth == nil {
+		return nil
+	}
+	if shouldHideReservedAuthFile(auth.FileName) {
 		return nil
 	}
 	auth.EnsureIndex()

@@ -432,6 +432,7 @@ func newDefaultAuthManager() *sdkAuth.Manager {
 		sdkAuth.NewCodexAuthenticator(),
 		sdkAuth.NewClaudeAuthenticator(),
 		sdkAuth.NewXAIAuthenticator(),
+		sdkAuth.NewCursorAuthenticator(),
 	)
 }
 
@@ -803,6 +804,12 @@ func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName 
 	if a == nil {
 		return "", "", false
 	}
+	// Cursor is a first-class native provider in cliproxy even though its auth
+	// payload carries compat_name/provider_key metadata for downstream proxying.
+	// Do not reinterpret it as generic openai-compatibility.
+	if strings.EqualFold(strings.TrimSpace(a.Provider), "cursor") {
+		return "", "", false
+	}
 	if len(a.Attributes) > 0 {
 		providerKey = strings.TrimSpace(a.Attributes["provider_key"])
 		compatName = strings.TrimSpace(a.Attributes["compat_name"])
@@ -1083,6 +1090,8 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
 	case "xai":
 		s.coreManager.RegisterExecutor(executor.NewXAIAutoExecutor(s.cfg))
+	case "cursor":
+		s.coreManager.RegisterExecutor(executor.NewCursorExecutor(s.cfg))
 	default:
 		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
 		if providerKey == "" {
@@ -1281,6 +1290,8 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 		switch strategy {
 		case "fill-first", "fillfirst", "ff":
 			return "fill-first"
+		case "quota-aware", "quotaaware", "quota", "qa":
+			return "quota-aware"
 		default:
 			return "round-robin"
 		}
@@ -1300,6 +1311,8 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 		switch nextStrategy {
 		case "fill-first":
 			selector = &coreauth.FillFirstSelector{}
+		case "quota-aware":
+			selector = coreauth.NewQuotaAwareSelector()
 		default:
 			selector = &coreauth.RoundRobinSelector{}
 		}
@@ -2027,6 +2040,9 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		models = applyExcludedModels(models, excluded)
 	case "xai":
 		models = registry.GetXAIModels()
+		models = applyExcludedModels(models, excluded)
+	case "cursor":
+		models = cursorModelsFromAuthMetadata(a.Metadata)
 		models = applyExcludedModels(models, excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
@@ -2779,4 +2795,137 @@ func applyOAuthModelAliasEntries(aliases []config.OAuthModelAlias, models []*Mod
 		}
 	}
 	return out
+}
+func cursorModelsFromAuthMetadata(metadata map[string]any) []*ModelInfo {
+	modelIDs := extractModelIDsFromMetadata(metadata, "models")
+	modelIDs = sanitizeCursorModelIDs(modelIDs)
+	if len(modelIDs) == 0 {
+		modelIDs = defaultCursorModelIDs()
+	}
+	now := time.Now().Unix()
+	out := make([]*ModelInfo, 0, len(modelIDs))
+	for _, id := range modelIDs {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			continue
+		}
+		out = append(out, &ModelInfo{
+			ID:          trimmed,
+			Object:      "model",
+			Created:     now,
+			OwnedBy:     "cursor",
+			Type:        "cursor",
+			DisplayName: trimmed,
+			UserDefined: false,
+			Thinking:    &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}},
+		})
+	}
+	return out
+}
+
+func sanitizeCursorModelIDs(modelIDs []string) []string {
+	if len(modelIDs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(modelIDs))
+	seen := make(map[string]struct{}, len(modelIDs))
+	for _, raw := range modelIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		lower := strings.ToLower(id)
+		if strings.HasPrefix(lower, "loading models") ||
+			strings.HasPrefix(lower, "available models") ||
+			strings.HasPrefix(lower, "tip:") {
+			continue
+		}
+		if parts := strings.SplitN(id, " - ", 2); len(parts) == 2 {
+			id = strings.TrimSpace(parts[0])
+		}
+		id = strings.TrimSuffix(id, "(default)")
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		key := strings.ToLower(id)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func extractModelIDsFromMetadata(metadata map[string]any, key string) []string {
+	if metadata == nil {
+		return nil
+	}
+	raw, ok := metadata[key]
+	if !ok || raw == nil {
+		return nil
+	}
+	entries, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		val := ""
+		switch v := entry.(type) {
+		case string:
+			val = strings.TrimSpace(v)
+		case map[string]any:
+			if id, okID := v["id"].(string); okID {
+				val = strings.TrimSpace(id)
+			}
+			if val == "" {
+				if name, okName := v["name"].(string); okName {
+					val = strings.TrimSpace(name)
+				}
+			}
+		}
+		if val == "" {
+			continue
+		}
+		k := strings.ToLower(val)
+		if _, okSeen := seen[k]; okSeen {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, val)
+	}
+	return out
+}
+
+func defaultCursorModelIDs() []string {
+	return []string{
+		"auto",
+		"composer-1.5",
+		"composer-1",
+		"sonnet-4.6",
+		"sonnet-4.6-thinking",
+		"opus-4.6",
+		"opus-4.6-thinking",
+		"gpt-5.4-medium",
+		"gpt-5.4-medium-fast",
+		"gpt-5.3-codex",
+		"gpt-5.3-codex-fast",
+		"gemini-3-pro",
+		"gemini-3-flash",
+		"grok",
+		"kimi-k2.5",
+	}
+}
+
+// forceModelPrefixForProvider reports whether model IDs for a provider should be
+// prefixed even when the global ForceModelPrefix setting is disabled. Cursor is
+// always prefixed so the cursor/ namespace stays distinct from native models.
+func forceModelPrefixForProvider(provider string, globalForce bool) bool {
+	if globalForce {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(provider), "cursor")
 }
