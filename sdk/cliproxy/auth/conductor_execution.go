@@ -287,6 +287,22 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		resp, errHome := m.executeHome(ctx, normalized, req, opts, true)
 		return resp, unwrapExecutionBoundaryError(errHome)
 	}
+	plan := m.buildRoutingExecutionPlan(normalized, req.Model, opts)
+	trace := m.newRoutingTraceRuntime("count_tokens", req.Model, normalized, plan)
+	var finalErr error
+	finalStatus := "failed"
+	stopReason := "unknown"
+	defer func() { m.finalizeRoutingTrace(trace, finalStatus, stopReason, finalErr) }()
+
+	if resp, ok, errPinned := m.executeRoutingExplicitCandidates(ctx, plan, req, opts, trace, "count_tokens"); errPinned != nil {
+		finalErr = errPinned
+		stopReason = "explicit_candidate_error"
+		return cliproxyexecutor.Response{}, errPinned
+	} else if ok {
+		finalStatus = "success"
+		stopReason = "completed"
+		return resp, nil
+	}
 
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
 
@@ -296,35 +312,47 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	for attempt := 0; ; attempt++ {
 		roundAttempted := make(map[string]struct{})
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
-		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry)
+		resp, errExec := m.executeCountMixedOnce(ctx, plan.OrderedProviders, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry)
 		if errExec == nil {
+			finalStatus = "success"
+			stopReason = "completed"
 			return resp, nil
 		}
 		if isRequestTerminatedError(errExec) || isRequestStopError(errExec) {
+			finalErr = unwrapExecutionBoundaryError(errExec)
+			stopReason = "request_terminated"
 			return cliproxyexecutor.Response{}, unwrapExecutionBoundaryError(errExec)
 		}
 		if hasUpstreamExecutionAttempt(errExec) {
 			preferredUpstreamErr = errExec
 		}
 		lastErr = errExec
-		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errExec, attempt, normalized, retryModel, maxWait, -1, defaultRequestRetry, roundAttempted)
+		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errExec, attempt, plan.OrderedProviders, retryModel, maxWait, -1, defaultRequestRetry, roundAttempted)
 		if !shouldRetry {
 			break
 		}
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
+			finalErr = errWait
+			stopReason = "cooldown_wait_interrupted"
 			return cliproxyexecutor.Response{}, errWait
 		}
 	}
 	if lastErr != nil {
 		if ctx != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
+				finalErr = errCtx
+				stopReason = "context_terminated"
 				return cliproxyexecutor.Response{}, errCtx
 			}
 		}
 		lastErr = preferredExecutionAttemptError(lastErr, preferredUpstreamErr)
+		finalErr = unwrapExecutionBoundaryError(lastErr)
+		stopReason = "terminal_error"
 		return cliproxyexecutor.Response{}, unwrapExecutionBoundaryError(lastErr)
 	}
-	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
+	finalErr = &Error{Code: "auth_not_found", Message: "no auth available"}
+	stopReason = "no_auth_available"
+	return cliproxyexecutor.Response{}, finalErr
 }
 
 // ExecuteStream performs a streaming execution using the configured selector and executor.
@@ -340,6 +368,12 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	plan := m.buildRoutingExecutionPlan(normalized, req.Model, opts)
+	trace := m.newRoutingTraceRuntime("stream", req.Model, normalized, plan)
+	var finalErr error
+	finalStatus := "failed"
+	stopReason := "unknown"
+	defer func() { m.finalizeRoutingTrace(trace, finalStatus, stopReason, finalErr) }()
 
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
 
@@ -353,8 +387,10 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	for {
 		roundAttempted := make(map[string]struct{})
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
-		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, &homeRetryLimit, attempt, defaultRequestRetry)
+		result, errStream := m.executeStreamMixedOnce(ctx, plan.OrderedProviders, req, roundOpts, maxRetryCredentials, &homeRetryLimit, attempt, defaultRequestRetry)
 		if errStream == nil {
+			finalStatus = "success"
+			stopReason = "completed"
 			return result, nil
 		}
 		if hasUpstreamExecutionAttempt(errStream) {
@@ -363,9 +399,13 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		if m.HomeEnabled() && retryRoundPending {
 			if wait, okWait := pendingHomeRetryRoundDelay(errStream, maxWait, &homeRetryLimit, pinnedAuthIDFromMetadata(opts.Metadata) == ""); okWait && m.homeRetryAllowed(attempt-1, homeRetryLimit) {
 				if retryRoundWaited {
+					finalErr = unwrapExecutionBoundaryError(errStream)
+					stopReason = "home_retry_exhausted"
 					return nil, unwrapExecutionBoundaryError(errStream)
 				}
 				if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
+					finalErr = errWait
+					stopReason = "cooldown_wait_interrupted"
 					return nil, errWait
 				}
 				retryRoundWaited = true
@@ -375,14 +415,18 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		retryRoundPending = false
 		retryRoundWaited = false
 		if isRequestTerminatedError(errStream) || isRequestStopError(errStream) {
+			finalErr = unwrapExecutionBoundaryError(errStream)
+			stopReason = "request_terminated"
 			return nil, unwrapExecutionBoundaryError(errStream)
 		}
 		lastErr = errStream
-		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errStream, attempt, normalized, retryModel, maxWait, homeRetryLimit, defaultRequestRetry, roundAttempted)
+		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errStream, attempt, plan.OrderedProviders, retryModel, maxWait, homeRetryLimit, defaultRequestRetry, roundAttempted)
 		if !shouldRetry {
 			break
 		}
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
+			finalErr = errWait
+			stopReason = "cooldown_wait_interrupted"
 			return nil, errWait
 		}
 		attempt++
@@ -392,6 +436,8 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	if lastErr != nil {
 		if ctx != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
+				finalErr = errCtx
+				stopReason = "context_terminated"
 				return nil, errCtx
 			}
 		}
@@ -401,18 +447,28 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		lastErr = unwrapExecutionBoundaryError(lastErr)
 		if hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
 			if result, ok, errCredits := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); errCredits != nil {
+				finalErr = errCredits
+				stopReason = "credits_fallback_error"
 				return nil, errCredits
 			} else if ok {
+				finalStatus = "success"
+				stopReason = "completed"
 				return result, nil
 			}
 		}
 		var bootstrapErr *streamBootstrapError
 		if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
+			finalErr = bootstrapErr
+			stopReason = "bootstrap_error"
 			return streamErrorResult(bootstrapErr.Headers(), lastErr), nil
 		}
+		finalErr = lastErr
+		stopReason = "terminal_error"
 		return nil, lastErr
 	}
-	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	finalErr = &Error{Code: "auth_not_found", Message: "no auth available"}
+	stopReason = "no_auth_available"
+	return nil, finalErr
 }
 
 type requestToFormatResolver interface {
