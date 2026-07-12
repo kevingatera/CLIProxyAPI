@@ -15,6 +15,17 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
+const (
+	// codexUsageEndpoint is the ChatGPT backend usage endpoint the Management UI
+	// and quota selector both read to derive per-account quota telemetry.
+	codexUsageEndpoint = "https://chatgpt.com/backend-api/wham/usage"
+
+	// codexCLIUserAgent mimics the codex CLI's own User-Agent so the usage
+	// endpoint returns the same shape it returns to the codex CLI. Update this
+	// when the codex CLI version it tracks changes.
+	codexCLIUserAgent = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+)
+
 // QuotaAwareSelector balances usage across credentials using provider-specific quota telemetry.
 //
 // Today this selector is implemented for Codex only, using the same usage endpoint the
@@ -356,14 +367,14 @@ func fetchCodexUsageDefault(ctx context.Context, auth *Auth) (*codexUsageSnapsho
 		return nil, fmt.Errorf("codex usage: missing account_id")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://chatgpt.com/backend-api/wham/usage", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, codexUsageEndpoint, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Chatgpt-Account-Id", accountID)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal")
+	req.Header.Set("User-Agent", codexCLIUserAgent)
 
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
