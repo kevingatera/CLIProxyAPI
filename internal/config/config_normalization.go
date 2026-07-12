@@ -7,6 +7,91 @@ import (
 	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
 )
 
+// SanitizeRoutingPolicy normalizes routing policy fields and drops invalid entries.
+func (cfg *Config) SanitizeRoutingPolicy() {
+	if cfg == nil {
+		return
+	}
+	normalizeTrigger := func(trigger string) (string, bool) {
+		switch strings.ToLower(strings.TrimSpace(trigger)) {
+		case "exhausted", "quota", "quota_exhausted":
+			return "exhausted", true
+		case "rate_limited", "ratelimited", "rate-limited", "429":
+			return "rate_limited", true
+		case "server_error", "server", "5xx":
+			return "server_error", true
+		case "transport_error", "transport", "network", "timeout":
+			return "transport_error", true
+		default:
+			return "", false
+		}
+	}
+	canonicalizeRule := func(rule RoutingPolicyRule) RoutingPolicyRule {
+		out := RoutingPolicyRule{IncludeRemainingProviders: rule.IncludeRemainingProviders}
+		seenProviders := make(map[string]struct{}, len(rule.Route))
+		for _, route := range rule.Route {
+			provider := strings.ToLower(strings.TrimSpace(route.Provider))
+			if provider == "" {
+				continue
+			}
+			if _, exists := seenProviders[provider]; exists {
+				continue
+			}
+			seenProviders[provider] = struct{}{}
+			seenAuthIDs := make(map[string]struct{}, len(route.AuthOrder))
+			authOrder := make([]string, 0, len(route.AuthOrder))
+			for _, authID := range route.AuthOrder {
+				authID = strings.TrimSpace(authID)
+				if authID == "" {
+					continue
+				}
+				if _, exists := seenAuthIDs[authID]; exists {
+					continue
+				}
+				seenAuthIDs[authID] = struct{}{}
+				authOrder = append(authOrder, authID)
+			}
+			out.Route = append(out.Route, RoutingPolicyRoute{
+				Provider: provider, AuthOrder: authOrder, IncludeRemainingAuth: route.IncludeRemainingAuth,
+			})
+		}
+		return out
+	}
+	cfg.Routing.Policy.Defaults = canonicalizeRule(cfg.Routing.Policy.Defaults)
+	if len(cfg.Routing.Policy.ModelOverrides) > 0 {
+		overrides := make(map[string]RoutingPolicyRule, len(cfg.Routing.Policy.ModelOverrides))
+		for modelID, rule := range cfg.Routing.Policy.ModelOverrides {
+			if modelID = strings.TrimSpace(modelID); modelID != "" {
+				overrides[modelID] = canonicalizeRule(rule)
+			}
+		}
+		cfg.Routing.Policy.ModelOverrides = overrides
+	}
+	seenTriggers := make(map[string]struct{}, len(cfg.Routing.Policy.Fallback.On))
+	triggers := make([]string, 0, len(cfg.Routing.Policy.Fallback.On))
+	for _, trigger := range cfg.Routing.Policy.Fallback.On {
+		normalized, ok := normalizeTrigger(trigger)
+		if !ok {
+			continue
+		}
+		if _, exists := seenTriggers[normalized]; exists {
+			continue
+		}
+		seenTriggers[normalized] = struct{}{}
+		triggers = append(triggers, normalized)
+	}
+	if len(triggers) == 0 {
+		triggers = []string{"exhausted", "rate_limited", "server_error", "transport_error"}
+	}
+	cfg.Routing.Policy.Fallback.On = triggers
+	if cfg.Routing.Policy.Observability.TraceLimit < 0 {
+		cfg.Routing.Policy.Observability.TraceLimit = 0
+	}
+	if cfg.Routing.Policy.Observability.TraceLimit > 2000 {
+		cfg.Routing.Policy.Observability.TraceLimit = 2000
+	}
+}
+
 // NormalizePluginsConfig applies default plugin configuration values.
 func (cfg *Config) NormalizePluginsConfig() {
 	if cfg == nil {

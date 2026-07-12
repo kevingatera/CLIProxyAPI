@@ -57,6 +57,15 @@ type Config struct {
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
 
+	// UsageStatisticsPersist enables periodic persistence of in-memory usage statistics to disk.
+	UsageStatisticsPersist bool `yaml:"usage-statistics-persist" json:"usage-statistics-persist"`
+
+	// UsageStatisticsFile optionally overrides the persisted statistics snapshot path.
+	UsageStatisticsFile string `yaml:"usage-statistics-file" json:"usage-statistics-file"`
+
+	// UsageStatisticsSaveIntervalSeconds controls how frequently usage snapshots are written.
+	UsageStatisticsSaveIntervalSeconds int `yaml:"usage-statistics-save-interval-seconds" json:"usage-statistics-save-interval-seconds"`
+
 	// RedisUsageQueueRetentionSeconds controls how long usage queue items are retained
 	// in memory for Management API consumers.
 	// Default: 60. Max: 3600.

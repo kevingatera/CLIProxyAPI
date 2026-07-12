@@ -24,6 +24,12 @@ import (
 
 var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at", "lastRefreshedAt"}
 
+// shouldHideReservedAuthFile reports whether a reserved/internal auth-directory
+// file should be hidden from management auth-file listings.
+func shouldHideReservedAuthFile(name string) bool {
+	return strings.EqualFold(strings.TrimSpace(name), "usage_stats.json")
+}
+
 var (
 	callbackForwardersMu  sync.Mutex
 	callbackForwarders    = make(map[int]*callbackForwarder)
@@ -238,6 +244,9 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 		if !strings.HasSuffix(strings.ToLower(name), ".json") {
 			continue
 		}
+		if shouldHideReservedAuthFile(name) {
+			continue
+		}
 		if info, errInfo := e.Info(); errInfo == nil {
 			fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime()}
 
@@ -311,6 +320,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 
 func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	if auth == nil {
+		return nil
+	}
+	if shouldHideReservedAuthFile(auth.FileName) {
 		return nil
 	}
 	auth.EnsureIndex()
