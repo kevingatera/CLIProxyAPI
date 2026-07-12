@@ -18,7 +18,14 @@ RUN CGO_ENABLED=1 GOOS=linux go build -buildvcs=false -ldflags="-s -w -X 'main.V
 
 FROM debian:bookworm
 
-RUN apt-get update && apt-get install -y --no-install-recommends tzdata ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata ca-certificates curl bash && rm -rf /var/lib/apt/lists/*
+
+# Install Cursor Agent CLI for cursor-based auth flows in management API.
+RUN curl -fsSL https://cursor.com/install | bash \
+ && ln -sf /root/.local/bin/cursor-agent /usr/local/bin/cursor-agent \
+ && ln -sf /root/.local/bin/agent /usr/local/bin/agent
+
+ENV PATH="/root/.local/bin:${PATH}"
 
 RUN mkdir /CLIProxyAPI
 
