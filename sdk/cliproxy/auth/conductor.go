@@ -294,6 +294,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
+	manager.setRoutingTraceLimitFromConfig(nil)
 	return manager
 }
 
@@ -519,6 +520,7 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		cfg = &internalconfig.Config{}
 	}
 	m.runtimeConfig.Store(cfg)
+	m.setRoutingTraceLimitFromConfig(cfg)
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if !cfg.Home.Enabled {
 		m.clearHomeRuntimeAuths()
@@ -2327,35 +2329,147 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 
+	plan := m.buildRoutingExecutionPlan(normalized, req.Model, opts)
+	trace := m.newRoutingTraceRuntime("execute", req.Model, normalized, plan)
+	var (
+		finalStatus = "failed"
+		stopReason  = "unknown"
+		finalErr    error
+	)
+	defer func() {
+		m.finalizeRoutingTrace(trace, finalStatus, stopReason, finalErr)
+	}()
+
 	_, maxRetryCredentials, maxWait := m.retrySettings()
+
+	// Policy explicit-candidate pre-pass: try pinned auths in declared order,
+	// falling back on policy-configured error classes. On exhaustion of explicit
+	// candidates (or when policy is disabled), defer to the standard execute loop.
+	if resp, ok, errPin := m.executeRoutingExplicitCandidates(ctx, plan, req, opts, trace, "execute"); errPin != nil {
+		finalErr = errPin
+		stopReason = "explicit_candidate_error"
+		return cliproxyexecutor.Response{}, errPin
+	} else if ok {
+		finalStatus = "success"
+		stopReason = "completed"
+		return resp, nil
+	}
 
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	for attempt := 0; ; attempt++ {
-		resp, errExec := m.executeMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
+		resp, errExec := m.executeMixedOnce(ctx, plan.OrderedProviders, req, opts, maxRetryCredentials)
 		if errExec == nil {
+			finalStatus = "success"
+			stopReason = "completed"
 			return resp, nil
 		}
 		lastErr = errExec
-		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, retryModel, maxWait)
+		m.appendRoutingTraceAttempt(trace, traceAttemptFromError("", "", "strategy", errExec, true, classifyFallbackReasonLabel(errExec, plan)))
+		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, plan.OrderedProviders, retryModel, maxWait)
 		if !shouldRetry {
 			break
 		}
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
+			finalErr = errWait
+			stopReason = "cooldown_wait_interrupted"
 			return cliproxyexecutor.Response{}, errWait
 		}
 	}
 	if lastErr != nil {
 		if hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
 			if resp, ok, errCredits := m.tryAntigravityCreditsExecute(ctx, req, opts); errCredits != nil {
+				finalErr = errCredits
 				return cliproxyexecutor.Response{}, errCredits
 			} else if ok {
+				finalStatus = "success"
+				stopReason = "completed"
 				return resp, nil
 			}
 		}
+		finalErr = lastErr
+		stopReason = "terminal_error"
 		return cliproxyexecutor.Response{}, lastErr
 	}
+	finalErr = &Error{Code: "auth_not_found", Message: "no auth available"}
+	stopReason = "no_auth_available"
 	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
+}
+
+// executeRoutingExplicitCandidates runs the policy explicit-candidate pre-pass
+// for non-streaming Execute. It tries each pinned candidate in declared order,
+// falling back to the next on policy-configured error classes. It returns
+// (resp, true, nil) when a candidate succeeds, (zero, false, nil) when no
+// candidates remain or policy is disabled (caller falls back to strategy loop),
+// and (zero, false, err) when a candidate fails with a non-fallback error.
+func (m *Manager) executeRoutingExplicitCandidates(ctx context.Context, plan routingExecutionPlan, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, trace *routingTraceRuntime, stage string) (cliproxyexecutor.Response, bool, error) {
+	if !plan.PolicyEnabled || len(plan.ExplicitCandidates) == 0 {
+		return cliproxyexecutor.Response{}, false, nil
+	}
+	tried := make(map[string]struct{}, len(plan.ExplicitCandidates))
+	for _, candidate := range plan.ExplicitCandidates {
+		if _, used := tried[candidate.AuthID]; used {
+			continue
+		}
+		auth, executor, errPick := m.pickPinnedCandidate(ctx, candidate.Provider, req.Model, opts, tried, candidate.AuthID)
+		if errPick != nil || auth == nil || executor == nil {
+			m.appendRoutingTraceAttempt(trace, traceAttemptFromError(candidate.Provider, candidate.AuthID, stage, errPick, true, "candidate_unavailable"))
+			tried[candidate.AuthID] = struct{}{}
+			continue
+		}
+		tried[auth.ID] = struct{}{}
+		execCtx := ctx
+		if rt := m.roundTripperFor(auth); rt != nil {
+			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
+			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
+		}
+		auth, errPrepare := m.prepareRequestAuth(execCtx, executor, auth)
+		if errPrepare != nil {
+			m.appendRoutingTraceAttempt(trace, traceAttemptFromError(candidate.Provider, candidate.AuthID, stage, errPrepare, true, "prepare_failed"))
+			continue
+		}
+		execReq := req
+		resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
+		result := Result{AuthID: auth.ID, Provider: candidate.Provider, Model: req.Model, Success: errExec == nil}
+		if errExec != nil {
+			if errCtx := execCtx.Err(); errCtx != nil {
+				m.appendRoutingTraceAttempt(trace, traceAttemptFromError(candidate.Provider, auth.ID, stage, errCtx, false, ""))
+				return cliproxyexecutor.Response{}, false, errCtx
+			}
+			result.Error = &Error{Message: errExec.Error()}
+			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
+				result.Error.HTTPStatus = se.StatusCode()
+			}
+			if ra := retryAfterFromError(errExec); ra != nil {
+				result.RetryAfter = ra
+			}
+			m.MarkResult(execCtx, result)
+			if isRequestInvalidError(errExec) {
+				m.appendRoutingTraceAttempt(trace, traceAttemptFromError(candidate.Provider, auth.ID, stage, errExec, false, "non_retryable"))
+				return cliproxyexecutor.Response{}, false, errExec
+			}
+			reason, _ := classifyFallbackReason(errExec)
+			if !plan.allowsFallback(reason) {
+				m.appendRoutingTraceAttempt(trace, traceAttemptFromError(candidate.Provider, auth.ID, stage, errExec, false, "policy_stop"))
+				return cliproxyexecutor.Response{}, false, errExec
+			}
+			m.appendRoutingTraceAttempt(trace, traceAttemptFromError(candidate.Provider, auth.ID, stage, errExec, true, reason))
+			continue
+		}
+		m.MarkResult(execCtx, result)
+		m.appendRoutingTraceAttempt(trace, traceAttemptSuccess(candidate.Provider, auth.ID, stage))
+		return resp, true, nil
+	}
+	return cliproxyexecutor.Response{}, false, nil
+}
+
+// classifyFallbackReasonLabel returns the fallback reason label for an error,
+// or an empty string when the error class is not fallback-eligible.
+func classifyFallbackReasonLabel(err error, plan routingExecutionPlan) string {
+	if reason, ok := classifyFallbackReason(err); ok && plan.allowsFallback(reason) {
+		return reason
+	}
+	return ""
 }
 
 // It supports multiple providers for the same model and round-robins the starting provider per model.
