@@ -563,10 +563,15 @@ func isTransportExecutionError(err error) bool {
 
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr != nil {
+		// A net.Error that reports a timeout is a genuine transport/timeout
+		// failure. Non-timeout net.Errors fall through to the text-match
+		// hints below so we don't classify every network error (including
+		// connection resets already covered by the hints) as a transport
+		// error solely because it satisfies net.Error.
 		if netErr.Timeout() {
 			return true
 		}
-		return true
+		return false
 	}
 
 	text := strings.ToLower(strings.TrimSpace(err.Error()))
