@@ -170,6 +170,11 @@ type Manager struct {
 	refreshLocks sync.Map
 	// persistLocks serializes disk persistence per auth ID and guards against out-of-order writes.
 	persistLocks sync.Map
+
+	// routingTraces holds a bounded ring buffer of recent route execution traces.
+	routingTraces     []RoutingTrace
+	routingTraceMu    sync.Mutex
+	routingTraceLimit atomic.Int32
 }
 
 // NewManager constructs a manager with optional custom selector and hook.

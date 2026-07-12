@@ -3,6 +3,7 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 )
 
@@ -48,6 +49,17 @@ func (e *Error) Error() string {
 func (e *Error) StatusCode() int {
 	if e == nil {
 		return 0
+	}
+	if e.HTTPStatus > 0 {
+		return e.HTTPStatus
+	}
+	switch e.Code {
+	case "invalid_request", "provider_not_found":
+		return http.StatusBadRequest
+	case "auth_not_found", "auth_unavailable", "executor_not_found":
+		return http.StatusServiceUnavailable
+	case "not_supported":
+		return http.StatusNotImplemented
 	}
 	return e.HTTPStatus
 }
