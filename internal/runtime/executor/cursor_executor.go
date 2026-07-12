@@ -25,6 +25,7 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	sdkauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
@@ -338,21 +339,9 @@ func runCursorAgent(ctx context.Context, model, prompt string) (cursorRunResult,
 	}, nil
 }
 
-func resolveCursorAgentPath() (string, error) {
-	if path, err := exec.LookPath("cursor-agent"); err == nil && strings.TrimSpace(path) != "" {
-		return path, nil
-	}
-	for _, candidate := range []string{
-		"/usr/local/bin/cursor-agent",
-		"/root/.local/bin/cursor-agent",
-		"/root/.local/bin/agent",
-	} {
-		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
-			return candidate, nil
-		}
-	}
-	return "", fmt.Errorf("cursor-agent binary not found")
-}
+// resolveCursorAgentPath delegates to the canonical sdk/auth implementation so
+// the cursor-agent candidate list lives in exactly one place.
+func resolveCursorAgentPath() (string, error) { return sdkauth.ResolveCursorAgentPath() }
 
 func classifyCursorErrorCode(message string, fallback int) int {
 	lower := strings.ToLower(strings.TrimSpace(message))

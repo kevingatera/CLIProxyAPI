@@ -126,25 +126,27 @@ func (a CursorAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 	}, nil
 }
 
-func resolveCursorAgentPath() (string, error) {
-	if path, err := exec.LookPath("cursor-agent"); err == nil {
+// ResolveCursorAgentPath locates the cursor-agent CLI binary. It is the single
+// source of truth for cursor-agent discovery across the codebase (auth login,
+// executor, and management handlers). Exported so other packages avoid
+// duplicating the candidate list.
+func ResolveCursorAgentPath() (string, error) {
+	if path, err := exec.LookPath("cursor-agent"); err == nil && strings.TrimSpace(path) != "" {
 		return path, nil
 	}
-	candidates := []string{
+	for _, candidate := range []string{
 		"/usr/local/bin/cursor-agent",
 		"/root/.local/bin/cursor-agent",
 		"/root/.local/bin/agent",
-	}
-	for _, p := range candidates {
-		if strings.TrimSpace(p) == "" {
-			continue
-		}
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p, nil
+	} {
+		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+			return candidate, nil
 		}
 	}
 	return "", fmt.Errorf("cursor-agent binary not found")
 }
+
+func resolveCursorAgentPath() (string, error) { return ResolveCursorAgentPath() }
 
 func resolveCursorBaseURL() string {
 	if v := strings.TrimSpace(os.Getenv("CURSOR_PROXY_BASE_URL")); v != "" {
