@@ -2479,27 +2479,56 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 
+	plan := m.buildRoutingExecutionPlan(normalized, req.Model, opts)
+	trace := m.newRoutingTraceRuntime("count_tokens", req.Model, normalized, plan)
+	var (
+		finalStatus = "failed"
+		stopReason  = "unknown"
+		finalErr    error
+	)
+	defer func() {
+		m.finalizeRoutingTrace(trace, finalStatus, stopReason, finalErr)
+	}()
+
+	if resp, ok, errPin := m.executeRoutingExplicitCandidates(ctx, plan, req, opts, trace, "count_tokens"); errPin != nil {
+		finalErr = errPin
+		stopReason = "explicit_candidate_error"
+		return cliproxyexecutor.Response{}, errPin
+	} else if ok {
+		finalStatus = "success"
+		stopReason = "completed"
+		return resp, nil
+	}
+
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	for attempt := 0; ; attempt++ {
-		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
+		resp, errExec := m.executeCountMixedOnce(ctx, plan.OrderedProviders, req, opts, maxRetryCredentials)
 		if errExec == nil {
+			finalStatus = "success"
+			stopReason = "completed"
 			return resp, nil
 		}
 		lastErr = errExec
-		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, retryModel, maxWait)
+		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, plan.OrderedProviders, retryModel, maxWait)
 		if !shouldRetry {
 			break
 		}
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
+			finalErr = errWait
+			stopReason = "cooldown_wait_interrupted"
 			return cliproxyexecutor.Response{}, errWait
 		}
 	}
 	if lastErr != nil {
+		finalErr = lastErr
+		stopReason = "terminal_error"
 		return cliproxyexecutor.Response{}, lastErr
 	}
+	finalErr = &Error{Code: "auth_not_found", Message: "no auth available"}
+	stopReason = "no_auth_available"
 	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
 
@@ -2511,38 +2540,66 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 
+	plan := m.buildRoutingExecutionPlan(normalized, req.Model, opts)
+	trace := m.newRoutingTraceRuntime("stream", req.Model, normalized, plan)
+	var (
+		finalStatus = "failed"
+		stopReason  = "unknown"
+		finalErr    error
+	)
+	defer func() {
+		m.finalizeRoutingTrace(trace, finalStatus, stopReason, finalErr)
+	}()
+
+	// Note: explicit-candidate pre-pass is skipped for streaming requests because
+	// the non-streaming executor.Execute return type cannot be wrapped into a
+	// StreamResult without a converter. Provider ordering still applies via
+	// plan.OrderedProviders below.
+
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	for attempt := 0; ; attempt++ {
-		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
+		result, errStream := m.executeStreamMixedOnce(ctx, plan.OrderedProviders, req, opts, maxRetryCredentials)
 		if errStream == nil {
+			finalStatus = "success"
+			stopReason = "completed"
 			return result, nil
 		}
 		lastErr = errStream
-		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, normalized, retryModel, maxWait)
+		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, plan.OrderedProviders, retryModel, maxWait)
 		if !shouldRetry {
 			break
 		}
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
+			finalErr = errWait
+			stopReason = "cooldown_wait_interrupted"
 			return nil, errWait
 		}
 	}
 	if lastErr != nil {
 		if hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
 			if result, ok, errCredits := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); errCredits != nil {
+				finalErr = errCredits
 				return nil, errCredits
 			} else if ok {
+				finalStatus = "success"
+				stopReason = "completed"
 				return result, nil
 			}
 		}
 		var bootstrapErr *streamBootstrapError
 		if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
+			finalErr = bootstrapErr
 			return streamErrorResult(bootstrapErr.Headers(), bootstrapErr.cause), nil
 		}
+		finalErr = lastErr
+		stopReason = "terminal_error"
 		return nil, lastErr
 	}
+	finalErr = &Error{Code: "auth_not_found", Message: "no auth available"}
+	stopReason = "no_auth_available"
 	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
 
