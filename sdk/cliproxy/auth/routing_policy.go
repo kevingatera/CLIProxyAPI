@@ -90,6 +90,19 @@ type routingExecutionPlan struct {
 	FallbackOn         []string
 }
 
+// allowsFallback reports whether the given classified fallback reason is
+// permitted by the plan's configured fallback triggers.
+func (p routingExecutionPlan) allowsFallback(reason string) bool {
+	if reason == "" {
+		return false
+	}
+	if len(p.FallbackTriggers) == 0 {
+		return false
+	}
+	_, ok := p.FallbackTriggers[reason]
+	return ok
+}
+
 type routingTraceRuntime struct {
 	trace RoutingTrace
 }
