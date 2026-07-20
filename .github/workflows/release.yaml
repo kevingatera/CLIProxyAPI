@@ -139,7 +139,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
+          cache: false
       - uses: actions/cache@v4
         with:
           path: |
@@ -204,7 +204,18 @@ jobs:
             printf '%s\n' "${assets[@]}" >&2
             exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          # uploads.github.com returns transient 5xx under load; retry before failing the release
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber; then
+              break
+            fi
+            echo "upload attempt $attempt failed (exit $?); retrying in $((attempt * 15))s..." >&2
+            sleep $((attempt * 15))
+            if [[ "$attempt" == "5" ]]; then
+              echo "exhausted retries uploading release assets" >&2
+              exit 1
+            fi
+          done
       - name: Refresh release checksums
         continue-on-error: true
         shell: bash
@@ -339,7 +350,18 @@ jobs:
             printf '%s\n' "${assets[@]}" >&2
             exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          # uploads.github.com returns transient 5xx under load; retry before failing the release
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber; then
+              break
+            fi
+            echo "upload attempt $attempt failed (exit $?); retrying in $((attempt * 15))s..." >&2
+            sleep $((attempt * 15))
+            if [[ "$attempt" == "5" ]]; then
+              echo "exhausted retries uploading release assets" >&2
+              exit 1
+            fi
+          done
       - name: Refresh release checksums
         continue-on-error: true
         shell: bash
@@ -400,7 +422,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
+          cache: false
       - uses: actions/cache@v4
         with:
           path: |
@@ -461,7 +483,18 @@ jobs:
             printf '%s\n' "${assets[@]}" >&2
             exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          # uploads.github.com returns transient 5xx under load; retry before failing the release
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber; then
+              break
+            fi
+            echo "upload attempt $attempt failed (exit $?); retrying in $((attempt * 15))s..." >&2
+            sleep $((attempt * 15))
+            if [[ "$attempt" == "5" ]]; then
+              echo "exhausted retries uploading release assets" >&2
+              exit 1
+            fi
+          done
       - name: Refresh release checksums
         continue-on-error: true
         shell: bash
@@ -528,7 +561,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
+          cache: false
       - uses: actions/cache@v4
         with:
           path: |
@@ -617,7 +650,18 @@ jobs:
             printf '%s\n' "${assets[@]}" >&2
             exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          # uploads.github.com returns transient 5xx under load; retry before failing the release
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber; then
+              break
+            fi
+            echo "upload attempt $attempt failed (exit $?); retrying in $((attempt * 15))s..." >&2
+            sleep $((attempt * 15))
+            if [[ "$attempt" == "5" ]]; then
+              echo "exhausted retries uploading release assets" >&2
+              exit 1
+            fi
+          done
       - name: Refresh release checksums
         continue-on-error: true
         shell: bash
@@ -674,4 +718,14 @@ jobs:
             exit 0
           fi
           sha256sum "${archives[@]}" | sort -k2 > checksums.txt
-          gh release upload "$GITHUB_REF_NAME" checksums.txt --clobber
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$GITHUB_REF_NAME" checksums.txt --clobber; then
+              break
+            fi
+            echo "checksums upload attempt $attempt failed (exit $?); retrying in $((attempt * 15))s..." >&2
+            sleep $((attempt * 15))
+            if [[ "$attempt" == "5" ]]; then
+              echo "exhausted retries uploading checksums" >&2
+              exit 1
+            fi
+          done
