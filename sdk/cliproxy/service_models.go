@@ -47,6 +47,9 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		provider = "openai-compatibility"
 	}
 	excluded := s.oauthExcludedModels(provider, authKind)
+	if s.cfg != nil && len(s.cfg.GlobalExcludedModels) > 0 {
+		excluded = append(excluded, s.cfg.GlobalExcludedModels...)
+	}
 	// The synthesizer pre-merges per-account and global exclusions into the "excluded_models" attribute.
 	// If this attribute is present, it represents the complete list of exclusions and overrides the global config.
 	if a.Attributes != nil {
