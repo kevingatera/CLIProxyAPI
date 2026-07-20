@@ -68,6 +68,90 @@ func TestRegisterModelsForAuth_UsesPreMergedExcludedModelsAttribute(t *testing.T
 	}
 }
 
+func TestRegisterModelsForAuth_GlobalExcludedModelsAppliesToAllAuths(t *testing.T) {
+	// GlobalExcludedModels should filter models from ALL auths regardless of
+	// provider or auth kind. Test with cursor/* pattern against a cursor auth.
+	service := &Service{
+		cfg: &config.Config{
+			GlobalExcludedModels: []string{"cursor/*"},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-cursor-global-exclude",
+		Provider: "cursor",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"auth_kind": "oauth",
+		},
+		Metadata: map[string]any{
+			"models": []any{
+				map[string]any{"id": "gpt-4"},
+				map[string]any{"id": "claude-3.5-sonnet"},
+			},
+		},
+	}
+
+	registry := GlobalModelRegistry()
+	registry.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		registry.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(context.Background(), auth)
+
+	models := registry.GetAvailableModelsByProvider("cursor")
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		modelID := strings.TrimSpace(model.ID)
+		// The global exclusion "cursor/*" should block all cursor/ prefixed models.
+		if strings.HasPrefix(strings.ToLower(modelID), "cursor/") {
+			t.Fatalf("expected cursor/* model %q to be excluded by global-excluded-models", modelID)
+		}
+	}
+}
+
+func TestRegisterModelsForAuth_GlobalExcludedModelsWildcardSuffix(t *testing.T) {
+	// Test that "*-mini" pattern excludes models ending in -mini.
+	service := &Service{
+		cfg: &config.Config{
+			GlobalExcludedModels: []string{"*-mini"},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-gemini-global-suffix",
+		Provider: "gemini",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"auth_kind": "apikey",
+		},
+	}
+
+	registry := GlobalModelRegistry()
+	registry.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		registry.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(context.Background(), auth)
+
+	models := registry.GetAvailableModelsByProvider("gemini")
+	if len(models) == 0 {
+		t.Fatal("expected gemini models to be registered")
+	}
+
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		modelID := strings.ToLower(strings.TrimSpace(model.ID))
+		if strings.HasSuffix(modelID, "-mini") {
+			t.Fatalf("expected model %q to be excluded by *-mini global pattern", modelID)
+		}
+	}
+}
+
 func TestRegisterModelsForAuth_OpenAICompatibilityImageModelType(t *testing.T) {
 	service := &Service{
 		cfg: &config.Config{

@@ -171,6 +171,11 @@ type Config struct {
 	// OAuthExcludedModels defines per-provider global model exclusions applied to OAuth/file-backed auth entries.
 	OAuthExcludedModels map[string][]string `yaml:"oauth-excluded-models,omitempty" json:"oauth-excluded-models,omitempty"`
 
+	// GlobalExcludedModels defines model ID patterns (e.g. "cursor/*", "*-preview")
+	// excluded from all providers and all auth kinds (both OAuth and API-key).
+	// Patterns use simple wildcard matching: "*" matches any substring.
+	GlobalExcludedModels []string `yaml:"global-excluded-models,omitempty" json:"global-excluded-models,omitempty"`
+
 	// OAuthModelAlias defines global model name aliases for OAuth/file-backed auth channels.
 	// These aliases affect both model listing and model routing for supported channels:
 	// vertex, aistudio, antigravity, claude, codex, kimi, xai.
@@ -875,6 +880,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
+
+	// Normalize global model exclusion patterns (applies to all providers and auth kinds).
+	cfg.GlobalExcludedModels = NormalizeExcludedModels(cfg.GlobalExcludedModels)
 
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()

@@ -988,6 +988,88 @@ func (h *Handler) DeleteOAuthExcludedModels(c *gin.Context) {
 	h.persist(c)
 }
 
+// global-excluded-models: []string (wildcard patterns like "cursor/*", "*-preview")
+func (h *Handler) GetGlobalExcludedModels(c *gin.Context) {
+	c.JSON(200, gin.H{"global-excluded-models": config.NormalizeExcludedModels(h.cfg.GlobalExcludedModels)})
+}
+
+func (h *Handler) PutGlobalExcludedModels(c *gin.Context) {
+	data, err := c.GetRawData()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	var patterns []string
+	if err = json.Unmarshal(data, &patterns); err != nil {
+		var wrapper struct {
+			Items []string `json:"items"`
+		}
+		if err2 := json.Unmarshal(data, &wrapper); err2 != nil {
+			var single struct {
+				Models []string `json:"global-excluded-models"`
+			}
+			if err3 := json.Unmarshal(data, &single); err3 != nil {
+				c.JSON(400, gin.H{"error": "invalid body"})
+				return
+			}
+			patterns = single.Models
+		} else {
+			patterns = wrapper.Items
+		}
+	}
+	h.cfg.GlobalExcludedModels = config.NormalizeExcludedModels(patterns)
+	h.persist(c)
+}
+
+func (h *Handler) PatchGlobalExcludedModels(c *gin.Context) {
+	var body struct {
+		Model  *string `json:"model"`
+		Remove *bool   `json:"remove"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Model == nil {
+		c.JSON(400, gin.H{"error": "invalid body; expected {\"model\": \"cursor/*\"}"})
+		return
+	}
+	pattern := strings.ToLower(strings.TrimSpace(*body.Model))
+	if pattern == "" {
+		c.JSON(400, gin.H{"error": "model pattern is required"})
+		return
+	}
+	existing := config.NormalizeExcludedModels(h.cfg.GlobalExcludedModels)
+	if body.Remove != nil && *body.Remove {
+		filtered := existing[:0]
+		for _, p := range existing {
+			if p != pattern {
+				filtered = append(filtered, p)
+			}
+		}
+		h.cfg.GlobalExcludedModels = config.NormalizeExcludedModels(filtered)
+	} else {
+		// Add if not already present (NormalizeExcludedModels dedupes)
+		h.cfg.GlobalExcludedModels = config.NormalizeExcludedModels(append(existing, pattern))
+	}
+	h.persist(c)
+}
+
+func (h *Handler) DeleteGlobalExcludedModels(c *gin.Context) {
+	pattern := strings.ToLower(strings.TrimSpace(c.Query("model")))
+	if pattern == "" {
+		// Clear all
+		h.cfg.GlobalExcludedModels = nil
+		h.persist(c)
+		return
+	}
+	existing := config.NormalizeExcludedModels(h.cfg.GlobalExcludedModels)
+	filtered := existing[:0]
+	for _, p := range existing {
+		if p != pattern {
+			filtered = append(filtered, p)
+		}
+	}
+	h.cfg.GlobalExcludedModels = config.NormalizeExcludedModels(filtered)
+	h.persist(c)
+}
+
 // oauth-model-alias: map[string][]OAuthModelAlias
 func (h *Handler) GetOAuthModelAlias(c *gin.Context) {
 	c.JSON(200, gin.H{"oauth-model-alias": sanitizedOAuthModelAlias(h.cfg.OAuthModelAlias)})
