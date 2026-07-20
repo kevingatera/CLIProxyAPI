@@ -72,9 +72,6 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 		provider = "openai-compatibility"
 	}
 	excluded := oauthExcludedModelsForConfig(cfg, provider, authKind)
-	if cfg != nil && len(cfg.GlobalExcludedModels) > 0 {
-		excluded = append(excluded, cfg.GlobalExcludedModels...)
-	}
 	// The "excluded_models" attribute holds only the credential's own exclusions.
 	// When present it takes priority over the global oauth-excluded-models config;
 	// otherwise the current global config applies, so global changes take effect without rewriting credentials.
