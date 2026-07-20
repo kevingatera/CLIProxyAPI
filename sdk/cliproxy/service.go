@@ -1140,6 +1140,18 @@ func (s *Service) registerResolvedModelsForAuth(a *coreauth.Auth, providerKey st
 		GlobalModelRegistry().UnregisterClient(a.ID)
 		return
 	}
+	// Apply global exclusions AFTER prefixing so patterns like "cursor/*"
+	// match the final prefixed model IDs (e.g. "cursor/gpt-4"). This runs
+	// here (in registerResolvedModelsForAuth) rather than at the pre-prefix
+	// applyExcludedModels call sites because the prefix is only known at
+	// registration time.
+	if s.cfg != nil && len(s.cfg.GlobalExcludedModels) > 0 {
+		normalizedModels = applyExcludedModels(normalizedModels, s.cfg.GlobalExcludedModels)
+		if len(normalizedModels) == 0 {
+			GlobalModelRegistry().UnregisterClient(a.ID)
+			return
+		}
+	}
 	GlobalModelRegistry().RegisterClient(a.ID, providerKey, normalizedModels)
 }
 
@@ -1945,12 +1957,6 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		provider = "openai-compatibility"
 	}
 	excluded := s.oauthExcludedModels(provider, authKind)
-	// Merge global exclusions (applies to all providers and all auth kinds, both OAuth and API-key).
-	// These are user-configured patterns like "cursor/*" or "*-preview" in the top-level
-	// global-excluded-models config field.
-	if s.cfg != nil && len(s.cfg.GlobalExcludedModels) > 0 {
-		excluded = append(excluded, s.cfg.GlobalExcludedModels...)
-	}
 	// The synthesizer pre-merges per-account and global exclusions into the "excluded_models" attribute.
 	// If this attribute is present, it represents the complete list of exclusions and overrides the global config.
 	if a.Attributes != nil {
