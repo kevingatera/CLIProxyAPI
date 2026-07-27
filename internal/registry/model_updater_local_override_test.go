@@ -61,6 +61,31 @@ func TestLoadModelsAppliesLocalOverridesOnRemoteRefresh(t *testing.T) {
 	})
 }
 
+// TestPublishCatalogBytesAppliesLocalOverrides exercises the production remote
+// refresh store path (catalogUpdater -> publishCatalogBytes), which replaces the
+// whole catalog store; local overrides must be re-applied there too. This is
+// the path that runs at startup and on every periodic remote refresh.
+func TestPublishCatalogBytesAppliesLocalOverrides(t *testing.T) {
+	fakeRemote := []byte(`{
+		"kimi": [
+			{"id": "kimi-k3", "object": "model", "owned_by": "moonshot", "type": "kimi",
+			 "context_length": 262144, "max_completion_tokens": 65536,
+			 "thinking": {"zero_allowed": false, "levels": ["low", "high", "max"]}}
+		]
+	}`)
+	withTempModelStore(t, func() {
+		if _, err := publishCatalogBytes(fakeRemote); err != nil {
+			t.Fatalf("publishCatalogBytes() error = %v", err)
+		}
+		if findKimiModel("kimi-k3-256k") == nil {
+			t.Fatal("kimi-k3-256k missing after remote publish; local override wiped by remote refresh")
+		}
+		if findKimiModel("kimi-k3") == nil {
+			t.Error("kimi-k3 from remote catalog missing after publish")
+		}
+	})
+}
+
 // TestUpsertModelInfosReplace verifies an override entry replaces an existing
 // model with the same ID instead of duplicating it.
 func TestUpsertModelInfosReplace(t *testing.T) {
