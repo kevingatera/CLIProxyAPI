@@ -171,6 +171,9 @@ func publishCatalogBytes(data []byte) ([]string, error) {
 	if len(parsed.Meta) == 0 && old != nil {
 		parsed.Meta = old.Meta
 	}
+	// Re-apply local overrides: the remote catalog replaces the whole store,
+	// so homelab-local additions would otherwise be wiped on every refresh.
+	applyLocalModelOverrides(&parsed)
 	changed := detectChangedProviders(old, &parsed)
 	modelsCatalogStore.mu.Lock()
 	modelsCatalogStore.data = &parsed
