@@ -1,0 +1,23 @@
+{
+  "kimi": [
+    {
+      "id": "kimi-k3-256k",
+      "object": "model",
+      "created": 1784073600,
+      "owned_by": "moonshot",
+      "type": "kimi",
+      "display_name": "Kimi K3 256K",
+      "description": "Kimi K3 256K - Moonshot AI's K3 flagship model with a 256K context window",
+      "context_length": 262144,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": false,
+        "levels": [
+          "low",
+          "high",
+          "max"
+        ]
+      }
+    }
+  ]
+}
