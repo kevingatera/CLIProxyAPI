@@ -1,6 +1,9 @@
 package registry
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -57,6 +60,39 @@ func TestLoadModelsAppliesLocalOverridesOnRemoteRefresh(t *testing.T) {
 		// Remote catalog content must be preserved alongside the override.
 		if findKimiModel("kimi-k3") == nil {
 			t.Error("kimi-k3 from remote catalog missing after override merge")
+		}
+	})
+}
+
+// TestTryRefreshModelsAppliesLocalOverrides exercises the production remote
+// refresh path (tryRefreshModels -> fetchModelsFromRemote), which replaces the
+// whole catalog store; local overrides must be re-applied there too. This is
+// the path that runs at startup and every 3h in production.
+func TestTryRefreshModelsAppliesLocalOverrides(t *testing.T) {
+	fakeRemote := `{
+		"kimi": [
+			{"id": "kimi-k3", "object": "model", "owned_by": "moonshot", "type": "kimi",
+			 "context_length": 262144, "max_completion_tokens": 65536,
+			 "thinking": {"zero_allowed": false, "levels": ["low", "high", "max"]}}
+		]
+	}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fakeRemote))
+	}))
+	t.Cleanup(srv.Close)
+
+	savedURLs := modelsURLs
+	modelsURLs = []string{srv.URL}
+	t.Cleanup(func() { modelsURLs = savedURLs })
+
+	withTempModelStore(t, func() {
+		tryRefreshModels(context.Background(), "test refresh")
+		if findKimiModel("kimi-k3-256k") == nil {
+			t.Fatal("kimi-k3-256k missing after tryRefreshModels; local override wiped by remote refresh")
+		}
+		if findKimiModel("kimi-k3") == nil {
+			t.Error("kimi-k3 from remote catalog missing after refresh")
 		}
 	})
 }

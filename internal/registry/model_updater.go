@@ -172,6 +172,10 @@ func tryRefreshModels(ctx context.Context, label string) {
 		return
 	}
 
+	// Re-apply local overrides: the remote catalog replaces the whole store,
+	// so homelab-local additions would otherwise be wiped on every refresh.
+	applyLocalModelOverrides(parsed)
+
 	// Detect changes before updating store.
 	changed := detectChangedProviders(oldData, parsed)
 
