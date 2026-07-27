@@ -27,6 +27,57 @@ var modelsURLs = []string{
 //go:embed models/models.json
 var embeddedModelsJSON []byte
 
+//go:embed models/models.local.json
+var localModelsJSON []byte
+
+// localOverrides holds the parsed models.local.json catalog. Entries are merged
+// over every loaded catalog (embedded or remotely refreshed) so homelab-local
+// model additions survive the periodic remote catalog refresh, which otherwise
+// replaces the whole store.
+var (
+	localOverridesOnce sync.Once
+	localOverrides     staticModelsJSON
+	localOverridesErr  error
+)
+
+// loadLocalOverrides parses the embedded local override catalog exactly once.
+func loadLocalOverrides() (*staticModelsJSON, error) {
+	localOverridesOnce.Do(func() {
+		if err := json.Unmarshal(localModelsJSON, &localOverrides); err != nil {
+			localOverridesErr = fmt.Errorf("decode local models override catalog: %w", err)
+		}
+	})
+	if localOverridesErr != nil {
+		return nil, localOverridesErr
+	}
+	return &localOverrides, nil
+}
+
+// applyLocalModelOverrides merges the embedded models.local.json entries over
+// the given catalog. It runs on every catalog load (startup embed and every
+// remote refresh) so local additions are never wiped by a remote refresh.
+func applyLocalModelOverrides(catalog *staticModelsJSON) {
+	if catalog == nil {
+		return
+	}
+	overrides, err := loadLocalOverrides()
+	if err != nil {
+		log.Warnf("registry: skipping local model overrides: %v", err)
+		return
+	}
+	catalog.Claude = upsertModelInfos(catalog.Claude, overrides.Claude...)
+	catalog.Gemini = upsertModelInfos(catalog.Gemini, overrides.Gemini...)
+	catalog.Vertex = upsertModelInfos(catalog.Vertex, overrides.Vertex...)
+	catalog.AIStudio = upsertModelInfos(catalog.AIStudio, overrides.AIStudio...)
+	catalog.CodexFree = upsertModelInfos(catalog.CodexFree, overrides.CodexFree...)
+	catalog.CodexTeam = upsertModelInfos(catalog.CodexTeam, overrides.CodexTeam...)
+	catalog.CodexPlus = upsertModelInfos(catalog.CodexPlus, overrides.CodexPlus...)
+	catalog.CodexPro = upsertModelInfos(catalog.CodexPro, overrides.CodexPro...)
+	catalog.Kimi = upsertModelInfos(catalog.Kimi, overrides.Kimi...)
+	catalog.Antigravity = upsertModelInfos(catalog.Antigravity, overrides.Antigravity...)
+	catalog.XAI = upsertModelInfos(catalog.XAI, overrides.XAI...)
+}
+
 type modelStore struct {
 	mu   sync.RWMutex
 	data *staticModelsJSON
@@ -302,6 +353,7 @@ func loadModelsFromBytes(data []byte, source string) error {
 	if err := validateModelsCatalog(&parsed); err != nil {
 		return fmt.Errorf("%s: validate models catalog: %w", source, err)
 	}
+	applyLocalModelOverrides(&parsed)
 
 	modelsCatalogStore.mu.Lock()
 	modelsCatalogStore.data = &parsed
