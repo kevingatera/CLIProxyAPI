@@ -11,7 +11,7 @@ env:
 
 jobs:
   docker_amd64:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, lxc]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -81,7 +81,7 @@ jobs:
             ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}-arm64
 
   docker_manifest:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, lxc]
     needs:
       - docker_amd64
       - docker_arm64
