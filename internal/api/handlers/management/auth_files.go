@@ -261,6 +261,14 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	c.JSON(200, gin.H{"files": files})
 }
 
+func shouldHideReservedAuthFile(name string) bool {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return false
+	}
+	return strings.EqualFold(trimmed, "usage_stats.json")
+}
+
 // GetAuthFileModels returns the models supported by a specific auth file
 func (h *Handler) GetAuthFileModels(c *gin.Context) {
 	name := c.Query("name")
@@ -325,6 +333,9 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 		if !strings.HasSuffix(strings.ToLower(name), ".json") {
 			continue
 		}
+		if shouldHideReservedAuthFile(name) {
+			continue
+		}
 		if info, errInfo := e.Info(); errInfo == nil {
 			fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime()}
 
@@ -374,6 +385,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	name := strings.TrimSpace(auth.FileName)
 	if name == "" {
 		name = auth.ID
+	}
+	if shouldHideReservedAuthFile(name) {
+		return nil
 	}
 	entry := gin.H{
 		"id":             auth.ID,
