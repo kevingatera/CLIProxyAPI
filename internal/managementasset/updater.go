@@ -46,6 +46,14 @@ var (
 	sfGroup             singleflight.Group
 )
 
+// OverridePath returns the cleaned MANAGEMENT_STATIC_PATH override when it is set.
+func OverridePath() string {
+	if override := strings.TrimSpace(os.Getenv("MANAGEMENT_STATIC_PATH")); override != "" {
+		return filepath.Clean(override)
+	}
+	return ""
+}
+
 // SetCurrentConfig stores the latest configuration snapshot for management asset decisions.
 func SetCurrentConfig(cfg *config.Config) {
 	if cfg == nil {
@@ -74,6 +82,11 @@ func StartAutoUpdater(ctx context.Context, configFilePath string) {
 func runAutoUpdater(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+
+	if OverridePath() != "" {
+		log.Debug("management asset auto-updater skipped: MANAGEMENT_STATIC_PATH override is set")
+		return
 	}
 
 	ticker := time.NewTicker(updateCheckInterval)
@@ -132,7 +145,7 @@ type releaseResponse struct {
 
 // StaticDir resolves the directory that stores the management control panel asset.
 func StaticDir(configFilePath string) string {
-	if override := strings.TrimSpace(os.Getenv("MANAGEMENT_STATIC_PATH")); override != "" {
+	if override := OverridePath(); override != "" {
 		cleaned := filepath.Clean(override)
 		if strings.EqualFold(filepath.Base(cleaned), managementAssetName) {
 			return filepath.Dir(cleaned)
@@ -162,7 +175,7 @@ func StaticDir(configFilePath string) string {
 
 // FilePath resolves the absolute path to the management control panel asset.
 func FilePath(configFilePath string) string {
-	if override := strings.TrimSpace(os.Getenv("MANAGEMENT_STATIC_PATH")); override != "" {
+	if override := OverridePath(); override != "" {
 		cleaned := filepath.Clean(override)
 		if strings.EqualFold(filepath.Base(cleaned), managementAssetName) {
 			return cleaned
