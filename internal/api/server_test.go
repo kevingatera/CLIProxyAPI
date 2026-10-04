@@ -1672,21 +1672,15 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 		t.Fatalf("missing key status = %d, want %d body=%s", missingKeyRR.Code, http.StatusUnauthorized, missingKeyRR.Body.String())
 	}
 
-	// The /v0/management/usage endpoint serves the in-memory usage statistics
-	// snapshot for the management UI's Usage page.
-	usageReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage", nil)
-	usageReq.Header.Set("Authorization", "Bearer test-management-key")
-	usageRR := httptest.NewRecorder()
-	server.engine.ServeHTTP(usageRR, usageReq)
-	if usageRR.Code != http.StatusOK {
-		t.Fatalf("usage status = %d, want %d body=%s", usageRR.Code, http.StatusOK, usageRR.Body.String())
-	}
-	var usageSnapshot struct {
-		Usage          json.RawMessage `json:"usage"`
-		FailedRequests int64           `json:"failed_requests"`
-	}
-	if errUnmarshal := json.Unmarshal(usageRR.Body.Bytes(), &usageSnapshot); errUnmarshal != nil {
-		t.Fatalf("unmarshal usage response: %v body=%s", errUnmarshal, usageRR.Body.String())
+	// Upstream removed the legacy redisqueue /usage route, but this fork serves
+	// usage statistics at /usage (the management UI depends on it), so an
+	// authenticated request returns 200 instead of upstream's 404.
+	usageStatsReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage?count=2", nil)
+	usageStatsReq.Header.Set("Authorization", "Bearer test-management-key")
+	usageStatsRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(usageStatsRR, usageStatsReq)
+	if usageStatsRR.Code != http.StatusOK {
+		t.Fatalf("usage statistics status = %d, want %d body=%s", usageStatsRR.Code, http.StatusOK, usageStatsRR.Body.String())
 	}
 
 	authReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)
