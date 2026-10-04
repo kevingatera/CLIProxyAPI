@@ -2,7 +2,9 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"reflect"
 	"testing"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -35,11 +37,13 @@ func (e *routingPolicyTestExecutor) Execute(ctx context.Context, auth *Auth, req
 }
 
 func (e *routingPolicyTestExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	_ = ctx
-	_ = auth
-	_ = req
-	_ = opts
-	return nil, nil
+	if _, err := e.Execute(ctx, auth, req, opts); err != nil {
+		return nil, err
+	}
+	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("ok")}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
 }
 
 func (e *routingPolicyTestExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
@@ -244,5 +248,52 @@ func TestExecute_RoutingTraceIncludesFallbackAttempts(t *testing.T) {
 	}
 	if firstAttempt.FallbackReason != "rate_limited" && firstAttempt.FallbackReason != "exhausted" {
 		t.Fatalf("first attempt fallback reason = %q, want rate_limited/exhausted", firstAttempt.FallbackReason)
+	}
+}
+
+func TestExecuteStream_RoutingPolicyAuthOrderAndFallback(t *testing.T) {
+	for _, failFirst := range []bool{false, true} {
+		t.Run(fmt.Sprint(failFirst), func(t *testing.T) {
+			model := "routing-stream-order-test"
+			cfg := &internalconfig.Config{Routing: internalconfig.RoutingConfig{Policy: internalconfig.RoutingPolicy{
+				Enabled:       true,
+				Defaults:      internalconfig.RoutingPolicyRule{Route: []internalconfig.RoutingPolicyRoute{{Provider: "claude", AuthOrder: []string{"z-oauth", "a-fallback"}}}},
+				Fallback:      internalconfig.RoutingFallbackPolicy{On: []string{"rate_limited"}},
+				Observability: internalconfig.RoutingPolicyObservability{TraceLimit: 32},
+			}}}
+			cfg.SanitizeRoutingPolicy()
+			exec := &routingPolicyTestExecutor{id: "claude", execute: func(a *Auth) error {
+				if failFirst && a.ID == "z-oauth" {
+					return &Error{HTTPStatus: 429, Message: "rate limited"}
+				}
+				return nil
+			}}
+			m := NewManager(nil, &RoundRobinSelector{}, nil)
+			m.SetConfig(cfg)
+			m.RegisterExecutor(exec)
+			for _, id := range []string{"a-fallback", "z-oauth"} {
+				if _, err := m.Register(context.Background(), &Auth{ID: id, Provider: "claude", Status: StatusActive}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			registerRoutingPolicyAuthModel(t, "claude", model, "a-fallback", "z-oauth")
+			result, err := m.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range result.Chunks {
+			}
+			want := []string{"z-oauth"}
+			if failFirst {
+				want = append(want, "a-fallback")
+			}
+			if !reflect.DeepEqual(exec.calls, want) {
+				t.Fatalf("calls %v want %v", exec.calls, want)
+			}
+			traces := m.ListRoutingTraces(1, model, "claude", false)
+			if len(traces) != 1 || len(traces[0].Attempts) != len(want) {
+				t.Fatalf("traces %#v", traces)
+			}
+		})
 	}
 }
