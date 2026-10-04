@@ -391,7 +391,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	for {
 		roundAttempted := make(map[string]struct{})
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
-		result, errStream := m.executeStreamMixedOnce(ctx, plan.OrderedProviders, req, roundOpts, maxRetryCredentials, &homeRetryLimit, attempt, defaultRequestRetry)
+		result, errStream := m.executeStreamMixedOnce(ctx, plan.OrderedProviders, req, roundOpts, maxRetryCredentials, &homeRetryLimit, attempt, defaultRequestRetry, trace)
 		if errStream == nil {
 			finalStatus = "success"
 			stopReason = "completed"
@@ -1064,7 +1064,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 }
 
-func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, homeRetryLimit *int, retryRound int, defaultRequestRetry int) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, homeRetryLimit *int, retryRound int, defaultRequestRetry int, traces ...*routingTraceRuntime) (*cliproxyexecutor.StreamResult, error) {
 	if len(providers) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -1072,6 +1072,12 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	responseAlias := requestedModelAliasFromOptions(opts, routeModel)
 	executionModel, restoreExecutionModel := executionModelForAuthSelection(opts, req.Model)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	plan := m.buildRoutingExecutionPlan(providers, routeModel, opts)
+	var trace *routingTraceRuntime
+	if len(traces) > 0 {
+		trace = traces[0]
+	}
+	candidateIndex := 0
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
@@ -1120,7 +1126,22 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				provider = selection.Provider
 			}
 		} else {
-			auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+			for candidateIndex < len(plan.ExplicitCandidates) && auth == nil {
+				candidate := plan.ExplicitCandidates[candidateIndex]
+				candidateIndex++
+				if _, used := tried[candidate.AuthID]; used {
+					continue
+				}
+				auth, executor, errPick = m.pickPinnedCandidate(ctx, candidate.Provider, routeModel, pickOpts, tried, candidate.AuthID)
+				provider = candidate.Provider
+				if errPick != nil {
+					m.appendRoutingTraceAttempt(trace, traceAttemptFromError(provider, candidate.AuthID, "stream", errPick, true, "candidate_unavailable"))
+					tried[candidate.AuthID] = struct{}{}
+				}
+			}
+			if auth == nil {
+				auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+			}
 		}
 		if errPick != nil {
 			preferredErr := preferredExecutionAttemptError(lastErr, upstreamErr)
@@ -1329,6 +1350,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil)
 		if errStream != nil {
+			fallback, reason := m.shouldFallbackAfterExecutionError(errStream, plan)
+			m.appendRoutingTraceAttempt(trace, traceAttemptFromError(provider, auth.ID, "stream", errStream, fallback, reason))
 			if hasUpstreamExecutionAttempt(errStream) {
 				upstreamErr = errStream
 			}
@@ -1366,7 +1389,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				}
 				continue
 			}
-			if isRequestInvalidError(errStream) {
+			if isRequestInvalidError(errStream) || (plan.PolicyEnabled && !homeMode && !fallback) {
 				return nil, errStream
 			}
 			lastErr = errStream
@@ -1378,6 +1401,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			continue
 		}
+		m.appendRoutingTraceAttempt(trace, traceAttemptSuccess(provider, auth.ID, "stream"))
 		if selection != nil {
 			if m.retainHomeWebsocketSelection(ctx, opts, routeModel, selection) {
 				return wrapHomeStream(ctx, streamResult, nil, releaseAttempt), nil

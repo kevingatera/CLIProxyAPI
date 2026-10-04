@@ -5091,6 +5091,68 @@ func TestClaudeExecutor_RebuildMidSystemMessageOptInMovesSystemMessages(t *testi
 	}
 }
 
+func TestClaudeExecutor_RebuildMidSystemMessageOptInStreaming(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{
+		ClaudeKey: []config.ClaudeKey{{
+			APIKey:                  "key-123",
+			BaseURL:                 server.URL,
+			RebuildMidSystemMessage: true,
+		}},
+	})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"system":"Top rule","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]},{"role":"system","content":"Mid string rule"},{"role":"assistant","content":[{"type":"text","text":"ok"}]},{"role":"system","content":[{"type":"text","text":"Mid array rule","cache_control":{"type":"ephemeral"}}]},{"role":"user","content":[{"type":"text","text":"continue"}]}],"metadata":{"user_id":"{\"device_id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"account_uuid\":\"\",\"session_id\":\"11111111-2222-4333-8444-555555555555\"}"}}`)
+	ctx := contextWithGinHeaders(map[string]string{
+		"User-Agent":     "claude-cli/2.1.280 (external, cli)",
+		"X-App":          "cli",
+		"Anthropic-Beta": "claude-code-20250219",
+	})
+
+	result, errExecute := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet-20241022",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude"), Stream: true})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	for range result.Chunks {
+	}
+	if len(seenBody) == 0 {
+		t.Fatal("expected request body to be captured")
+	}
+
+	system := gjson.GetBytes(seenBody, "system").Array()
+	if len(system) != 3 {
+		t.Fatalf("system has %d items, want 3: %s", len(system), gjson.GetBytes(seenBody, "system").Raw)
+	}
+	wantTexts := []string{"Top rule", "Mid string rule", "Mid array rule"}
+	for i, want := range wantTexts {
+		if got := system[i].Get("text").String(); got != want {
+			t.Fatalf("system[%d].text = %q, want %q", i, got, want)
+		}
+	}
+	if got := gjson.GetBytes(seenBody, "system.2.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("system.2.cache_control.type = %q, want ephemeral", got)
+	}
+	if gjson.GetBytes(seenBody, `messages.#(role=="system")`).Exists() {
+		t.Fatalf("messages should not contain system role after rebuild: %s", gjson.GetBytes(seenBody, "messages").Raw)
+	}
+	if got := gjson.GetBytes(seenBody, "messages.#").Int(); got != 3 {
+		t.Fatalf("messages count = %d, want 3", got)
+	}
+}
+
 func TestResolveClaudeWirePolicy(t *testing.T) {
 	tests := []struct {
 		name      string
