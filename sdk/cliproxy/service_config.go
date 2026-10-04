@@ -5,9 +5,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -121,6 +121,7 @@ func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 	s.cfgMu.Lock()
 	s.cfg = newCfg
 	s.cfgMu.Unlock()
+	s.cancelStaleAntigravityProbes("")
 	s.configSequence++
 	return configCommit{cfg: newCfg, sequence: s.configSequence}
 }
@@ -161,6 +162,7 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 	if !s.applyPprofConfigContext(ctx, cfg) {
 		return false
 	}
+	s.applyDiscoveryConfigContext(ctx, cfg)
 	if errContext := ctx.Err(); errContext != nil {
 		return false
 	}
