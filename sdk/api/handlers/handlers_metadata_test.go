@@ -39,6 +39,29 @@ func TestGetContextWithCancelCapturesClientRequestMetadata(t *testing.T) {
 	}
 }
 
+func TestGetContextWithCancelCapturesResolvedClientIP(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, engine := gin.CreateTestContext(httptest.NewRecorder())
+	if errSetTrustedProxies := engine.SetTrustedProxies([]string{"192.0.2.0/24"}); errSetTrustedProxies != nil {
+		t.Fatalf("SetTrustedProxies: %v", errSetTrustedProxies)
+	}
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ginCtx.Request.RemoteAddr = "192.0.2.10:43123"
+	ginCtx.Request.Header.Set("X-Forwarded-For", "203.0.113.5")
+
+	handler := &BaseAPIHandler{Cfg: &config.SDKConfig{}}
+	ctx, cancel := handler.GetContextWithCancel(nil, ginCtx, context.Background())
+	defer cancel()
+
+	metadata := logging.GetClientRequestMetadata(ctx)
+	if metadata.ResolvedClientIP != "203.0.113.5" {
+		t.Fatalf("ResolvedClientIP = %q, want %q", metadata.ResolvedClientIP, "203.0.113.5")
+	}
+	if metadata.ClientIP != "192.0.2.10" {
+		t.Fatalf("ClientIP = %q, want direct peer IP", metadata.ClientIP)
+	}
+}
+
 func TestRequestExecutionMetadataIncludesExecutionSessionWithoutIdempotencyKey(t *testing.T) {
 	ctx := WithExecutionSessionID(context.Background(), "session-1")
 
@@ -282,5 +305,21 @@ func TestEnrichContextWithSessionHierarchyFromBody(t *testing.T) {
 	metaCleared := logging.GetClientRequestMetadata(ctxCleared)
 	if metaCleared.SessionID != "" || metaCleared.ParentSessionID != "" {
 		t.Fatalf("cleared context = (%q, %q), want (empty, empty)", metaCleared.SessionID, metaCleared.ParentSessionID)
+	}
+
+	// 7. Roo Code task delegation from body
+	rooBody := []byte(`{"taskId":"task-child-99","parentTaskId":"task-parent-99"}`)
+	ctx7 := EnrichContextWithSessionHierarchy(context.Background(), nil, rooBody, nil)
+	meta7 := logging.GetClientRequestMetadata(ctx7)
+	if meta7.SessionID != "task:task-child-99" || meta7.ParentSessionID != "task:task-parent-99" {
+		t.Fatalf("Roo Code task session = (%q, %q), want (task:task-child-99, task:task-parent-99)", meta7.SessionID, meta7.ParentSessionID)
+	}
+
+	// 8. OpenCode parent_id in payload
+	opencodeBody := []byte(`{"session_id":"opencode-sess-1","parent_id":"opencode-root-1"}`)
+	ctx8 := EnrichContextWithSessionHierarchy(context.Background(), nil, opencodeBody, nil)
+	meta8 := logging.GetClientRequestMetadata(ctx8)
+	if meta8.SessionID != "session:opencode-sess-1" || meta8.ParentSessionID != "session:opencode-root-1" {
+		t.Fatalf("OpenCode parent_id session = (%q, %q), want (session:opencode-sess-1, session:opencode-root-1)", meta8.SessionID, meta8.ParentSessionID)
 	}
 }

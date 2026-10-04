@@ -28,9 +28,20 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 	if ctx.Err() != nil {
 		return
 	}
+	s.cancelStaleAntigravityProbes(a.ID)
 	if a.Disabled {
+		if s != nil && s.coreManager != nil {
+			if current, ok := s.coreManager.GetByID(a.ID); ok && current != nil && !current.Disabled {
+				return
+			}
+		}
 		GlobalModelRegistry().UnregisterClient(a.ID)
 		return
+	}
+	if s != nil && s.coreManager != nil {
+		if current, ok := s.coreManager.GetByID(a.ID); !ok || current == nil || current.Disabled {
+			return
+		}
 	}
 	authKind := a.AuthKind()
 	// Unregister legacy client ID (if present) to avoid double counting
@@ -100,8 +111,21 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		models = registry.GetAIStudioModels()
 		models = applyExcludedModels(models, excluded)
 	case "antigravity":
-		models = registry.GetAntigravityModels()
-		models = applyAntigravityFetchedModelCapabilities(models, s.fetchAntigravityModelCapabilityHintsForAuth(ctx, a))
+		if !s.antigravityHomeEnabled() {
+			expectedRegEpoch := GlobalModelRegistry().ClientRegistrationEpoch(a.ID)
+			expectedKey := s.antigravityCapabilityKey(a)
+			hints := s.cachedAntigravityHints(a)
+			if hints.ModelIDs != nil {
+				// Publish known catalogs through the same fenced, state-preserving
+				// path as refreshes. An expired catalog remains usable while HTTP
+				// is pending, including its quota and suspension projections.
+				s.applyAntigravityModelHints(ctx, a, provider, hints, expectedKey, a.RegistrationEpoch, expectedRegEpoch)
+				s.asyncProbeAntigravityCapabilities(ctx, a, provider)
+				return
+			}
+		} else {
+			models = registry.GetAntigravityModels()
+		}
 		models = applyExcludedModels(models, excluded)
 	case "claude":
 		models = registry.GetClaudeModels()
@@ -141,7 +165,7 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 			models = registry.GetCodexProModels()
 		}
 		models = applyExcludedModels(models, excluded)
-	case "kimi":
+	case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
 		models = registry.GetKimiModels()
 		models = applyExcludedModels(models, excluded)
 	case "xai":
@@ -157,6 +181,19 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		models = applyExcludedModels(models, excluded)
 	case "cursor":
 		models = cursorModelsFromAuthMetadata(a.Metadata)
+	case "devin":
+		models = registry.GetDevinModels()
+		models = applyExcludedModels(models, excluded)
+	case "meta":
+		models = registry.GetMetaModels()
+		if entry := s.resolveConfigMetaKey(a); entry != nil {
+			if len(entry.Models) > 0 {
+				models = buildMetaConfigModels(entry)
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
+			}
+		}
 		models = applyExcludedModels(models, excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
@@ -275,21 +312,28 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 	}
 	models = s.appendPluginModels(key, models)
 	if len(models) > 0 {
+		models = applyOAuthSettingsForAuth(s.cfg, provider, authKind, models)
 		forcePrefix := forceModelPrefixForProvider(provider, s.cfg != nil && s.cfg.ForceModelPrefix)
 		s.registerResolvedModelsForAuth(a, key, applyModelPrefixes(models, a.Prefix, forcePrefix))
+		if strings.EqualFold(strings.TrimSpace(a.Provider), "antigravity") {
+			s.asyncProbeAntigravityCapabilities(ctx, a, key)
+		}
 		return
 	}
 
 	GlobalModelRegistry().UnregisterClient(a.ID)
+	if provider == "antigravity" {
+		s.asyncProbeAntigravityCapabilities(ctx, a, key)
+	}
 }
 
 // refreshModelRegistrationForAuth re-applies the latest model registration for
 // one auth and reconciles any concurrent auth changes that race with the
 // refresh. Callers are expected to pre-filter provider membership.
 //
-// Re-registration is deliberate: registry cooldown/suspension state is treated
-// as part of the previous registration snapshot and is cleared when the auth is
-// rebound to the refreshed model catalog.
+// Re-registration is deliberate: most providers start a fresh registry snapshot.
+// Native Antigravity catalogs instead use fenced replacement to preserve quota
+// and suspension state while account entitlement refreshes are pending.
 func (s *Service) refreshModelRegistrationForAuth(current *coreauth.Auth) bool {
 	return s.refreshModelRegistrationForAuthWithContext(context.Background(), current, nil)
 }
@@ -312,7 +356,7 @@ func (s *Service) refreshModelRegistrationForAuthWithContext(ctx context.Context
 		s.ensureExecutorsForAuthWithContext(ctx, current, false)
 	}
 	s.registerModelsForAuthWithCache(ctx, current, compatCache)
-	s.coreManager.ReconcileRegistryModelStates(ctx, current.ID)
+	s.reconcileRegisteredModelStates(ctx, current)
 	if ctx.Err() != nil {
 		return false
 	}
@@ -332,7 +376,7 @@ func (s *Service) refreshModelRegistrationForAuthWithContext(ctx context.Context
 	if ctx.Err() != nil {
 		return false
 	}
-	s.coreManager.ReconcileRegistryModelStates(ctx, latest.ID)
+	s.reconcileRegisteredModelStates(ctx, latest)
 	s.coreManager.RefreshSchedulerEntry(current.ID)
 	return true
 }
@@ -498,6 +542,13 @@ func (s *Service) resolveConfigXAIKey(auth *coreauth.Auth) *config.XAIKey {
 	return resolveConfigCodexStyleKey(auth, s.cfg.XAIKey, false)
 }
 
+func (s *Service) resolveConfigMetaKey(auth *coreauth.Auth) *config.MetaKey {
+	if s == nil || s.cfg == nil {
+		return nil
+	}
+	return resolveConfigCodexStyleKey(auth, s.cfg.MetaKey, false)
+}
+
 func resolveConfigCodexStyleKey(auth *coreauth.Auth, entries []config.CodexKey, validateIndexCredentials bool) *config.CodexKey {
 	if auth == nil {
 		return nil
@@ -577,6 +628,19 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 	return filtered
 }
 
+func cloneModelInfoForCatalogRoute(model *ModelInfo) ModelInfo {
+	clone := *model
+	if model.NativeCapabilities != nil {
+		capabilities := *model.NativeCapabilities
+		if model.NativeCapabilities.WebSearch != nil {
+			webSearch := *model.NativeCapabilities.WebSearch
+			capabilities.WebSearch = &webSearch
+		}
+		clone.NativeCapabilities = &capabilities
+	}
+	return clone
+}
+
 func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix bool) []*ModelInfo {
 	trimmedPrefix := strings.TrimSpace(prefix)
 	if trimmedPrefix == "" || len(models) == 0 {
@@ -612,8 +676,13 @@ func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix boo
 		if !forceModelPrefix || trimmedPrefix == baseID {
 			addModel(model)
 		}
-		clone := *model
+		clone := cloneModelInfoForCatalogRoute(model)
 		clone.ID = trimmedPrefix + "/" + baseID
+		if clone.MetadataModelID == "" {
+			clone.MetadataModelID = baseID
+		}
+		clone.ExplicitThinking = model.ExplicitThinking
+		clone.ExplicitInputModalities = model.ExplicitInputModalities
 		addModel(&clone)
 	}
 	return out
@@ -694,14 +763,19 @@ func buildConfiguredModelInfo(model modelEntry, ownedBy, modelType string, creat
 	if displayName == "" {
 		displayName = alias
 	}
+	metadataModelID := name
+	if metadataModelID == "" {
+		metadataModelID = alias
+	}
 	info := &ModelInfo{
-		ID:          alias,
-		Object:      "model",
-		Created:     created,
-		OwnedBy:     ownedBy,
-		Type:        modelType,
-		DisplayName: displayName,
-		UserDefined: userDefined,
+		ID:              alias,
+		MetadataModelID: metadataModelID,
+		Object:          "model",
+		Created:         created,
+		OwnedBy:         ownedBy,
+		Type:            modelType,
+		DisplayName:     displayName,
+		UserDefined:     userDefined,
 	}
 	if maxContextModel, okMaxContext := any(model).(modelMaxContextLengthEntry); okMaxContext {
 		if maxContextLength := maxContextModel.GetMaxContextLength(); maxContextLength > 0 {
@@ -735,6 +809,12 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 		if thinkingSupport == nil && !model.Image {
 			thinkingSupport = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
 		}
+		if model.Thinking != nil {
+			info.ExplicitThinking = true
+		}
+		if len(model.InputModalities) > 0 {
+			info.ExplicitInputModalities = true
+		}
 		info.Thinking = modelconfig.NormalizeThinkingSupport(thinkingSupport)
 		info.SupportedInputModalities = normalizeCompatConfigModalities(model.InputModalities)
 		info.SupportedOutputModalities = normalizeCompatConfigModalities(model.OutputModalities)
@@ -766,7 +846,7 @@ func normalizeCompatConfigModalities(raw []string) []string {
 	return out
 }
 
-func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*ModelInfo {
+func buildConfigModels[T modelEntry](models []T, ownedBy, modelType, metadataChannel string) []*ModelInfo {
 	if len(models) == 0 {
 		return nil
 	}
@@ -786,8 +866,14 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*M
 			continue
 		}
 		seen[key] = struct{}{}
+		if model.GetThinking() != nil {
+			info.ExplicitThinking = true
+		}
 		if resolved := modelconfig.ResolveModelInfo(name, modelType, model.GetThinking()); resolved.Thinking != nil {
 			info.Thinking = resolved.Thinking
+		}
+		if staticInfo := registry.LookupStaticModelInfoByChannel(name, metadataChannel); staticInfo != nil && staticInfo.NativeCapabilities != nil {
+			info.NativeCapabilities = cloneModelInfoForCatalogRoute(staticInfo).NativeCapabilities
 		}
 		out = append(out, info)
 	}
@@ -798,28 +884,35 @@ func buildVertexCompatConfigModels(entry *config.VertexCompatKey) []*ModelInfo {
 	if entry == nil {
 		return nil
 	}
-	return buildConfigModels(entry.Models, "google", "vertex")
+	return buildConfigModels(entry.Models, "google", "vertex", "vertex")
 }
 
 func buildGeminiConfigModels(entry *config.GeminiKey) []*ModelInfo {
 	if entry == nil {
 		return nil
 	}
-	return buildConfigModels(entry.Models, "google", "gemini")
+	return buildConfigModels(entry.Models, "google", "gemini", "gemini")
 }
 
 func buildClaudeConfigModels(entry *config.ClaudeKey) []*ModelInfo {
 	if entry == nil {
 		return nil
 	}
-	return buildConfigModels(entry.Models, "anthropic", "claude")
+	return buildConfigModels(entry.Models, "anthropic", "claude", "claude")
 }
 
 func buildXAIConfigModels(entry *config.XAIKey) []*ModelInfo {
 	if entry == nil {
 		return nil
 	}
-	return buildConfigModels(entry.Models, "xai", "xai")
+	return buildConfigModels(entry.Models, "xai", "xai", "xai")
+}
+
+func buildMetaConfigModels(entry *config.MetaKey) []*ModelInfo {
+	if entry == nil {
+		return nil
+	}
+	return buildConfigModels(entry.Models, "meta", "meta", "meta")
 }
 
 func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
@@ -827,11 +920,18 @@ func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
 		return nil
 	}
 	if len(entry.Models) == 0 {
-		return registry.GetCodexProModels()
+		models := registry.GetCodexProModels()
+		for _, model := range models {
+			if model != nil {
+				model.SupportConfigurationUpdate = false
+			}
+		}
+		return models
 	}
 
-	models := buildConfigModels(entry.Models, "openai", "openai")
+	models := buildConfigModels(entry.Models, "openai", "openai", "codex")
 	configuredDisplayNames := make(map[string]string, len(entry.Models))
+	configuredConfigurationUpdates := make(map[string]bool, len(entry.Models))
 	seenConfiguredModels := make(map[string]struct{}, len(entry.Models))
 	for i := range entry.Models {
 		model := entry.Models[i]
@@ -847,6 +947,7 @@ func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
 			continue
 		}
 		seenConfiguredModels[key] = struct{}{}
+		configuredConfigurationUpdates[key] = model.SupportConfigurationUpdate
 
 		displayName := strings.TrimSpace(model.DisplayName)
 		if displayName != "" {
@@ -857,9 +958,11 @@ func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
 		if model == nil {
 			continue
 		}
-		if displayName, ok := configuredDisplayNames[strings.ToLower(model.ID)]; ok {
+		key := strings.ToLower(model.ID)
+		if displayName, ok := configuredDisplayNames[key]; ok {
 			model.DisplayName = displayName
 		}
+		model.SupportConfigurationUpdate = configuredConfigurationUpdates[key]
 	}
 	return models
 }
@@ -1019,8 +1122,15 @@ func applyOAuthModelAliasEntries(aliases []config.OAuthModelAlias, models []*Mod
 				continue
 			}
 			seen[aliasKey] = struct{}{}
-			clone := *model
+			clone := cloneModelInfoForCatalogRoute(model)
 			clone.ID = mappedID
+			if model.MetadataModelID != "" {
+				clone.MetadataModelID = model.MetadataModelID
+			} else {
+				clone.MetadataModelID = id
+			}
+			clone.ExplicitThinking = model.ExplicitThinking
+			clone.ExplicitInputModalities = model.ExplicitInputModalities
 			if entry.displayName != "" {
 				clone.DisplayName = entry.displayName
 			}
@@ -1036,6 +1146,54 @@ func applyOAuthModelAliasEntries(aliases []config.OAuthModelAlias, models []*Mod
 				continue
 			}
 			seen[key] = struct{}{}
+			out = append(out, model)
+		}
+	}
+	return out
+}
+
+func applyOAuthSettings(cfg *config.Config, provider, authKind string, models []*ModelInfo) []*ModelInfo {
+	return applyOAuthSettingsForAuth(cfg, provider, authKind, models)
+}
+
+func applyOAuthSettingsForAuth(cfg *config.Config, provider, authKind string, models []*ModelInfo) []*ModelInfo {
+	if len(models) == 0 {
+		return models
+	}
+	channel := coreauth.OAuthModelAliasChannel(provider, authKind)
+	if channel == "" {
+		return models
+	}
+	settings := oauthSettingsForAuth(cfg, channel)
+	if len(settings) == 0 {
+		return models
+	}
+	return applyOAuthSettingEntries(settings, models)
+}
+
+func oauthSettingsForAuth(cfg *config.Config, channel string) []config.OAuthModelSetting {
+	if cfg == nil || len(cfg.OAuthSettings) == 0 {
+		return nil
+	}
+	return cfg.OAuthSettings[channel]
+}
+
+func applyOAuthSettingEntries(settings []config.OAuthModelSetting, models []*ModelInfo) []*ModelInfo {
+	if len(settings) == 0 || len(models) == 0 {
+		return models
+	}
+	out := make([]*ModelInfo, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		setting := config.ResolveOAuthModelSetting(settings, model.ID, model.MetadataModelID, model.Name)
+		if setting != nil && setting.MaxContextLength > 0 {
+			clone := *model
+			clone.ContextLength = setting.MaxContextLength
+			clone.MaxContextLength = setting.MaxContextLength
+			out = append(out, &clone)
+		} else {
 			out = append(out, model)
 		}
 	}
