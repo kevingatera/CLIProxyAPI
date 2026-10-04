@@ -80,10 +80,15 @@ func (cfg *Config) SanitizeRoutingPolicy() {
 		seenTriggers[normalized] = struct{}{}
 		triggers = append(triggers, normalized)
 	}
-	if len(triggers) == 0 {
+	// Only inject default fallback triggers when the policy is enabled; doing
+	// it unconditionally would materialize values in saved configs even for a
+	// disabled policy and break config round-trip stability.
+	if len(triggers) == 0 && cfg.Routing.Policy.Enabled {
 		triggers = []string{"exhausted", "rate_limited", "server_error", "transport_error"}
 	}
-	cfg.Routing.Policy.Fallback.On = triggers
+	if len(triggers) > 0 {
+		cfg.Routing.Policy.Fallback.On = triggers
+	}
 	if cfg.Routing.Policy.Observability.TraceLimit < 0 {
 		cfg.Routing.Policy.Observability.TraceLimit = 0
 	}
