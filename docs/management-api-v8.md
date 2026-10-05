@@ -120,7 +120,10 @@ retain the corresponding business operation's fields.
 ## Configured account quota
 
 `POST /credentials/quota/native` accepts `{"auth_index":"<index>"}` from
-`GET /credentials/configured-quota`. It reads the configured key on the server
+`GET /credentials/configured-quota`. Entries using the same provider and API
+key are grouped into one allowance card, with their routing labels in
+`connections`. Distinct credentials remain separate. Grouping does not modify
+the routing entries. It reads the configured key on the server
 and returns normalized `groups` and numeric `summary` metrics. It does not reset
 limits, change routing cooldowns, or infer allowances from proxy request counts.
 The management key is required for both endpoints.

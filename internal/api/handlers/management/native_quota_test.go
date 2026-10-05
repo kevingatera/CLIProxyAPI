@@ -66,3 +66,23 @@ func TestNativeQuotaProviderBoundaries(t *testing.T) {
 		t.Fatalf("provider=%s", got)
 	}
 }
+
+func TestConfiguredQuotaCredentialsShareAccountAcrossProtocols(t *testing.T) {
+	makeAuth := func(id, label, key string, disabled bool) *coreauth.Auth {
+		return &coreauth.Auth{ID: id, Label: label, Disabled: disabled, Attributes: map[string]string{"api_key": key, "base_url": "https://api.commandcode.ai/provider/v1", "source": "config:" + label}}
+	}
+	a := makeAuth("claude-route", "claude-apikey", "same-secret", true)
+	b := makeAuth("openai-route", "command-code", "same-secret", false)
+	other := makeAuth("another-account", "command-code", "different-secret", false)
+	files := configuredQuotaCredentials([]*coreauth.Auth{a, b, other})
+	if len(files) != 2 {
+		t.Fatalf("got %d cards, want two distinct credentials", len(files))
+	}
+	if len(files[0]["connections"].([]string)) != 2 || files[0]["disabled"] != false || files[0]["auth_index"] != b.Index {
+		t.Fatalf("wrong shared account: %+v", files[0])
+	}
+	out, _ := json.Marshal(files)
+	if strings.Contains(string(out), "secret") {
+		t.Fatal("credential leaked")
+	}
+}
