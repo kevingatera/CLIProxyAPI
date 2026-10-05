@@ -99,6 +99,8 @@ retain the corresponding business operation's fields.
 | `/observability/usage/api-keys` | GET | Get API-key usage. |
 | `/observability/usage/queue` | GET | Get queued usage events. |
 | `/credentials` | GET, POST, DELETE | List, upload, or delete credential files. |
+| `/credentials/configured-quota` | GET | List configured API-key account identifiers without returning keys. |
+| `/credentials/quota/native` | POST | Fetch provider-reported account allowance for an `auth_index`. |
 | `/credentials/models` | GET | Get credential models. |
 | `/credentials/download` | GET | Download a credential file. |
 | `/credentials/status` | PATCH | Change credential status. |
@@ -114,6 +116,26 @@ retain the corresponding business operation's fields.
 | `/plugins/store` | GET | List the plugin store. |
 | `/plugins/store/<id>/install` | POST | Install or update a plugin. |
 | `/plugins/<id>/quota` | GET, POST, DELETE | Read, fetch, or reset plugin quota. |
+
+## Configured account quota
+
+`POST /credentials/quota/native` accepts `{"auth_index":"<index>"}` from
+`GET /credentials/configured-quota`. It reads the configured key on the server
+and returns normalized `groups` and numeric `summary` metrics. It does not reset
+limits, change routing cooldowns, or infer allowances from proxy request counts.
+The management key is required for both endpoints.
+
+Native adapters cover OpenCode Go, Kimi Coding, MiniMax international Coding
+Plan, and CommandCode account billing. OpenCode's HTTP 403 exhausted-window
+response remains a valid quota report when all three allowance windows are
+present. Other 403 responses remain errors. An inactive MiniMax token plan is
+reported explicitly, rather than displayed as a zero balance. Unsupported
+providers return HTTP 501; upstream authentication and malformed reports return
+HTTP 502 with an explanation, without exposing upstream bodies or credentials.
+
+Clients should poll no more frequently than every five minutes and pause
+polling while hidden. OAuth and plugin quotas use their existing account APIs
+and `/plugins/<id>/quota`; configured account quota does not replace them.
 
 ## OAuth
 
