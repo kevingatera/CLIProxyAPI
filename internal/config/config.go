@@ -9,6 +9,10 @@ type Config struct {
 	// Models selects optional catalog sources independently for each catalog.
 	Models ModelCatalogs `yaml:"models" json:"models"`
 
+	// RequestArchive records redacted traffic independently of provider selection.
+	// Enabling it or changing its directory requires a restart.
+	RequestArchive RequestArchiveConfig `yaml:"request-archive" json:"request-archive"`
+
 	SDKConfig `yaml:",inline"`
 	// Host is the network host/interface on which the API server will bind.
 	// Default is empty ("") to bind all interfaces (IPv4 + IPv6). Use "127.0.0.1" or "localhost" for local-only access.
