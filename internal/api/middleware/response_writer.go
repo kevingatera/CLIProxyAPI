@@ -89,6 +89,10 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 		if w.firstChunkTimestamp.IsZero() {
 			w.firstChunkTimestamp = time.Now()
 		}
+		if w.losslessStreaming() {
+			w.chunkChannel <- append([]byte(nil), data...)
+			return n, err
+		}
 		// For streaming responses: Send to async logging channel (non-blocking)
 		select {
 		case w.chunkChannel <- append([]byte(nil), data...): // Non-blocking send with copy
@@ -136,6 +140,10 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 		// Capture TTFB on first chunk (synchronous, before async channel send)
 		if w.firstChunkTimestamp.IsZero() {
 			w.firstChunkTimestamp = time.Now()
+		}
+		if w.losslessStreaming() {
+			w.chunkChannel <- []byte(data)
+			return n, err
 		}
 		select {
 		case w.chunkChannel <- []byte(data):
@@ -758,4 +766,9 @@ func hasActionableError(c *gin.Context, statusCode int, apiErrors []*interfaces.
 		return false
 	}
 	return statusCode >= http.StatusBadRequest
+}
+
+func (w *ResponseWriterWrapper) losslessStreaming() bool {
+	logger, ok := w.logger.(interface{ LosslessStreaming() bool })
+	return ok && logger.LosslessStreaming()
 }

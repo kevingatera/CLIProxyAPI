@@ -160,6 +160,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 
 	cfg.NormalizePluginsConfig()
+	if cfg.RequestArchive.MaxSizeGB < 0 || cfg.RequestArchive.MaxSizeGB > 1000000 {
+		return nil, fmt.Errorf("request-archive.max-size-gb must be between 0 and 1000000")
+	}
+	if cfg.RequestArchive.Enabled {
+		cfg.RequestLog = true
+	}
 	if errResolvePluginsDir := cfg.ResolvePluginsDir(); errResolvePluginsDir != nil && cfg.Plugins.Enabled {
 		return nil, errResolvePluginsDir
 	}

@@ -1087,6 +1087,13 @@ observability:
     # Record proxy request/response logs. Management requests are excluded.
     request-log: false
 
+    # Provider-independent credential-masked archive. Enabling requires restart.
+    # The cap uses decimal GB; oldest completed entries are removed first.
+    request-archive:
+      enabled: false
+      max-size-gb: 30
+      # directory: /CLIProxyAPI/logs/requests
+
   usage:
     # When false, disable in-memory usage statistics aggregation
     usage-statistics-enabled: false

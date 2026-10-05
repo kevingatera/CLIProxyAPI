@@ -12,6 +12,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+type RequestArchiveConfig struct {
+	Enabled   bool   `yaml:"enabled" json:"enabled"`
+	Directory string `yaml:"directory,omitempty" json:"directory,omitempty"`
+	MaxSizeGB int    `yaml:"max-size-gb,omitempty" json:"max-size-gb,omitempty"`
+}
+
 // RequestScopedErrorRule configures custom classification and handling for upstream errors.
 type RequestScopedErrorRule struct {
 	// Status matches the HTTP status code of the upstream response (e.g. 400).

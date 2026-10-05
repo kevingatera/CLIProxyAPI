@@ -59,6 +59,9 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 	}
 
 	// Update request logger enabled state if it has changed
+	if archive, ok := s.requestLogger.(*logging.RequestArchive); ok {
+		archive.SetConfig(cfg)
+	}
 	previousRequestLog := false
 	if oldCfg != nil {
 		previousRequestLog = oldCfg.RequestLog

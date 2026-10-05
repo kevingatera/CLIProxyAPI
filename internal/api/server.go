@@ -161,6 +161,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 			requestLogger = optionState.requestLoggerFactory(cfg, configFilePath)
 		}
 		if requestLogger != nil {
+			if archive, ok := requestLogger.(*logging.RequestArchive); ok && authManager != nil {
+				archive.SetSecretProvider(func() []string { return logging.ArchiveSecrets(authManager.List()) })
+			}
 			engine.Use(middleware.RequestLoggingMiddleware(requestLogger))
 			if setter, ok := requestLogger.(interface{ SetEnabled(bool) }); ok {
 				toggle = setter.SetEnabled
