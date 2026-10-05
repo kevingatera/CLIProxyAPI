@@ -175,7 +175,7 @@ func (r *ArchiveRedactor) Bytes(data []byte) []byte {
 		return []byte("[BINARY PAYLOAD OMITTED]\n")
 	}
 	s := r.replacements.Replace(string(data))
-	s = redactArchiveJSON(s)
+	s = r.redactArchiveJSON(s)
 	s = archivePrivateKey.ReplaceAllString(s, archiveRedacted)
 	s = archiveIncompletePrivateKey.ReplaceAllString(s, archiveRedacted)
 	s = urlUserinfoLogPattern.ReplaceAllString(s, `${1}[REDACTED]@`)
@@ -187,10 +187,10 @@ func (r *ArchiveRedactor) Bytes(data []byte) []byte {
 	return []byte(s)
 }
 
-func redactArchiveJSON(s string) string {
+func (r *ArchiveRedactor) redactArchiveJSON(s string) string {
 	var value any
 	if json.Unmarshal([]byte(s), &value) == nil {
-		if maskArchiveFields(value) {
+		if masked, known := maskArchiveFields(value), r.maskKnownArchiveValues(value); masked || known {
 			encoded, _ := json.Marshal(value)
 			return string(encoded)
 		}
@@ -206,7 +206,10 @@ func redactArchiveJSON(s string) string {
 			}
 			line = strings.TrimPrefix(line, prefix)
 		}
-		if json.Unmarshal([]byte(line), &value) == nil && maskArchiveFields(value) {
+		if json.Unmarshal([]byte(line), &value) == nil {
+			if masked, known := maskArchiveFields(value), r.maskKnownArchiveValues(value); !(masked || known) {
+				continue
+			}
 			encoded, _ := json.Marshal(value)
 			lines[i] = prefix + string(encoded)
 		}
@@ -298,4 +301,37 @@ func (r *ArchiveRedactor) Headers(headers map[string][]string) map[string][]stri
 		}
 	}
 	return out
+}
+
+// Decode string escapes before matching exact credential values, so JSON
+// unicode escapes cannot hide a configured key from the archive masker.
+func (r *ArchiveRedactor) maskKnownArchiveValues(value any) bool {
+	changed := false
+	switch x := value.(type) {
+	case map[string]any:
+		for key, item := range x {
+			if text, ok := item.(string); ok {
+				safe := r.replacements.Replace(text)
+				if safe != text {
+					x[key] = safe
+					changed = true
+				}
+			} else if r.maskKnownArchiveValues(item) {
+				changed = true
+			}
+		}
+	case []any:
+		for i, item := range x {
+			if text, ok := item.(string); ok {
+				safe := r.replacements.Replace(text)
+				if safe != text {
+					x[i] = safe
+					changed = true
+				}
+			} else if r.maskKnownArchiveValues(item) {
+				changed = true
+			}
+		}
+	}
+	return changed
 }

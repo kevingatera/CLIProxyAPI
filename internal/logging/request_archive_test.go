@@ -184,3 +184,15 @@ func TestRequestArchiveForcedErrorsMaskErrorTextAndDirectBodies(t *testing.T) {
 		}
 	}
 }
+
+func TestArchiveRedactorDecodedEscapesCannotHideKnownCredentials(t *testing.T) {
+	r := NewArchiveRedactor([]string{"consumer-secret-123456789"})
+	input := []byte(`{"prompt":"consumer\u002dsecret-123456789","tool":{"data":["consumer\u002dsecret-123456789"]}}`)
+	out := string(r.Bytes(input))
+	if strings.Contains(out, "123456789") || strings.Contains(out, "consumer") {
+		t.Fatalf("escaped key leaked: %s", out)
+	}
+	if !strings.Contains(out, "[REDACTED]") {
+		t.Fatal("mask missing")
+	}
+}
