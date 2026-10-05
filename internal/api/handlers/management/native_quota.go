@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,19 +23,49 @@ import (
 func (h *Handler) ListConfiguredQuotaCredentials(c *gin.Context) {
 	files := []gin.H{}
 	if h.authManager != nil {
-		for _, a := range h.authManager.List() {
-			if a == nil || a.Attributes["api_key"] == "" || !strings.HasPrefix(a.Attributes["source"], "config:") {
-				continue
-			}
-			a.EnsureIndex()
-			label := a.Label
-			if label == "" {
-				label = a.Provider
-			}
-			files = append(files, gin.H{"name": label + " (" + a.Index + ")", "provider": label, "auth_index": a.Index, "disabled": a.Disabled})
-		}
+		files = configuredQuotaCredentials(h.authManager.List())
 	}
 	c.JSON(http.StatusOK, gin.H{"files": files})
+}
+
+func configuredQuotaCredentials(auths []*coreauth.Auth) []gin.H {
+	files := []gin.H{}
+	byCredential := map[string]int{}
+	for _, a := range auths {
+		if a == nil || a.Attributes["api_key"] == "" || !strings.HasPrefix(a.Attributes["source"], "config:") {
+			continue
+		}
+		a.EnsureIndex()
+		label := a.Label
+		if label == "" {
+			label = a.Provider
+		}
+		provider := nativeQuotaProvider(a)
+		scope := provider
+		if scope == "" {
+			scope = a.Attributes["base_url"]
+		}
+		// Multiple protocol routes can share one account credential and allowance.
+		key := scope + "\x00" + a.Attributes["api_key"]
+		if i, exists := byCredential[key]; exists {
+			connections := files[i]["connections"].([]string)
+			if !slices.Contains(connections, label) {
+				files[i]["connections"] = append(connections, label)
+			}
+			if !a.Disabled {
+				files[i]["disabled"] = false
+				files[i]["auth_index"] = a.Index
+			}
+			continue
+		}
+		display := map[string]string{"commandcode": "CommandCode", "kimi": "Kimi Coding", "opencode-go": "OpenCode Go", "minimax": "MiniMax"}[provider]
+		if display == "" {
+			display = label
+		}
+		byCredential[key] = len(files)
+		files = append(files, gin.H{"name": display + " (" + a.Index + ")", "provider": display, "auth_index": a.Index, "disabled": a.Disabled, "connections": []string{label}})
+	}
+	return files
 }
 
 func nativeQuotaProvider(a *coreauth.Auth) string {
