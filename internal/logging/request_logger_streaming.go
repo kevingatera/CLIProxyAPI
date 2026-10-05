@@ -16,6 +16,7 @@ import (
 // It spools streaming response chunks to a temporary file to avoid retaining large responses in memory.
 // The final log file is assembled when Close is called.
 type FileStreamingLogWriter struct {
+	lossless bool
 	// logsDir is the target directory for log files.
 	logsDir string
 
@@ -95,6 +96,10 @@ func (w *FileStreamingLogWriter) WriteChunkAsync(chunk []byte) {
 	// Make a copy of the chunk to avoid data races
 	chunkCopy := make([]byte, len(chunk))
 	copy(chunkCopy, chunk)
+	if w.lossless {
+		w.chunkChan <- chunkCopy
+		return
+	}
 
 	// Non-blocking send
 	select {

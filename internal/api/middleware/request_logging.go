@@ -39,7 +39,8 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 			return
 		}
 
-		if shouldSkipMethodForRequestLogging(c.Request) {
+		archive, isArchive := logger.(interface{ LosslessStreaming() bool })
+		if shouldSkipMethodForRequestLogging(c.Request) && !(isArchive && archive.LosslessStreaming()) {
 			c.Next()
 			return
 		}
@@ -106,8 +107,8 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 				}
 			}
 			if errFinalize := wrapper.Finalize(c); errFinalize != nil {
-				// Log error but don't interrupt the response
-				// In a real implementation, you might want to use a proper logger here
+				// Log the error without interrupting the response
+				log.WithField("error", logging.SafeErrorDiagnostic(errFinalize)).Warn("request logging failed")
 			}
 			if recovered != nil {
 				panic(recovered)
