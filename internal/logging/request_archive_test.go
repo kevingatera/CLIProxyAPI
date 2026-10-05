@@ -3,6 +3,7 @@ package logging
 import (
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 )
 
 func newTestArchive(t *testing.T) *RequestArchive {
@@ -159,6 +161,26 @@ func TestArchiveRetentionOnlyRemovesOldCompletedLogs(t *testing.T) {
 	for _, name := range []string{"new.log", "active.tmp", "usage_stats.json"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
 			t.Fatalf("removed %s", name)
+		}
+	}
+}
+
+func TestRequestArchiveForcedErrorsMaskErrorTextAndDirectBodies(t *testing.T) {
+	a := newTestArchive(t)
+	a.SetEnabled(false)
+	apiErrors := []*interfaces.ErrorMessage{{StatusCode: 400, Error: errors.New("password=error-secret"), Body: []byte(`{"api_key":"direct-body-secret"}`)}}
+	if err := a.LogRequestWithOptions("/v1/messages", "POST", nil, []byte("error prompt marker"), 400, nil, []byte("error response marker"), nil, nil, nil, nil, apiErrors, true, "error", time.Now(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	log := readArchive(t, a)
+	for _, secret := range []string{"error-secret", "direct-body-secret"} {
+		if strings.Contains(log, secret) {
+			t.Errorf("error secret leaked %q", secret)
+		}
+	}
+	for _, marker := range []string{"error prompt marker", "error response marker", "400", "[REDACTED]"} {
+		if !strings.Contains(log, marker) {
+			t.Errorf("missing %s", marker)
 		}
 	}
 }
