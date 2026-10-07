@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -219,4 +220,21 @@ func (h *Handler) GetRoutingTraces(c *gin.Context) {
 		"traces": traces,
 		"count":  len(traces),
 	})
+}
+
+// GetUnifiedModels explains the active canonical offering without exposing credentials.
+func (h *Handler) GetUnifiedModels(c *gin.Context) {
+	if h == nil || h.cfg == nil || h.authManager == nil {
+		c.JSON(503, gin.H{"error": "routing unavailable"})
+		return
+	}
+	h.mu.Lock()
+	settings := h.cfg.Routing.UnifiedModels
+	h.mu.Unlock()
+	models := []gin.H{}
+	for _, model := range settings.Models {
+		id := settings.PublicID(model.ID)
+		models = append(models, gin.H{"id": id, "routes": h.authManager.UnifiedRoutes(id, time.Now())})
+	}
+	c.JSON(200, gin.H{"enabled": settings.Enabled, "bare_names": settings.BareNames, "expose_legacy": settings.ExposeLegacy, "models": models})
 }

@@ -280,6 +280,10 @@ func (m *Manager) buildRoutingExecutionPlan(providers []string, model string, op
 		return plan
 	}
 
+	if unified, ok := m.unifiedExecutionPlan(model, plan); ok {
+		return unified
+	}
+
 	policy := cfg.Routing.Policy
 	if !policy.Enabled {
 		return plan
@@ -597,6 +601,9 @@ func isTransportExecutionError(err error) bool {
 }
 
 func (m *Manager) shouldFallbackAfterExecutionError(err error, plan routingExecutionPlan) (bool, string) {
+	if plan.Strategy == "unified-adaptive" && unifiedBudgetError(err) {
+		return true, routingFallbackExhausted
+	}
 	if err == nil {
 		return false, ""
 	}

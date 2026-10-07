@@ -332,6 +332,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
 
+	if err := cfg.Routing.UnifiedModels.Validate(); err != nil {
+		return nil, err
+	}
 	// Normalize global OAuth model settings.
 	cfg.SanitizeOAuthSettings()
 	// Normalize routing policy fields.
