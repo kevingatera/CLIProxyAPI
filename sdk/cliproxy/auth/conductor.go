@@ -143,10 +143,12 @@ type resultPolicyHolder struct {
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
+	unifiedWake               chan struct{}
 	unifiedMu                 sync.Mutex
 	unifiedQuota              map[string]unifiedQuotaSnapshot
 	unifiedBurn               map[string]*unifiedTokenWindow
 	unifiedQuotaFetcher       func(context.Context, *Auth) (pluginapi.QuotaFetchResponse, error)
+	unifiedAllowanceRefresher func(context.Context) bool
 	store                     Store
 	cooldownStore             CooldownStateStore
 	pendingCooldownStateStore CooldownStateStore

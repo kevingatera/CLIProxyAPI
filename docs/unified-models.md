@@ -65,3 +65,21 @@ These management endpoints require authentication. They never return API keys.
 
 This feature does not change the routing policy of legacy model IDs. In
 particular, existing Claude OAuth-first ordering remains in effect.
+# Private allowance snapshots
+
+`routing.allowances` can configure `collector-key`, `service-url` and
+`service-key`. Use distinct random tokens of at least 32 characters. The
+collector key grants only `GET /capacity/v1/collect`; it grants no management or
+inference access. Its reports contain opaque credential indexes, provider
+provenance, account or model scope and observation expiry. Shared protocol
+credentials are grouped into one allowance account.
+
+The independent model-capacity service reads that collector and exposes an
+authenticated `/v1/allowances` snapshot. CLIProxy reads it in the background,
+preserving the original observation time. If the service is unreachable or
+expired, native quota refresh remains available. No network calls occur during
+request selection. Missing provider adapters remain unknown.
+
+Keep these private keys in runtime configuration only. They are excluded from
+the general JSON configuration response. The public provider-plan-catalog is a
+separate static program with no account connector or private runtime secrets.
