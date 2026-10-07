@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/kevingatera/model-capacity/capacity"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
@@ -63,6 +64,8 @@ type Handler struct {
 	pluginReleases          pluginReleaseCache
 	siwcOAuthFactory        func(*config.Config) siwcOAuthService
 	siwcCommitMu            sync.Mutex
+	allowanceMu             sync.Mutex
+	allowanceSnapshot       *capacity.Snapshot
 }
 
 type configReloadSnapshot struct {
@@ -86,6 +89,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	}
 	if manager != nil {
 		manager.SetUnifiedQuotaFetcher(h.fetchNativeQuota)
+		manager.SetUnifiedAllowanceRefresher(h.refreshAllowanceService)
 	}
 	h.startAttemptCleanup()
 	return h

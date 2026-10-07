@@ -118,7 +118,11 @@ func (h *Handler) FetchNativeQuota(c *gin.Context) {
 		return
 	}
 	if h.authManager != nil {
-		h.authManager.ObserveUnifiedQuota(a.ID, report, time.Now())
+		for _, peer := range h.authManager.List() {
+			if sameNativeAccount(a, peer) {
+				h.authManager.ObserveUnifiedQuota(peer.ID, report, time.Now())
+			}
+		}
 	}
 	c.JSON(http.StatusOK, report)
 }
