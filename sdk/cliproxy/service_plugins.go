@@ -160,7 +160,7 @@ func (s *Service) syncPluginModelRuntime(ctx context.Context) {
 }
 
 func (s *Service) refreshPluginModelRegistrations(ctx context.Context) {
-	if s == nil || s.pluginHost == nil || s.coreManager == nil {
+	if s == nil || s.coreManager == nil {
 		return
 	}
 	// Native capability probes publish and refresh their scheduler entries

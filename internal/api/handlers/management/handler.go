@@ -85,6 +85,9 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		envSecret:           envSecret,
 		usageStats:          usage.GetRequestStatistics(),
 	}
+	if manager != nil {
+		manager.SetUnifiedQuotaFetcher(h.fetchNativeQuota)
+	}
 	h.startAttemptCleanup()
 	return h
 }

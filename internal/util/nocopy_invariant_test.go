@@ -104,6 +104,7 @@ type reviewedInPlaceByteWrite struct {
 }
 
 var reviewedInPlaceByteWrites = map[string]reviewedInPlaceByteWrite{
+	"sdk/cliproxy/auth/unified_models.go":                   {1, "resets a mutex-protected int64 token counter; no byte buffer or GJSON view is involved"},
 	"internal/translator/common/apply_patch_responses.go":   {1, "shifts [][]byte item references in a private output slice; no byte of any JSON payload is rewritten"},
 	"internal/runtime/executor/claude_signing.go":           {2, "writes CCH digits into bytes.Clone(body); the caller's body is never touched"},
 	"internal/runtime/executor/claude_executor_cloaking.go": {1, "shifts []string headers to prepend a block; no byte of any payload is rewritten"},

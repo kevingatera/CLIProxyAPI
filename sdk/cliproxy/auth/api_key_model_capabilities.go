@@ -335,6 +335,9 @@ func lookupAPIKeyModelCapability(routing *apiKeyModelRoutingSnapshot, auth *Auth
 	if len(byRoute) == 0 {
 		return nil, false
 	}
+	if route := unifiedRouteForAuth(routing.config, auth, routeModel); route != nil {
+		routeModel = route.Source
+	}
 	requestedModel := rewriteModelForAuth(strings.TrimSpace(routeModel), auth)
 	_, candidates := modelAliasLookupCandidates(requestedModel)
 	routes := make([]apiKeyModelCapabilityRoute, 0)

@@ -209,6 +209,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Normalize routing policy fields.
 	cfg.SanitizeRoutingPolicy()
+	if err := cfg.Routing.UnifiedModels.Validate(); err != nil {
+		return nil, err
+	}
 	// Normalize global OAuth model settings.
 	cfg.SanitizeOAuthSettings()
 

@@ -1670,10 +1670,12 @@ func (g *QuotaGroup) UnmarshalJSON(data []byte) error {
 
 // QuotaBucket describes a single quota window or limit bucket.
 type QuotaBucket struct {
-	Window            string  `json:"window,omitempty"`
-	RemainingFraction float64 `json:"remainingFraction"`
-	ResetTime         string  `json:"resetTime,omitempty"`
-	Description       string  `json:"description,omitempty"`
+	Scope             string   `json:"scope,omitempty"`
+	Models            []string `json:"models,omitempty"`
+	Window            string   `json:"window,omitempty"`
+	RemainingFraction float64  `json:"remainingFraction"`
+	ResetTime         string   `json:"resetTime,omitempty"`
+	Description       string   `json:"description,omitempty"`
 }
 
 // UnmarshalJSON supports both camelCase and snake_case field names.

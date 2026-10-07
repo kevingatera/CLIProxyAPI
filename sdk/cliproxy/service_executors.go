@@ -465,6 +465,32 @@ func (s *Service) registerResolvedModelsForAuth(a *coreauth.Auth, providerKey st
 			return
 		}
 	}
+	if s.cfg != nil && s.cfg.Routing.UnifiedModels.Enabled {
+		originals := append([]*ModelInfo(nil), normalizedModels...)
+		for _, unified := range s.cfg.Routing.UnifiedModels.Models {
+			for _, route := range unified.Routes {
+				if !route.Matches(a.Provider, a.Attributes["compat_name"]) {
+					continue
+				}
+				for _, source := range originals {
+					if source.ID != route.Source {
+						continue
+					}
+					clone := *source
+					clone.ID = s.cfg.Routing.UnifiedModels.PublicID(unified.ID)
+					clone.OwnedBy = "cliproxy"
+					clone.DisplayName = unified.ID
+					if unified.ContextLength > 0 {
+						clone.ContextLength = unified.ContextLength
+						clone.MaxContextLength = unified.ContextLength
+						clone.InputTokenLimit = unified.ContextLength
+					}
+					normalizedModels = append(normalizedModels, &clone)
+					break
+				}
+			}
+		}
+	}
 	GlobalModelRegistry().RegisterClient(a.ID, providerKey, normalizedModels)
 }
 

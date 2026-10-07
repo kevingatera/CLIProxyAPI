@@ -31,6 +31,8 @@ func (s *Server) registerManagementV8Routes() {
 	v8.POST("/requests/api-call", s.mgmt.APICall)
 	v8.POST("/routing/cooldown/reset", s.mgmt.ResetQuota)
 	v8.GET("/routing/traces", s.mgmt.GetRoutingTraces)
+	v8.GET("/routing/unified-models", s.mgmt.GetUnifiedModels)
+	v8.PATCH("/routing/unified-models", s.mgmt.PatchUnifiedModels)
 	v8.GET("/routing/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 
 	v8.GET("/observability/logs", s.mgmt.GetLogs)

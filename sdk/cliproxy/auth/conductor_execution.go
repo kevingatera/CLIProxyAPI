@@ -212,6 +212,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 }
 
 func (m *Manager) executeRoutingExplicitCandidates(ctx context.Context, plan routingExecutionPlan, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, trace *routingTraceRuntime, stage string) (cliproxyexecutor.Response, bool, error) {
+	if plan.Strategy == "unified-adaptive" {
+		return m.executeUnifiedCandidates(ctx, plan, req, opts, trace, stage)
+	}
 	if !plan.PolicyEnabled || len(plan.ExplicitCandidates) == 0 {
 		return cliproxyexecutor.Response{}, false, nil
 	}
@@ -1139,6 +1142,12 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 					tried[candidate.AuthID] = struct{}{}
 				}
 			}
+			if auth == nil && plan.Strategy == "unified-adaptive" {
+				if lastErr != nil {
+					return nil, preferredExecutionAttemptError(lastErr, upstreamErr)
+				}
+				return nil, &Error{Code: "auth_not_found", Message: "no eligible unified route available"}
+			}
 			if auth == nil {
 				auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 			}
@@ -1389,7 +1398,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				}
 				continue
 			}
-			if isRequestInvalidError(errStream) || (plan.PolicyEnabled && !homeMode && !fallback) {
+			if (isRequestInvalidError(errStream) && !(plan.Strategy == "unified-adaptive" && unifiedBudgetError(errStream))) || (plan.PolicyEnabled && !homeMode && !fallback) {
 				return nil, errStream
 			}
 			lastErr = errStream

@@ -356,6 +356,7 @@ type QuotaExceeded struct {
 
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
+	UnifiedModels UnifiedModels `yaml:"unified-models,omitempty" json:"unified-models,omitempty"`
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first", "quota-aware".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
