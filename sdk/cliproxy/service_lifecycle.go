@@ -230,6 +230,9 @@ func (s *Service) Run(ctx context.Context) error {
 		s.configRuntimeMu.Unlock()
 	}
 
+	if s.coreManager != nil {
+		s.coreManager.StartUnifiedRouting(ctx)
+	}
 	s.registerModelRefreshCallback()
 	if !homeEnabled {
 		go s.runAntigravityModelRefresh(ctx)

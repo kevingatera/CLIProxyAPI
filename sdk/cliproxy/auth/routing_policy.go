@@ -72,18 +72,29 @@ type routingPlan struct {
 	trace      RoutingTrace
 }
 
-// routingPlanFor returns nil when the policy does not apply: policy disabled, no providers,
-// Home mode, or a caller-pinned credential.
+// routingPlanFor returns nil when no plan applies: no providers, Home mode, a caller-pinned
+// credential, or neither a unified model nor an enabled routing policy.
+// Traces are kept only while the routing policy is enabled.
 func (m *Manager) routingPlanFor(operation string, providers []string, model string, opts cliproxyexecutor.Options) *routingPlan {
 	if m == nil || len(providers) == 0 || m.HomeEnabled() || pinnedAuthIDFromMetadata(opts.Metadata) != "" {
 		return nil
 	}
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
-	if cfg == nil || !cfg.Routing.Policy.Enabled {
+	if cfg == nil {
 		return nil
 	}
-	plan := buildRoutingPlan(cfg.Routing.Policy, providers, model)
-	plan.manager = m
+	var plan *routingPlan
+	switch {
+	case cfg.Routing.UnifiedModels.Find(thinking.ParseSuffix(model).ModelName) != nil:
+		plan = m.unifiedRoutingPlan(cfg, providers, model)
+	case cfg.Routing.Policy.Enabled:
+		plan = buildRoutingPlan(cfg.Routing.Policy, providers, model)
+	default:
+		return nil
+	}
+	if cfg.Routing.Policy.Enabled {
+		plan.manager = m
+	}
 	plan.trace = RoutingTrace{
 		ID:         uuid.NewString(),
 		Timestamp:  time.Now().UTC(),
@@ -97,24 +108,8 @@ func (m *Manager) routingPlanFor(operation string, providers []string, model str
 
 func buildRoutingPlan(policy internalconfig.RoutingPolicy, providers []string, model string) *routingPlan {
 	plan := &routingPlan{
-		fallbackOn: make(map[string]struct{}),
-		traceLimit: policy.Observability.TraceLimit,
-	}
-	for _, trigger := range policy.Fallback.On {
-		if normalized, ok := internalconfig.NormalizeRoutingFallbackTrigger(trigger); ok {
-			plan.fallbackOn[normalized] = struct{}{}
-		}
-	}
-	if len(plan.fallbackOn) == 0 {
-		for _, trigger := range internalconfig.DefaultRoutingFallbackTriggers() {
-			plan.fallbackOn[trigger] = struct{}{}
-		}
-	}
-	if plan.traceLimit <= 0 {
-		plan.traceLimit = defaultRoutingTraceLimit
-	}
-	if plan.traceLimit > internalconfig.MaxRoutingTraceLimit {
-		plan.traceLimit = internalconfig.MaxRoutingTraceLimit
+		fallbackOn: routingFallbackTriggers(policy.Fallback),
+		traceLimit: routingTraceLimit(policy.Observability),
 	}
 
 	rule := policy.Defaults
@@ -181,6 +176,29 @@ func buildRoutingPlan(policy internalconfig.RoutingPolicy, providers []string, m
 		plan.filter = &routingAuthFilter{allowOnly: allowOnly}
 	}
 	return plan
+}
+
+func routingFallbackTriggers(fallback internalconfig.RoutingFallbackPolicy) map[string]struct{} {
+	set := make(map[string]struct{})
+	for _, trigger := range fallback.On {
+		if normalized, ok := internalconfig.NormalizeRoutingFallbackTrigger(trigger); ok {
+			set[normalized] = struct{}{}
+		}
+	}
+	if len(set) == 0 {
+		for _, trigger := range internalconfig.DefaultRoutingFallbackTriggers() {
+			set[trigger] = struct{}{}
+		}
+	}
+	return set
+}
+
+func routingTraceLimit(observability internalconfig.RoutingPolicyObservability) int {
+	limit := observability.TraceLimit
+	if limit <= 0 {
+		return defaultRoutingTraceLimit
+	}
+	return min(limit, internalconfig.MaxRoutingTraceLimit)
 }
 
 // retryProviders returns the providers the upstream retry loop and the credits fallback may use.
