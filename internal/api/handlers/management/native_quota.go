@@ -123,8 +123,8 @@ func (h *Handler) FetchCredentialQuotaV8(c *gin.Context) {
 	report, handled, err := h.fetchPluginQuota(ctx, a, body.PluginID, body.Provider)
 	if !handled {
 		report, handled, err = h.fetchNativeQuota(ctx, a)
-		if handled && err == nil && h.authManager != nil {
-			h.authManager.ObserveUnifiedQuota(a.ID, report, time.Now())
+		if handled && err == nil {
+			h.observeNativeQuota(a, report)
 		}
 	}
 	switch {
@@ -136,6 +136,18 @@ func (h *Handler) FetchCredentialQuotaV8(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 	default:
 		c.JSON(http.StatusOK, report)
+	}
+}
+
+// observeNativeQuota feeds a native report to every credential that shares the same account.
+func (h *Handler) observeNativeQuota(a *coreauth.Auth, report pluginapi.QuotaFetchResponse) {
+	if h.authManager == nil {
+		return
+	}
+	for _, peer := range h.authManager.List() {
+		if sameNativeAccount(a, peer) {
+			h.authManager.ObserveUnifiedQuota(peer.ID, report, time.Now())
+		}
 	}
 }
 
