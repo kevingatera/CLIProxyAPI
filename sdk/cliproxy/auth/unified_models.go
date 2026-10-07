@@ -37,7 +37,7 @@ func unifiedRouteForAuth(cfg *config.Config, a *Auth, model string) *config.Unif
 	}
 	for i := range unified.Routes {
 		route := &unified.Routes[i]
-		if route.Matches(a.Provider, a.Attributes["compat_name"]) && registry.GetGlobalRegistry().ClientSupportsModel(a.ID, route.Source) {
+		if route.Matches(a.Provider, a.Attributes["compat_name"]) && (route.AuthKind == "" || route.AuthKind == a.AuthKind()) && registry.GetGlobalRegistry().ClientSupportsModel(a.ID, route.Source) {
 			return route
 		}
 	}
@@ -74,8 +74,23 @@ func (m *Manager) SetUnifiedQuotaFetcher(fetch func(context.Context, *Auth) (plu
 	m.unifiedQuotaFetcher = fetch
 }
 
+// SetUnifiedAllowanceRefresher installs an optional background snapshot reader.
+func (m *Manager) SetUnifiedAllowanceRefresher(refresh func(context.Context) bool) {
+	m.unifiedMu.Lock()
+	defer m.unifiedMu.Unlock()
+	m.unifiedAllowanceRefresher = refresh
+}
+
 // StartUnifiedRouting refreshes outside inference requests. No network work occurs in selection.
 func (m *Manager) StartUnifiedRouting(ctx context.Context) {
+	m.unifiedMu.Lock()
+	if m.unifiedWake != nil {
+		m.unifiedMu.Unlock()
+		return
+	}
+	m.unifiedWake = make(chan struct{}, 1)
+	wake := m.unifiedWake
+	m.unifiedMu.Unlock()
 	coreusage.RegisterNamedPlugin("unified-routing", m)
 	go func() {
 		m.refreshUnifiedQuotas(ctx)
@@ -86,6 +101,8 @@ func (m *Manager) StartUnifiedRouting(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				m.refreshUnifiedQuotas(ctx)
+			case <-wake:
 				m.refreshUnifiedQuotas(ctx)
 			}
 		}
@@ -98,7 +115,11 @@ func (m *Manager) refreshUnifiedQuotas(ctx context.Context) {
 	}
 	m.unifiedMu.Lock()
 	fetch := m.unifiedQuotaFetcher
+	refresh := m.unifiedAllowanceRefresher
 	m.unifiedMu.Unlock()
+	if refresh != nil && refresh(ctx) {
+		return
+	}
 	if fetch == nil {
 		return
 	}
@@ -110,7 +131,7 @@ func (m *Manager) refreshUnifiedQuotas(ctx context.Context) {
 		participates := false
 		for _, model := range cfg.Routing.UnifiedModels.Models {
 			for _, route := range model.Routes {
-				if route.Matches(a.Provider, a.Attributes["compat_name"]) {
+				if route.Matches(a.Provider, a.Attributes["compat_name"]) && (route.AuthKind == "" || route.AuthKind == a.AuthKind()) {
 					participates = true
 				}
 			}
@@ -372,4 +393,16 @@ func unifiedUpstreamModel(route *config.UnifiedModelRoute, requested string) str
 		return route.Model + "(" + parsed.RawSuffix + ")"
 	}
 	return route.Model
+}
+
+func (m *Manager) wakeUnifiedRouting() {
+	m.unifiedMu.Lock()
+	wake := m.unifiedWake
+	m.unifiedMu.Unlock()
+	if wake != nil {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
 }

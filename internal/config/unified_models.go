@@ -18,6 +18,7 @@ type UnifiedModel struct {
 	Routes        []UnifiedModelRoute `yaml:"routes" json:"routes"`
 }
 type UnifiedModelRoute struct {
+	AuthKind string `yaml:"auth-kind,omitempty" json:"auth-kind,omitempty"`
 	Provider string `yaml:"provider" json:"provider"`
 	// Source is the already registered model ID, including its provider prefix.
 	Source string `yaml:"source" json:"source"`
@@ -66,6 +67,9 @@ func (u UnifiedModels) Validate() error {
 				return fmt.Errorf("unified model %s requires one verified source and upstream model per provider", model.ID)
 			}
 			providers[strings.ToLower(route.Provider)] = true
+			if route.AuthKind != "" && route.AuthKind != "oauth" && route.AuthKind != "apikey" {
+				return fmt.Errorf("unified model %s auth-kind must be oauth or apikey", model.ID)
+			}
 			if route.Plan != "included" && route.Plan != "metered" {
 				return fmt.Errorf("unified model %s plan must be included or metered", model.ID)
 			}
