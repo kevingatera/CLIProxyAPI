@@ -84,6 +84,9 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
 	}
+	if manager != nil {
+		manager.SetUnifiedQuotaFetcher(h.unifiedQuotaFetch)
+	}
 	h.startAttemptCleanup()
 	return h
 }

@@ -73,6 +73,9 @@ func nativeQuotaProvider(a *coreauth.Auth) string {
 	if a == nil {
 		return ""
 	}
+	if a.Provider == "kimi" && a.AuthKind() == coreauth.AuthKindOAuth {
+		return "kimi"
+	}
 	u, err := url.Parse(a.Attributes["base_url"])
 	if err != nil {
 		return ""
@@ -120,6 +123,9 @@ func (h *Handler) FetchCredentialQuotaV8(c *gin.Context) {
 	report, handled, err := h.fetchPluginQuota(ctx, a, body.PluginID, body.Provider)
 	if !handled {
 		report, handled, err = h.fetchNativeQuota(ctx, a)
+		if handled && err == nil && h.authManager != nil {
+			h.authManager.ObserveUnifiedQuota(a.ID, report, time.Now())
+		}
 	}
 	switch {
 	case !handled:
@@ -133,6 +139,16 @@ func (h *Handler) FetchCredentialQuotaV8(c *gin.Context) {
 	}
 }
 
+// unifiedQuotaFetch adapts the built-in adapters to the routing refresh. An unsupported account is an
+// error here, so it never becomes an empty report.
+func (h *Handler) unifiedQuotaFetch(ctx context.Context, a *coreauth.Auth) (pluginapi.QuotaFetchResponse, error) {
+	report, handled, err := h.fetchNativeQuota(ctx, a)
+	if err == nil && !handled {
+		return report, errors.New(nativeQuotaUnsupported)
+	}
+	return report, err
+}
+
 // fetchNativeQuota reports handled=false when no built-in adapter matches the credential.
 func (h *Handler) fetchNativeQuota(ctx context.Context, a *coreauth.Auth) (pluginapi.QuotaFetchResponse, bool, error) {
 	provider := nativeQuotaProvider(a)
@@ -140,6 +156,9 @@ func (h *Handler) fetchNativeQuota(ctx context.Context, a *coreauth.Auth) (plugi
 		return pluginapi.QuotaFetchResponse{}, false, nil
 	}
 	key := a.Attributes["api_key"]
+	if key == "" && provider == "kimi" && a.AuthKind() == coreauth.AuthKindOAuth {
+		key, _ = a.Metadata["access_token"].(string)
+	}
 	if key == "" {
 		return pluginapi.QuotaFetchResponse{}, true, errNativeQuotaKeyMissing
 	}
@@ -203,6 +222,10 @@ func readNativeQuota(ctx context.Context, client *http.Client, endpoint, key, pr
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "opencode/1.3.0")
+	if provider == "kimi" {
+		req.Header.Set("User-Agent", "kimi-code-cli/1.0")
+		req.Header.Set("X-Msh-Platform", "kimi_code_cli")
+	}
 	if provider == "commandcode" {
 		req.Header.Set("User-Agent", "cli")
 		req.Header.Set("x-command-code-version", "1.74.1")
@@ -293,7 +316,7 @@ func parseMiniMaxQuota(b []byte, status int) (pluginapi.QuotaFetchResponse, erro
 		if !ok || !okRemaining || total <= 0 || remaining < 0 {
 			continue
 		}
-		group.Buckets = append(group.Buckets, pluginapi.QuotaBucket{Window: r.Get("model_name").String(), RemainingFraction: quotaRemaining(remaining / total), ResetTime: r.Get("end_time").String()})
+		group.Buckets = append(group.Buckets, pluginapi.QuotaBucket{Scope: "model", Models: []string{r.Get("model_name").String()}, Window: r.Get("model_name").String(), RemainingFraction: quotaRemaining(remaining / total), ResetTime: r.Get("end_time").String()})
 	}
 	if len(group.Buckets) == 0 {
 		return report, fmt.Errorf("MiniMax returned no valid token plan allowance")
