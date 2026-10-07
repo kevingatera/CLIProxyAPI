@@ -164,6 +164,9 @@ func preserveRequestedModelSuffix(requestedModel, resolved string) string {
 }
 
 func (m *Manager) executionModelCandidates(auth *Auth, routeModel string) []string {
+	if route := unifiedRouteForAuth(m.loadAPIKeyModelRouting().config, auth, routeModel); route != nil {
+		return []string{unifiedUpstreamModel(route, routeModel)}
+	}
 	if auth != nil && auth.Attributes != nil {
 		if homeModel := strings.TrimSpace(auth.Attributes[homeUpstreamModelAttributeKey]); homeModel != "" {
 			return []string{homeModel}
@@ -204,6 +207,9 @@ func (m *Manager) ResolveExecutionModel(auth *Auth, routeModel string) string {
 }
 
 func (m *Manager) selectionModelForAuth(auth *Auth, routeModel string) string {
+	if route := unifiedRouteForAuth(m.loadAPIKeyModelRouting().config, auth, routeModel); route != nil {
+		return unifiedUpstreamModel(route, routeModel)
+	}
 	requestedModel := rewriteModelForAuth(routeModel, auth)
 	if strings.TrimSpace(requestedModel) == "" {
 		requestedModel = strings.TrimSpace(routeModel)
@@ -406,6 +412,9 @@ func (m *Manager) executionModelCandidatesWithAlias(auth *Auth, routeModel strin
 		aliasResult.OriginalAlias = strings.TrimSpace(routeModel)
 	}
 	upstreamModel := executionAliasPoolModel(auth, requestedModel, aliasResult)
+	if unifiedRouteForAuth(routing.config, auth, routeModel) != nil {
+		return []string{aliasResult.UpstreamModel}, false, aliasResult, routing
+	}
 
 	var candidates []string
 	if auth != nil && auth.Attributes != nil {
@@ -445,6 +454,11 @@ func (m *Manager) resolveExecutionAliasResultForRequested(auth *Auth, requestedM
 func (m *Manager) resolveExecutionAliasResultForRequestedWithRouting(routing *apiKeyModelRoutingSnapshot, auth *Auth, requestedModel string) OAuthModelAliasResult {
 	if result := homeForceMappingAliasResult(auth, requestedModel); result.ForceMapping {
 		return result
+	}
+	if auth != nil {
+		if route := unifiedRouteForAuth(routing.config, auth, requestedModel); route != nil {
+			return OAuthModelAliasResult{UpstreamModel: unifiedUpstreamModel(route, requestedModel), ForceMapping: true, OriginalAlias: requestedModel}
+		}
 	}
 	if isConfiguredModelRoutingAuth(auth) {
 		return resolveAPIKeyModelAliasWithResult(routing.config, auth, requestedModel)

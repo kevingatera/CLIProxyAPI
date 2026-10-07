@@ -72,6 +72,9 @@ func nativeQuotaProvider(a *coreauth.Auth) string {
 	if a == nil {
 		return ""
 	}
+	if a.Provider == "kimi" && a.AuthKind() == coreauth.AuthKindOAuth {
+		return "kimi"
+	}
 	u, err := url.Parse(a.Attributes["base_url"])
 	if err != nil {
 		return ""
@@ -105,19 +108,39 @@ func (h *Handler) FetchNativeQuota(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "credential not found"})
 		return
 	}
-	provider := nativeQuotaProvider(a)
-	if provider == "" {
+	if nativeQuotaProvider(a) == "" {
 		c.JSON(501, gin.H{"error": "This provider does not expose a supported account quota API. Proxy request telemetry is not an account allowance."})
 		return
 	}
-	key := a.Attributes["api_key"]
-	if key == "" {
-		c.JSON(400, gin.H{"error": "configured API key not found"})
+	report, err := h.fetchNativeQuota(c.Request.Context(), a)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
 	}
-	client := &http.Client{Transport: h.apiCallTransport(a, ""), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	if h.authManager != nil {
+		h.authManager.ObserveUnifiedQuota(a.ID, report, time.Now())
+	}
+	c.JSON(http.StatusOK, report)
+}
+
+func (h *Handler) fetchNativeQuota(ctx context.Context, a *coreauth.Auth) (pluginapi.QuotaFetchResponse, error) {
+	provider := nativeQuotaProvider(a)
+	if provider == "" {
+		return pluginapi.QuotaFetchResponse{}, fmt.Errorf("This provider does not expose a supported account quota API. Proxy request telemetry is not an account allowance.")
+	}
+	key := a.Attributes["api_key"]
+	if key == "" && provider == "kimi" && a.AuthKind() == coreauth.AuthKindOAuth {
+		key, _ = a.Metadata["access_token"].(string)
+	}
+	if key == "" {
+		return pluginapi.QuotaFetchResponse{}, fmt.Errorf("configured API key not found")
+	}
+	h.mu.Lock()
+	transport := h.apiCallTransport(a, "")
+	h.mu.Unlock()
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	read := func(endpoint string) ([]byte, int, error) {
-		return readNativeQuota(c.Request.Context(), client, endpoint, key, provider)
+		return readNativeQuota(ctx, client, endpoint, key, provider)
 	}
 	var report pluginapi.QuotaFetchResponse
 	var err error
@@ -163,11 +186,7 @@ func (h *Handler) FetchNativeQuota(c *gin.Context) {
 			report, err = parseCommandCodeQuota(b, status)
 		}
 	}
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, report)
+	return report, err
 }
 
 func readNativeQuota(ctx context.Context, client *http.Client, endpoint, key, provider string) ([]byte, int, error) {
@@ -178,6 +197,10 @@ func readNativeQuota(ctx context.Context, client *http.Client, endpoint, key, pr
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "opencode/1.3.0")
+	if provider == "kimi" {
+		req.Header.Set("User-Agent", "kimi-code-cli/1.0")
+		req.Header.Set("X-Msh-Platform", "kimi_code_cli")
+	}
 	if provider == "commandcode" {
 		req.Header.Set("User-Agent", "cli")
 		req.Header.Set("x-command-code-version", "1.74.1")
@@ -268,7 +291,7 @@ func parseMiniMaxQuota(b []byte, status int) (pluginapi.QuotaFetchResponse, erro
 		if !ok || !okRemaining || total <= 0 || remaining < 0 {
 			continue
 		}
-		group.Buckets = append(group.Buckets, pluginapi.QuotaBucket{Window: r.Get("model_name").String(), RemainingFraction: quotaRemaining(remaining / total), ResetTime: r.Get("end_time").String()})
+		group.Buckets = append(group.Buckets, pluginapi.QuotaBucket{Scope: "model", Models: []string{r.Get("model_name").String()}, Window: r.Get("model_name").String(), RemainingFraction: quotaRemaining(remaining / total), ResetTime: r.Get("end_time").String()})
 	}
 	if len(group.Buckets) == 0 {
 		return report, fmt.Errorf("MiniMax returned no valid token plan allowance")

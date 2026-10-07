@@ -18,6 +18,87 @@
           "max"
         ]
       }
+    },
+    {
+      "id": "kimi-k3",
+      "object": "model",
+      "created": 1784073600,
+      "owned_by": "moonshot",
+      "type": "kimi",
+      "display_name": "Kimi K3",
+      "description": "Kimi Coding OAuth model; capabilities verified against the native model catalog.",
+      "context_length": 262144,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": false,
+        "levels": [
+          "low",
+          "high",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "kimi-k2.8",
+      "object": "model",
+      "created": 1789115500,
+      "owned_by": "moonshot",
+      "type": "kimi",
+      "display_name": "Kimi K2.8 Preview",
+      "description": "Kimi Coding OAuth model; capabilities verified against the native model catalog.",
+      "context_length": 1048576,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": false,
+        "levels": [
+          "low",
+          "high",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "kimi-k2.8-code",
+      "object": "model",
+      "created": 1789115500,
+      "owned_by": "moonshot",
+      "type": "kimi",
+      "display_name": "Kimi K2.8 Code Preview",
+      "description": "Kimi Coding OAuth model; capabilities verified against the native model catalog.",
+      "context_length": 1048576,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": false,
+        "levels": [
+          "low",
+          "high",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     }
   ]
 }
