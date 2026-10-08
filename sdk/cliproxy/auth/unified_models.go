@@ -354,9 +354,6 @@ func (m *Manager) UnifiedRoutes(model string, now time.Time) []UnifiedRouteStatu
 		if a.Eligible != b.Eligible {
 			return a.Eligible
 		}
-		if a.QuotaKnown != b.QuotaKnown {
-			return a.QuotaKnown
-		}
 		// Preserve included plans unless a binding window has less than five percent headroom.
 		comfortableA := a.Remaining == nil || *a.Remaining >= .05
 		comfortableB := b.Remaining == nil || *b.Remaining >= .05
@@ -364,6 +361,9 @@ func (m *Manager) UnifiedRoutes(model string, now time.Time) []UnifiedRouteStatu
 		includedB := b.Plan == "included" && comfortableB
 		if includedA != includedB {
 			return includedA
+		}
+		if a.QuotaKnown != b.QuotaKnown {
+			return a.QuotaKnown
 		}
 		// Quantization avoids changing providers for insignificant quota fluctuations.
 		scoreA, scoreB := int(a.CapacityScore*20), int(b.CapacityScore*20)
