@@ -94,6 +94,9 @@ func (e *MetaExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	if errAuth != nil {
 		return resp, errAuth
 	}
+	if errSubscription := e.checkSubscription(enriched, req, opts); errSubscription != nil {
+		return resp, errSubscription
+	}
 
 	prepared, errPrepare := e.prepareResponsesRequest(ctx, req, opts, true)
 	if errPrepare != nil {
@@ -223,8 +226,12 @@ func (e *MetaExecutor) translateMetaCompleted(ctx context.Context, req cliproxye
 }
 
 func (e *MetaExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	if _, errAuth := e.ensureAuth(ctx, auth); errAuth != nil {
+	enriched, errAuth := e.ensureAuth(ctx, auth)
+	if errAuth != nil {
 		return cliproxyexecutor.Response{}, errAuth
+	}
+	if errSubscription := e.checkSubscription(enriched, req, opts); errSubscription != nil {
+		return cliproxyexecutor.Response{}, errSubscription
 	}
 	prepared, errPrepare := e.prepareResponsesRequest(ctx, req, opts, false)
 	if errPrepare != nil {

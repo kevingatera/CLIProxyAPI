@@ -25,6 +25,9 @@ func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	if errAuth != nil {
 		return nil, errAuth
 	}
+	if errSubscription := e.checkSubscription(enriched, req, opts); errSubscription != nil {
+		return nil, errSubscription
+	}
 
 	prepared, errPrepare := e.prepareResponsesRequest(ctx, req, opts, true)
 	if errPrepare != nil {

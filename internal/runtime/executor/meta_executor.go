@@ -10,8 +10,10 @@ import (
 	metaauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/meta"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"golang.org/x/sync/singleflight"
@@ -386,3 +388,20 @@ func isMetaSubscriptionQuota(statusCode int, body []byte) bool {
 
 // SupportsApplyPatch reports the actual executor contract, independent of its provider name.
 func (e *MetaExecutor) SupportsApplyPatch() bool { return e != nil }
+
+func (e *MetaExecutor) checkSubscription(auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) error {
+	if e.cfg == nil {
+		return nil
+	}
+	model := thinking.ParseSuffix(helps.PayloadRequestedModel(opts, req.Model)).ModelName
+	unified := e.cfg.Routing.UnifiedModels.Find(model)
+	if unified == nil {
+		return nil
+	}
+	for _, route := range unified.Routes {
+		if route.Matches("meta", "") && route.SubscriptionOnly && !cliproxyauth.MatchesUnifiedRoute(route, auth) {
+			return statusErr{code: http.StatusPaymentRequired, msg: "meta executor: active Muse Code subscription required"}
+		}
+	}
+	return nil
+}
