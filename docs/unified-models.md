@@ -41,8 +41,10 @@ creates a private timestamped backup, and preserves the rest of the document.
 1. Require an enabled credential, an executor, the registered source model and no
    active model/credential cooldown.
 2. Exclude fresh provider-reported exhausted windows and exhausted credit balances.
-3. Prefer fresh known capacity over unknown capacity. Unknown is not unlimited.
-4. Prefer an included plan when its binding window has at least 5% remaining.
+3. Prefer an included plan unless a known binding window has less than 5% remaining.
+   Missing quota does not force a subscription request onto a metered relay.
+4. Within that plan preference, prefer fresh known capacity over unknown capacity.
+   Unknown is not unlimited.
 5. Compare binding-window headroom adjusted for observed allowance depletion and
    time until reset. Scores are grouped into 5% bands to reduce trivial switches.
 6. Use stable credential ordering for ties. Retry a different eligible route for
