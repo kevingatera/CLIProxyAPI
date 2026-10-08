@@ -38,11 +38,23 @@ func unifiedRouteForAuth(cfg *config.Config, a *Auth, model string) *config.Unif
 	}
 	for i := range unified.Routes {
 		route := &unified.Routes[i]
-		if route.Matches(a.Provider, a.Attributes["compat_name"]) && (route.AuthKind == "" || route.AuthKind == a.AuthKind()) && registry.GetGlobalRegistry().ClientSupportsModel(a.ID, route.Source) {
+		if MatchesUnifiedRoute(*route, a) && registry.GetGlobalRegistry().ClientSupportsModel(a.ID, route.Source) {
 			return route
 		}
 	}
 	return nil
+}
+
+// MatchesUnifiedRoute checks declared credential and subscription requirements.
+func MatchesUnifiedRoute(route config.UnifiedModelRoute, a *Auth) bool {
+	if a == nil || !route.Matches(a.Provider, a.Attributes["compat_name"]) || (route.AuthKind != "" && route.AuthKind != a.AuthKind()) {
+		return false
+	}
+	if route.SubscriptionOnly {
+		active, _ := a.Metadata["is_subs_active"].(bool)
+		return a.AuthKind() == AuthKindOAuth && active
+	}
+	return true
 }
 
 // PresentModels changes discovery only; legacy routes remain registered and usable.
@@ -132,7 +144,7 @@ func (m *Manager) refreshUnifiedQuotas(ctx context.Context) {
 		participates := false
 		for _, model := range cfg.Routing.UnifiedModels.Models {
 			for _, route := range model.Routes {
-				if route.Matches(a.Provider, a.Attributes["compat_name"]) && (route.AuthKind == "" || route.AuthKind == a.AuthKind()) {
+				if MatchesUnifiedRoute(route, a) {
 					participates = true
 				}
 			}
