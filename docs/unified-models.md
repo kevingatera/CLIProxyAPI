@@ -67,6 +67,13 @@ This feature does not change the routing policy of legacy model IDs. In
 particular, existing Claude OAuth-first ordering remains in effect.
 # Private allowance snapshots
 
+Routes can set `subscription-only: true` with `auth-kind: oauth`. Such a route
+requires the provider's `is_subs_active` boolean to be true. Missing or inactive
+subscription status excludes the credential even while its model registration
+is cached. This prevents a subscription route from silently using ordinary
+API billing. Meta Muse publishes this status when its OAuth device credential
+is exchanged for the Muse Code inference key.
+
 `routing.allowances` can configure `collector-key`, `service-url` and
 `service-key`. Use distinct random tokens of at least 32 characters. The
 collector key grants only `GET /capacity/v1/collect`; it grants no management or
