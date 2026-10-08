@@ -469,7 +469,7 @@ func (s *Service) registerResolvedModelsForAuth(a *coreauth.Auth, providerKey st
 		originals := append([]*ModelInfo(nil), normalizedModels...)
 		for _, unified := range s.cfg.Routing.UnifiedModels.Models {
 			for _, route := range unified.Routes {
-				if !route.Matches(a.Provider, a.Attributes["compat_name"]) || (route.AuthKind != "" && route.AuthKind != a.AuthKind()) {
+				if !coreauth.MatchesUnifiedRoute(route, a) {
 					continue
 				}
 				for _, source := range originals {
