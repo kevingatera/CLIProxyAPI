@@ -181,3 +181,28 @@ func TestUnifiedCreditExhaustionAndBudgetFailure(t *testing.T) {
 		t.Fatal("invalid input must not fall back")
 	}
 }
+
+func TestUnifiedUnknownIncludedPlanPrecedesKnownMeteredPlan(t *testing.T) {
+	m, included, metered, _ := setupUnified(t)
+	now := time.Now()
+	m.ObserveUnifiedQuota("unified-paid-auth", reportUnified(1, now.Add(time.Hour)), now)
+	routes := m.UnifiedRoutes("cliproxy/unified-test", now)
+	if routes[0].Provider != "unified-go" || routes[0].QuotaKnown {
+		t.Fatalf("unexpected ranking: %+v", routes)
+	}
+	for _, streaming := range []bool{false, true} {
+		req := executor.Request{Model: "cliproxy/unified-test"}
+		var err error
+		if streaming {
+			_, err = m.ExecuteStream(context.Background(), []string{"unified-paid", "unified-go"}, req, executor.Options{})
+		} else {
+			_, err = m.Execute(context.Background(), []string{"unified-paid", "unified-go"}, req, executor.Options{})
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(included.models) != 2 || len(metered.models) != 0 {
+		t.Fatalf("included attempts %d, metered attempts %d", len(included.models), len(metered.models))
+	}
+}
