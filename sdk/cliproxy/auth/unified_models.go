@@ -245,6 +245,7 @@ func (m *Manager) HandleUsage(_ context.Context, record coreusage.Record) {
 }
 
 type UnifiedRouteStatus struct {
+	Priority         int        `json:"priority,omitempty"`
 	Provider         string     `json:"provider"`
 	AuthID           string     `json:"auth_id"`
 	Model            string     `json:"upstream_model"`
@@ -271,7 +272,7 @@ func (m *Manager) UnifiedRoutes(model string, now time.Time) []UnifiedRouteStatu
 		if route == nil {
 			continue
 		}
-		status := UnifiedRouteStatus{Provider: a.Provider, AuthID: a.ID, Model: route.Model, Plan: route.Plan, Eligible: !a.Disabled, Reason: "quota unknown"}
+		status := UnifiedRouteStatus{Priority: route.Priority, Provider: a.Provider, AuthID: a.ID, Model: route.Model, Plan: route.Plan, Eligible: !a.Disabled, Reason: "quota unknown"}
 		if _, ok := m.Executor(a.Provider); !ok {
 			status.Eligible = false
 			status.Reason = "executor unavailable"
@@ -361,6 +362,9 @@ func (m *Manager) UnifiedRoutes(model string, now time.Time) []UnifiedRouteStatu
 		includedB := b.Plan == "included" && comfortableB
 		if includedA != includedB {
 			return includedA
+		}
+		if a.Priority != b.Priority {
+			return a.Priority > b.Priority
 		}
 		if a.QuotaKnown != b.QuotaKnown {
 			return a.QuotaKnown
