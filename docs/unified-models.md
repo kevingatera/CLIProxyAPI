@@ -43,7 +43,10 @@ creates a private timestamped backup, and preserves the rest of the document.
 2. Exclude fresh provider-reported exhausted windows and exhausted credit balances.
 3. Prefer an included plan unless a known binding window has less than 5% remaining.
    Missing quota does not force a subscription request onto a metered relay.
-4. Within that plan preference, prefer fresh known capacity over unknown capacity.
+4. Within that plan preference, a higher route `priority` takes precedence.
+   Use it to prefer a native subscription over another included relay; disabled,
+   exhausted and cooling-down credentials remain excluded. With equal priorities,
+   prefer fresh known capacity over unknown capacity.
    Unknown is not unlimited.
 5. Compare binding-window headroom adjusted for observed allowance depletion and
    time until reset. Scores are grouped into 5% bands to reduce trivial switches.

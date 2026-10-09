@@ -206,3 +206,21 @@ func TestUnifiedUnknownIncludedPlanPrecedesKnownMeteredPlan(t *testing.T) {
 		t.Fatalf("included attempts %d, metered attempts %d", len(included.models), len(metered.models))
 	}
 }
+
+func TestUnifiedPriorityWithinIncludedPlans(t *testing.T) {
+	m, _, _, cfg := setupUnified(t)
+	cfg.Routing.UnifiedModels.Models[0].Routes[0].Priority = 10
+	cfg.Routing.UnifiedModels.Models[0].Routes[1].Plan = "included"
+	m.SetConfig(cfg)
+	now := time.Now()
+	m.ObserveUnifiedQuota("unified-paid-auth", reportUnified(1, now.Add(time.Hour)), now)
+	routes := m.UnifiedRoutes("cliproxy/unified-test", now)
+	if routes[0].Provider != "unified-go" {
+		t.Fatalf("priority ignored: %+v", routes)
+	}
+	m.ObserveUnifiedQuota("unified-go-auth", reportUnified(0, now.Add(time.Hour)), now)
+	routes = m.UnifiedRoutes("cliproxy/unified-test", now)
+	if routes[0].Provider != "unified-paid" || routes[1].Eligible {
+		t.Fatalf("exhaustion ignored: %+v", routes)
+	}
+}
