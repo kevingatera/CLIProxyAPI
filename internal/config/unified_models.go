@@ -18,6 +18,7 @@ type UnifiedModel struct {
 	Routes        []UnifiedModelRoute `yaml:"routes" json:"routes"`
 }
 type UnifiedModelRoute struct {
+	Priority         int    `yaml:"priority,omitempty" json:"priority,omitempty"`
 	SubscriptionOnly bool   `yaml:"subscription-only,omitempty" json:"subscription-only,omitempty"`
 	AuthKind         string `yaml:"auth-kind,omitempty" json:"auth-kind,omitempty"`
 	Provider         string `yaml:"provider" json:"provider"`
