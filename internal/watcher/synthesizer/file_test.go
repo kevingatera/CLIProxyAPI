@@ -1108,3 +1108,22 @@ func TestSynthesizeAuthFile_CodexPlanType(t *testing.T) {
 		})
 	}
 }
+
+func TestPluginFilePreservesAPIKeyClassificationAndExclusions(t *testing.T) {
+	tempDir := t.TempDir()
+	fullPath := filepath.Join(tempDir, "individual.json")
+	raw := []byte(`{"type":"zcode","auth_kind":"apikey","api_key":"test-key","excluded_models":["per-account"]}`)
+	ctx := &SynthesisContext{Config: &config.Config{OAuthExcludedModels: map[string][]string{"zcode": {"oauth-only"}}}, AuthDir: tempDir, Now: time.Now(), PluginAuthParser: multiAuthParserFunc(func(context.Context, pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error) {
+		return []*coreauth.Auth{{ID: "individual.json", Provider: "zcode", Metadata: map[string]any{"auth_kind": "apikey", "api_key": "test-key"}, Attributes: map[string]string{"auth_kind": "apikey", "api_key": "test-key"}}}, true, nil
+	})}
+	auths, err := SynthesizeAuthFile(ctx, fullPath, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(auths) != 1 || auths[0].AuthKind() != coreauth.AuthKindAPIKey {
+		t.Fatal("plugin API key classification changed")
+	}
+	if auths[0].Attributes["excluded_models"] != "per-account" {
+		t.Fatal("OAuth exclusions applied to plugin API key")
+	}
+}
