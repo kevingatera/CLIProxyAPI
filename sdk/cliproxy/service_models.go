@@ -210,6 +210,7 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 				excluded = entry.ExcludedModels
 			}
 		}
+		models = applyExcludedModels(models, excluded)
 	case "cursor":
 		models = cursorModelsFromAuthMetadata(a.Metadata)
 		models = applyExcludedModels(models, excluded)
