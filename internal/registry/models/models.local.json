@@ -17,7 +17,14 @@
           "high",
           "max"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "kimi-k3",
