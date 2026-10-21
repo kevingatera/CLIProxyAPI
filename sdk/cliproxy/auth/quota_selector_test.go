@@ -171,8 +171,8 @@ func TestCodexScore(t *testing.T) {
 
 	t.Run("more remaining scores higher", func(t *testing.T) {
 		t.Parallel()
-		moreRemaining := mkWindow(10, future)  // 90% remaining
-		lessRemaining := mkWindow(80, future)  // 20% remaining
+		moreRemaining := mkWindow(10, future) // 90% remaining
+		lessRemaining := mkWindow(80, future) // 20% remaining
 		sHi, exh, _ := codexScore(&moreRemaining, now)
 		sLo, exhLo, _ := codexScore(&lessRemaining, now)
 		if exh || exhLo {
