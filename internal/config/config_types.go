@@ -419,6 +419,9 @@ type RoutingConfig struct {
 	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 
+	// Policy configures explicit provider/auth ordering and fallback rules.
+	Policy RoutingPolicy `yaml:"policy,omitempty" json:"policy,omitempty"`
+
 	// SessionAffinity enables universal session-sticky routing for all clients.
 	// Explicit Claude Code, Codex, OpenCode, and pi session headers are preferred,
 	// followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,
@@ -446,6 +449,34 @@ type RoutingConfig struct {
 	//     auth errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
 	// Ignored when SessionAffinity is false.
 	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+}
+
+// RoutingPolicy configures explicit model routing order and fallback behavior.
+type RoutingPolicy struct {
+	Enabled        bool                         `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Defaults       RoutingPolicyRule            `yaml:"defaults,omitempty" json:"defaults,omitempty"`
+	ModelOverrides map[string]RoutingPolicyRule `yaml:"model-overrides,omitempty" json:"model-overrides,omitempty"`
+	Fallback       RoutingFallbackPolicy        `yaml:"fallback,omitempty" json:"fallback,omitempty"`
+	Observability  RoutingPolicyObservability   `yaml:"observability,omitempty" json:"observability,omitempty"`
+}
+
+type RoutingPolicyRule struct {
+	Route                     []RoutingPolicyRoute `yaml:"route,omitempty" json:"route,omitempty"`
+	IncludeRemainingProviders bool                 `yaml:"include-remaining-providers,omitempty" json:"include-remaining-providers,omitempty"`
+}
+
+type RoutingPolicyRoute struct {
+	Provider             string   `yaml:"provider,omitempty" json:"provider,omitempty"`
+	AuthOrder            []string `yaml:"auth-order,omitempty" json:"auth-order,omitempty"`
+	IncludeRemainingAuth bool     `yaml:"include-remaining-auth,omitempty" json:"include-remaining-auth,omitempty"`
+}
+
+type RoutingFallbackPolicy struct {
+	On []string `yaml:"on,omitempty" json:"on,omitempty"`
+}
+
+type RoutingPolicyObservability struct {
+	TraceLimit int `yaml:"trace-limit,omitempty" json:"trace-limit,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
