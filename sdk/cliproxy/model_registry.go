@@ -2,6 +2,7 @@ package cliproxy
 
 import (
 	"maps"
+	"slices"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
@@ -53,7 +54,13 @@ func SetGlobalModelRegistryHook(hook ModelRegistryHook) {
 // registry lock. Obsolete inherited exclusions must not advance the registry epoch
 // and invalidate newer work, even if the credential attributes are unchanged.
 type modelRegistrationFence struct {
-	globalExclusions          map[string]diff.ExcludedModelsSummary
+	globalExclusions map[string]diff.ExcludedModelsSummary
+	// globalExcludedModels is the cross-provider list captured with the fence.
+	// Filtering uses this copy, never the live config, and publication rejects
+	// the result when the live list no longer matches the summary. The list
+	// applies to every auth kind, including API keys.
+	globalExcludedModels      []string
+	globalExcludedSummary     diff.ExcludedModelsSummary
 	exclusionProvider         string
 	fallbackExclusionProvider string
 	registryEpoch             uint64
@@ -67,6 +74,11 @@ type modelRegistrationFence struct {
 
 func newModelRegistrationFence(a *coreauth.Auth, cfg *config.Config) modelRegistrationFence {
 	var exclusions map[string]diff.ExcludedModelsSummary
+	var globalExcluded []string
+	if cfg != nil {
+		globalExcluded = slices.Clone(cfg.GlobalExcludedModels)
+	}
+	globalSummary := diff.SummarizeExcludedModels(globalExcluded)
 	if cfg != nil && len(cfg.OAuthExcludedModels) > 0 {
 		exclusions = make(map[string]diff.ExcludedModelsSummary, len(cfg.OAuthExcludedModels))
 		for provider, rules := range cfg.OAuthExcludedModels {
@@ -74,22 +86,24 @@ func newModelRegistrationFence(a *coreauth.Auth, cfg *config.Config) modelRegist
 		}
 	}
 	if a == nil {
-		return modelRegistrationFence{globalExclusions: exclusions}
+		return modelRegistrationFence{globalExclusions: exclusions, globalExcludedModels: globalExcluded, globalExcludedSummary: globalSummary}
 	}
 	provider := strings.ToLower(strings.TrimSpace(a.Provider))
 	if _, _, compat := openAICompatInfoFromAuth(a); compat {
 		provider = "openai-compatibility"
 	}
 	return modelRegistrationFence{
-		globalExclusions:  exclusions,
-		exclusionProvider: provider,
-		registryEpoch:     GlobalModelRegistry().ClientRegistrationEpoch(a.ID),
-		registrationEpoch: a.RegistrationEpoch,
-		prefix:            a.Prefix,
-		provider:          a.Provider,
-		disabled:          a.Disabled || a.Status == coreauth.StatusDisabled,
-		authKind:          a.AuthKind(),
-		attributes:        maps.Clone(a.Attributes),
+		globalExclusions:      exclusions,
+		globalExcludedModels:  globalExcluded,
+		globalExcludedSummary: globalSummary,
+		exclusionProvider:     provider,
+		registryEpoch:         GlobalModelRegistry().ClientRegistrationEpoch(a.ID),
+		registrationEpoch:     a.RegistrationEpoch,
+		prefix:                a.Prefix,
+		provider:              a.Provider,
+		disabled:              a.Disabled || a.Status == coreauth.StatusDisabled,
+		authKind:              a.AuthKind(),
+		attributes:            maps.Clone(a.Attributes),
 	}
 }
 
@@ -102,6 +116,8 @@ func (f modelRegistrationFence) withAuth(a *coreauth.Auth) modelRegistrationFenc
 	}
 	next := newModelRegistrationFence(a, nil)
 	next.globalExclusions = f.globalExclusions
+	next.globalExcludedModels = f.globalExcludedModels
+	next.globalExcludedSummary = f.globalExcludedSummary
 	next.fallbackExclusionProvider = f.fallbackExclusionProvider
 	next.registryEpoch = f.registryEpoch
 	return next
@@ -121,9 +137,22 @@ func (f modelRegistrationFence) publishUnregister(s *Service, authID string) boo
 
 func (f modelRegistrationFence) publishIfCurrent(s *Service, authID string, publish func() bool) bool {
 	publishWithConfig := func() bool {
-		if s != nil && !f.disabled && f.authKind != coreauth.AuthKindAPIKey && strings.TrimSpace(f.attributes["excluded_models"]) == "" {
-			s.cfgMu.RLock()
-			defer s.cfgMu.RUnlock()
+		if s == nil || f.disabled {
+			return publish()
+		}
+		// Hold cfgMu through registry publication, not just the comparison.
+		s.cfgMu.RLock()
+		defer s.cfgMu.RUnlock()
+		// global-excluded-models applies to every auth kind and is not overridden
+		// by credential-level exclusions, so it is checked unconditionally.
+		var currentGlobal []string
+		if s.cfg != nil {
+			currentGlobal = s.cfg.GlobalExcludedModels
+		}
+		if f.globalExcludedSummary != diff.SummarizeExcludedModels(currentGlobal) {
+			return false
+		}
+		if f.authKind != coreauth.AuthKindAPIKey && strings.TrimSpace(f.attributes["excluded_models"]) == "" {
 			// Match the watcher's normalization so no-op and unrelated reloads do not
 			// discard work. A real change always schedules a replacement: the watcher
 			// redispatches affected auths, and applyConfigRuntime re-registers every
@@ -137,7 +166,6 @@ func (f modelRegistrationFence) publishIfCurrent(s *Service, authID string, publ
 					return false
 				}
 			}
-			// Hold cfgMu through registry publication, not just the comparison.
 		}
 		return publish()
 	}
