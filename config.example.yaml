@@ -1175,12 +1175,17 @@ observability:
     # Record proxy request/response logs. Management requests are excluded.
     request-log: false
 
-    # Provider-independent credential-masked archive. Enabling requires restart.
-    # The cap uses decimal GB; oldest completed entries are removed first.
+    # Provider-independent credential-masked archive. Off by default; enabling requires restart.
+    # The size cap uses decimal GB; oldest completed entries are removed first.
+    # See docs/request-archive.md for capture limits and retention.
     request-archive:
       enabled: false
       max-size-gb: 30
-      # directory: /CLIProxyAPI/logs/requests
+      # max-age-days: 0              # 0 keeps files until the size cap removes them
+      # max-capture-mb: 32           # in-memory transcript cap per request
+      # max-concurrent-captures: 16  # streaming requests buffering at once
+      # metadata-only: false         # omit all bodies, keep metadata
+      # directory: /var/lib/cliproxy/archive
 
   usage:
     # When false, disable in-memory usage statistics aggregation
