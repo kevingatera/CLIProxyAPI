@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -96,99 +97,111 @@ func nativeQuotaProvider(a *coreauth.Auth) string {
 	return ""
 }
 
-// FetchNativeQuota reads provider account limits independently of inference routing state.
-func (h *Handler) FetchNativeQuota(c *gin.Context) {
+var errNativeQuotaKeyMissing = errors.New("configured API key not found")
+
+const nativeQuotaUnsupported = "This provider does not expose a supported account quota API. Proxy request telemetry is not an account allowance."
+
+// FetchCredentialQuotaV8 uses the plugin quota dispatch first, then built-in account adapters.
+// It also serves the older /credentials/quota/native path for one release.
+func (h *Handler) FetchCredentialQuotaV8(c *gin.Context) {
 	var body credentialQuotaRequest
 	if c.ShouldBindJSON(&body) != nil {
-		c.JSON(400, gin.H{"error": "invalid request body"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
-	a := h.authByIndex(body.resolveAuthIndex())
+	authIndex := body.resolveAuthIndex()
+	if authIndex == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "auth_index is required"})
+		return
+	}
+	a := h.authByIndex(authIndex)
 	if a == nil {
-		c.JSON(404, gin.H{"error": "credential not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "credential not found"})
 		return
 	}
-	if nativeQuotaProvider(a) == "" {
-		c.JSON(501, gin.H{"error": "This provider does not expose a supported account quota API. Proxy request telemetry is not an account allowance."})
-		return
+	ctx := c.Request.Context()
+	report, handled, err := h.fetchPluginQuota(ctx, a, body.PluginID, body.Provider)
+	if !handled {
+		report, handled, err = h.fetchNativeQuota(ctx, a)
 	}
-	report, err := h.fetchNativeQuota(c.Request.Context(), a)
-	if err != nil {
+	switch {
+	case !handled:
+		c.JSON(http.StatusNotImplemented, gin.H{"error": nativeQuotaUnsupported})
+	case errors.Is(err, errNativeQuotaKeyMissing):
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	case err != nil:
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
-		return
-	}
-	if h.authManager != nil {
-		for _, peer := range h.authManager.List() {
-			if sameNativeAccount(a, peer) {
-				h.authManager.ObserveUnifiedQuota(peer.ID, report, time.Now())
+	default:
+		if h.authManager != nil {
+			for _, peer := range h.authManager.List() {
+				if sameNativeAccount(a, peer) { h.authManager.ObserveUnifiedQuota(peer.ID, report, time.Now()) }
 			}
 		}
+		c.JSON(http.StatusOK, report)
 	}
-	c.JSON(http.StatusOK, report)
 }
 
-func (h *Handler) fetchNativeQuota(ctx context.Context, a *coreauth.Auth) (pluginapi.QuotaFetchResponse, error) {
+// fetchNativeQuota reports handled=false when no built-in adapter matches the credential.
+func (h *Handler) fetchNativeQuota(ctx context.Context, a *coreauth.Auth) (pluginapi.QuotaFetchResponse, bool, error) {
 	provider := nativeQuotaProvider(a)
 	if provider == "" {
-		return pluginapi.QuotaFetchResponse{}, fmt.Errorf("This provider does not expose a supported account quota API. Proxy request telemetry is not an account allowance.")
+		return pluginapi.QuotaFetchResponse{}, false, nil
 	}
 	key := a.Attributes["api_key"]
 	if key == "" && provider == "kimi" && a.AuthKind() == coreauth.AuthKindOAuth {
 		key, _ = a.Metadata["access_token"].(string)
 	}
 	if key == "" {
-		return pluginapi.QuotaFetchResponse{}, fmt.Errorf("configured API key not found")
+		return pluginapi.QuotaFetchResponse{}, true, errNativeQuotaKeyMissing
 	}
+	// Config reload replaces h.cfg; proxy selection must read one snapshot under the lock.
 	h.mu.Lock()
 	transport := h.apiCallTransport(a, "")
 	h.mu.Unlock()
 	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	report, err := fetchNativeQuotaReport(ctx, client, provider, key)
+	return report, true, err
+}
+
+// fetchNativeQuotaReport calls the provider account API and normalizes its report.
+func fetchNativeQuotaReport(ctx context.Context, client *http.Client, provider, key string) (pluginapi.QuotaFetchResponse, error) {
 	read := func(endpoint string) ([]byte, int, error) {
 		return readNativeQuota(ctx, client, endpoint, key, provider)
 	}
 	var report pluginapi.QuotaFetchResponse
+	var b []byte
+	var status int
 	var err error
 	switch provider {
 	case "opencode-go":
-		var b []byte
-		var status int
-		b, status, err = read("https://opencode.ai/zen/go/v1/usage")
-		if err == nil {
+		if b, status, err = read("https://opencode.ai/zen/go/v1/usage"); err == nil {
 			report, err = parseOpenCodeQuota(b, status)
 		}
 	case "kimi":
-		var b []byte
-		var status int
-		b, status, err = read("https://api.kimi.com/coding/v1/usages")
-		if err == nil {
+		if b, status, err = read("https://api.kimi.com/coding/v1/usages"); err == nil {
 			report, err = parseKimiNativeQuota(b, status)
 		}
 	case "minimax":
-		var b []byte
-		var status int
-		b, status, err = read("https://www.minimax.io/v1/token_plan/remains")
-		if err == nil {
+		if b, status, err = read("https://www.minimax.io/v1/token_plan/remains"); err == nil {
 			report, err = parseMiniMaxQuota(b, status)
 		}
 	case "commandcode":
-		var b []byte
-		var status int
 		b, status, err = read("https://api.commandcode.ai/alpha/whoami?limits=1")
-		if err == nil && status != 200 {
+		if err == nil && status != http.StatusOK {
 			err = fmt.Errorf("provider authentication returned HTTP %d", status)
 		}
+		if err != nil {
+			break
+		}
 		query := ""
-		if err == nil {
-			if id := gjson.GetBytes(b, "org.id").String(); id != "" {
-				query = "?orgId=" + url.QueryEscape(id)
-			}
+		if id := gjson.GetBytes(b, "org.id").String(); id != "" {
+			query = "?orgId=" + url.QueryEscape(id)
 		}
-		if err == nil {
-			b, status, err = read("https://api.commandcode.ai/alpha/billing/credits" + query)
-		}
-		if err == nil {
+		if b, status, err = read("https://api.commandcode.ai/alpha/billing/credits" + query); err == nil {
 			report, err = parseCommandCodeQuota(b, status)
 		}
+	default:
+		err = errors.New(nativeQuotaUnsupported)
 	}
 	return report, err
 }

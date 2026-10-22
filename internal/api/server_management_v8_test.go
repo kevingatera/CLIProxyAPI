@@ -95,6 +95,7 @@ func TestManagementV8IndependentContract(t *testing.T) {
 		"POST /v8/management/models/refresh",
 		"GET /v8/management/routing/traces",
 		"GET /v8/management/plugins/:id/quota", "POST /v8/management/plugins/:id/quota", "DELETE /v8/management/plugins/:id/quota",
+		"GET /v8/management/credentials/configured-quota", "POST /v8/management/credentials/quota", "POST /v8/management/credentials/quota/native",
 		"POST /v8/management/plugins/store/:id/install", "DELETE /v8/management/plugins/:id",
 	} {
 		if !routes[route] {
