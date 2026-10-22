@@ -3,56 +3,85 @@ package auth
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 )
 
 const (
-	// codexUsageEndpoint is the ChatGPT backend usage endpoint the Management UI
-	// and quota selector both read to derive per-account quota telemetry.
 	codexUsageEndpoint = "https://chatgpt.com/backend-api/wham/usage"
-
-	// codexCLIUserAgent mimics the codex CLI's own User-Agent so the usage
-	// endpoint returns the same shape it returns to the codex CLI. Update this
-	// when the codex CLI version it tracks changes.
+	// codexCLIUserAgent makes the usage endpoint answer with the shape it returns to the codex CLI.
 	codexCLIUserAgent = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+
+	quotaRefreshInterval   = 60 * time.Second
+	quotaMaxStaleness      = 5 * time.Minute
+	quotaRefreshTick       = 15 * time.Second
+	quotaRefreshBackoff    = 30 * time.Second
+	quotaRefreshBackoffMax = 10 * time.Minute
+	quotaMaxConcurrent     = 4
+	quotaTrackedTTL        = 30 * time.Minute
+	quotaMaxTracked        = 4096
+	quotaShortlistRatio    = 0.95
+	quotaUsageBodyLimit    = 512 * 1024
 )
 
-// QuotaAwareSelector balances usage across credentials using provider-specific quota telemetry.
+// QuotaAwareSelector ranks Codex credentials by remaining usage window and
+// round-robins among the best of them. Other providers use round-robin.
 //
-// Today this selector is implemented for Codex only, using the same usage endpoint the
-// Management UI reads (https://chatgpt.com/backend-api/wham/usage). For other providers it
-// falls back to round-robin.
-//
-// Selection intent:
-// - Avoid exhausting "short window" (e.g. 5-hour) limits too early.
-// - Avoid exhausting "long window" (e.g. weekly) limits too early.
-// - Prefer accounts that can "afford" to spend quota faster (more remaining, or sooner reset).
-// - Keep operator overrides: any auth priority buckets are still respected.
+// Pick never performs I/O. It reads cached usage snapshots and records the
+// Codex credentials it saw; a background loop probes the usage endpoint for
+// those credentials. Each candidate is in exactly one state:
+//   - exhausted: a fresh snapshot says the limit is reached. Never picked.
+//   - known: a fresh snapshot with a score. Only the best scores are shortlisted.
+//   - unknown: no snapshot, a snapshot older than quotaMaxStaleness, a snapshot
+//     whose reset time has passed, or one without usable windows. Always
+//     shortlisted next to the best known candidates, so it is neither starved
+//     nor preferred over them.
 type QuotaAwareSelector struct {
 	rr RoundRobinSelector
 
-	mu sync.Mutex
+	now   func() time.Time
+	fetch func(context.Context, codexUsageCredential, time.Time) (*codexUsageSnapshot, error)
+	// manualRefresh keeps Pick from starting the background loop (tests drive refreshDue).
+	manualRefresh bool
 
-	cacheTTL time.Duration
-	now      func() time.Time
+	mu       sync.Mutex
+	entries  map[string]*quotaEntry
+	inflight int
 
-	codexCache map[string]codexQuotaCacheEntry
-
-	fetchCodexUsage func(context.Context, *Auth) (*codexUsageSnapshot, error)
+	startOnce sync.Once
+	stopOnce  sync.Once
+	stopped   bool
+	cancel    context.CancelFunc
+	wake      chan struct{}
+	wg        sync.WaitGroup
 }
 
-type codexQuotaCacheEntry struct {
-	fetchedAt time.Time
-	snapshot  codexUsageSnapshot
+type quotaEntry struct {
+	cred        codexUsageCredential
+	lastSeen    time.Time
+	snapshot    *codexUsageSnapshot
+	fetchedAt   time.Time
+	failures    int
+	nextAttempt time.Time
+	fetching    bool
+}
+
+type codexUsageCredential struct {
+	token     string
+	accountID string
+	proxyURL  string
 }
 
 type codexUsageSnapshot struct {
@@ -64,451 +93,424 @@ type codexUsageSnapshot struct {
 
 type codexUsageWindow struct {
 	usedPercent    float64
-	resetAfter     time.Duration
-	resetAt        time.Time
 	hasUsedPercent bool
-	hasReset       bool
-	limitWindow    time.Duration
-	hasLimitWindow bool
-	observedEmpty  bool
+	resetAt        time.Time
 }
 
+type quotaState int
+
+const (
+	quotaUnknown quotaState = iota
+	quotaKnown
+	quotaExhausted
+)
+
+// NewQuotaAwareSelector returns a selector that probes Codex usage in the background.
 func NewQuotaAwareSelector() *QuotaAwareSelector {
 	return &QuotaAwareSelector{
-		cacheTTL:        60 * time.Second,
-		now:             time.Now,
-		codexCache:      make(map[string]codexQuotaCacheEntry),
-		fetchCodexUsage: fetchCodexUsageDefault,
+		now:     time.Now,
+		fetch:   fetchCodexUsage,
+		entries: make(map[string]*quotaEntry),
+		wake:    make(chan struct{}, 1),
 	}
 }
 
+func (s *QuotaAwareSelector) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+// Pick selects a Codex credential from cached usage only.
 func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	if provider != "codex" {
 		return s.rr.Pick(ctx, provider, model, opts, auths)
 	}
-
-	now := time.Now()
-	if s != nil && s.now != nil {
-		now = s.now()
-	}
-
-	available, err := getAvailableAuths(auths, provider, model, now)
+	now := s.clock()
+	available, err := getSelectorAvailableAuths(ctx, auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
-	if len(available) <= 1 {
-		if len(available) == 0 {
-			return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
-		}
-		return available[0], nil
+	if !s.manualRefresh {
+		s.startOnce.Do(s.start)
 	}
 
-	type scored struct {
-		auth *Auth
-		ok   bool
-		s    float64
-		next time.Time
+	type scoredAuth struct {
+		auth  *Auth
+		score float64
 	}
-	scores := make([]scored, 0, len(available))
-	cooldownCount := 0
+	var known []scoredAuth
+	var unknown []*Auth
 	var earliest time.Time
+	needRefresh := false
 
+	s.mu.Lock()
 	for _, a := range available {
-		snapshot, snapOK := s.getCodexUsage(ctx, a, now)
-		if !snapOK {
-			scores = append(scores, scored{auth: a, ok: false})
-			continue
+		entry := s.trackLocked(a, now)
+		var snapshot *codexUsageSnapshot
+		if entry != nil {
+			if entry.snapshot != nil && now.Sub(entry.fetchedAt) <= quotaMaxStaleness {
+				snapshot = entry.snapshot
+			}
+			due := entry.snapshot == nil || now.Sub(entry.fetchedAt) >= quotaRefreshInterval
+			if due && !entry.fetching && !now.Before(entry.nextAttempt) {
+				needRefresh = true
+			}
 		}
-
-		score, exhausted, next := codexScore(snapshot, now)
-		if exhausted {
-			cooldownCount++
+		state, score, next := classifyCodexSnapshot(snapshot, now)
+		switch state {
+		case quotaExhausted:
 			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
 				earliest = next
 			}
-			// Do not add exhausted auth to scoring set.
-			continue
+		case quotaKnown:
+			known = append(known, scoredAuth{auth: a, score: score})
+		default:
+			unknown = append(unknown, a)
 		}
-
-		scores = append(scores, scored{auth: a, ok: true, s: score})
+	}
+	s.mu.Unlock()
+	if needRefresh {
+		s.signal()
 	}
 
-	if len(scores) == 0 && cooldownCount == len(available) && !earliest.IsZero() {
-		resetIn := earliest.Sub(now)
-		if resetIn < 0 {
-			resetIn = 0
+	if len(known) == 0 && len(unknown) == 0 {
+		if earliest.IsZero() {
+			return nil, &Error{Code: "auth_unavailable", Message: "all codex credentials report an exhausted usage limit", HTTPStatus: http.StatusTooManyRequests}
 		}
-		return nil, newModelCooldownError(model, "", resetIn)
+		return nil, newModelCooldownError(model, provider, earliest.Sub(now))
 	}
 
-	eligible := make([]*Auth, 0, len(scores))
-	best := -1.0
-	for _, v := range scores {
-		// If we have no quota telemetry for an auth, keep it eligible but treat its score as 0.
-		score := 0.0
-		if v.ok {
-			score = v.s
-		}
-		if score < 0 {
-			continue
-		}
-		if score > best {
-			best = score
-		}
-		eligible = append(eligible, v.auth)
+	best := 0.0
+	for _, k := range known {
+		best = math.Max(best, k.score)
 	}
-	if len(eligible) == 0 {
-		return s.rr.Pick(ctx, provider, model, opts, available)
-	}
-
-	// Prefer candidates within 95% of the best score to avoid sticking to a single account.
-	threshold := best * 0.95
-	if best == 0 {
-		threshold = 0
-	}
-	shortlist := make([]*Auth, 0, len(scores))
-	for _, v := range scores {
-		if v.auth == nil {
-			continue
-		}
-		score := 0.0
-		if v.ok {
-			score = v.s
-		}
-		if score >= threshold {
-			shortlist = append(shortlist, v.auth)
+	threshold := best * quotaShortlistRatio
+	shortlist := make([]*Auth, 0, len(known)+len(unknown))
+	for _, k := range known {
+		if k.score >= threshold {
+			shortlist = append(shortlist, k.auth)
 		}
 	}
-	if len(shortlist) == 0 {
-		shortlist = eligible
-	}
+	shortlist = append(shortlist, unknown...)
 	if len(shortlist) == 1 {
 		return shortlist[0], nil
 	}
-	return s.rr.Pick(ctx, provider, model, opts, shortlist)
+	sort.Slice(shortlist, func(i, j int) bool { return shortlist[i].ID < shortlist[j].ID })
+	// The shortlist is already filtered against the injected clock; skip revalidation.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return s.rr.Pick(context.WithValue(ctx, prevalidatedAuthCandidatesKey{}, true), provider, model, opts, shortlist)
 }
 
-func (s *QuotaAwareSelector) getCodexUsage(ctx context.Context, auth *Auth, now time.Time) (*codexUsageSnapshot, bool) {
-	if s == nil || auth == nil {
-		return nil, false
+// trackLocked records the credential so the refresher can probe it. Caller holds s.mu.
+func (s *QuotaAwareSelector) trackLocked(a *Auth, now time.Time) *quotaEntry {
+	if a == nil || a.ID == "" {
+		return nil
 	}
-	auth.EnsureIndex()
-	key := auth.Index
-	if key == "" {
-		key = auth.ID
+	if s.entries == nil {
+		s.entries = make(map[string]*quotaEntry)
 	}
-	if key == "" {
-		return nil, false
-	}
-
-	ttl := s.cacheTTL
-	if ttl <= 0 {
-		ttl = 60 * time.Second
-	}
-
-	s.mu.Lock()
-	entry, ok := s.codexCache[key]
-	if ok && !entry.fetchedAt.IsZero() && now.Sub(entry.fetchedAt) <= ttl {
-		snap := entry.snapshot
-		s.mu.Unlock()
-		return &snap, true
-	}
-	fetcher := s.fetchCodexUsage
-	s.mu.Unlock()
-
-	if fetcher == nil {
-		return nil, false
-	}
-
-	fetchCtx := ctx
-	if fetchCtx == nil {
-		fetchCtx = context.Background()
-	}
-	timeout := 2 * time.Second
-	if deadline, okDeadline := fetchCtx.Deadline(); okDeadline {
-		remaining := time.Until(deadline)
-		if remaining > 0 && remaining < timeout {
-			timeout = remaining
+	entry, ok := s.entries[a.ID]
+	if !ok {
+		if len(s.entries) >= quotaMaxTracked {
+			s.pruneLocked(now)
+			if len(s.entries) >= quotaMaxTracked {
+				return nil
+			}
 		}
+		entry = &quotaEntry{}
+		s.entries[a.ID] = entry
 	}
-	if timeout <= 0 {
-		timeout = 500 * time.Millisecond
-	}
-	var cancel context.CancelFunc
-	fetchCtx, cancel = context.WithTimeout(fetchCtx, timeout)
-	defer cancel()
-
-	snapshot, err := fetcher(fetchCtx, auth)
-	if err != nil || snapshot == nil {
-		// return stale entry if we have one
-		if ok {
-			snap := entry.snapshot
-			return &snap, true
-		}
-		return nil, false
-	}
-
-	s.mu.Lock()
-	if s.codexCache == nil {
-		s.codexCache = make(map[string]codexQuotaCacheEntry)
-	}
-	s.codexCache[key] = codexQuotaCacheEntry{fetchedAt: now, snapshot: *snapshot}
-	s.mu.Unlock()
-	return snapshot, true
+	entry.cred = codexCredentialOf(a)
+	entry.lastSeen = now
+	return entry
 }
 
-func codexScore(snapshot *codexUsageSnapshot, now time.Time) (score float64, exhausted bool, next time.Time) {
-	if snapshot == nil {
-		return -1, false, time.Time{}
-	}
-	if !snapshot.allowed || snapshot.limitReached {
-		// Treat as exhausted when upstream says no more requests are allowed.
-		next = minReset(now, snapshot.primaryWindow, snapshot.secondaryWindow)
-		if !next.IsZero() && next.After(now) {
-			return 0, true, next
+func (s *QuotaAwareSelector) pruneLocked(now time.Time) {
+	for id, entry := range s.entries {
+		if !entry.fetching && now.Sub(entry.lastSeen) > quotaTrackedTTL {
+			delete(s.entries, id)
 		}
 	}
+}
 
-	score = math.Inf(1)
-	applyWindow := func(window codexUsageWindow) {
-		if !window.hasReset || window.resetAt.IsZero() {
+func (s *QuotaAwareSelector) signal() {
+	if s.wake == nil {
+		return
+	}
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *QuotaAwareSelector) start() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+	go s.run(ctx)
+}
+
+func (s *QuotaAwareSelector) run(ctx context.Context) {
+	ticker := time.NewTicker(quotaRefreshTick)
+	defer ticker.Stop()
+	for {
+		s.refreshDue(ctx)
+		select {
+		case <-ctx.Done():
 			return
-		}
-		if window.hasUsedPercent {
-			remaining := clamp01(1.0 - (window.usedPercent / 100.0))
-			if remaining <= 0 && window.resetAt.After(now) {
-				exhausted = true
-				if next.IsZero() || window.resetAt.Before(next) {
-					next = window.resetAt
-				}
-				return
-			}
-			hours := window.resetAt.Sub(now).Hours()
-			if hours < 0 {
-				hours = 0
-			}
-			// Avoid spikes when a reset is very close.
-			hours = math.Max(hours, 0.25)
-			rate := remaining / hours
-			// Soft-penalize when near exhaustion to keep a safety buffer.
-			if remaining < 0.05 {
-				rate *= remaining / 0.05
-			}
-			if rate < score {
-				score = rate
-			}
+		case <-ticker.C:
+		case <-s.wake:
 		}
 	}
-
-	applyWindow(snapshot.primaryWindow)
-	if exhausted {
-		return 0, true, next
-	}
-	applyWindow(snapshot.secondaryWindow)
-	if exhausted {
-		return 0, true, next
-	}
-
-	if math.IsInf(score, 1) {
-		return -1, false, time.Time{}
-	}
-	return score, false, time.Time{}
 }
 
-func minReset(now time.Time, windows ...codexUsageWindow) time.Time {
-	var earliest time.Time
+// Stop cancels the refresher and any in-flight usage probes.
+func (s *QuotaAwareSelector) Stop() {
+	if s == nil {
+		return
+	}
+	s.stopOnce.Do(func() {
+		s.mu.Lock()
+		s.stopped = true
+		cancel := s.cancel
+		s.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+	})
+}
+
+// refreshDue starts probes for credentials whose snapshot is missing or older
+// than quotaRefreshInterval, skipping any still in failure backoff. It does not
+// wait for them, so one slow probe cannot stall the others.
+func (s *QuotaAwareSelector) refreshDue(ctx context.Context) {
+	if ctx.Err() != nil || s.fetch == nil {
+		return
+	}
+	now := s.clock()
+	type job struct {
+		id   string
+		cred codexUsageCredential
+	}
+	var jobs []job
+	s.mu.Lock()
+	s.pruneLocked(now)
+	for id, entry := range s.entries {
+		if s.inflight+len(jobs) >= quotaMaxConcurrent {
+			break
+		}
+		if entry.fetching || now.Before(entry.nextAttempt) {
+			continue
+		}
+		if entry.snapshot != nil && now.Sub(entry.fetchedAt) < quotaRefreshInterval {
+			continue
+		}
+		entry.fetching = true
+		jobs = append(jobs, job{id: id, cred: entry.cred})
+	}
+	s.inflight += len(jobs)
+	s.mu.Unlock()
+
+	for _, j := range jobs {
+		s.wg.Add(1)
+		go func(j job) {
+			defer s.wg.Done()
+			snapshot, errFetch := s.fetch(ctx, j.cred, now)
+			s.record(j.id, snapshot, errFetch)
+		}(j)
+	}
+}
+
+func (s *QuotaAwareSelector) record(id string, snapshot *codexUsageSnapshot, errFetch error) {
+	now := s.clock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inflight--
+	entry, ok := s.entries[id]
+	if !ok {
+		return
+	}
+	entry.fetching = false
+	if errFetch != nil || snapshot == nil {
+		entry.failures++
+		backoff := quotaRefreshBackoff << min(entry.failures-1, 8)
+		entry.nextAttempt = now.Add(min(backoff, quotaRefreshBackoffMax))
+		if errFetch != nil {
+			log.WithField("auth", id).Debugf("quota-aware: codex usage probe failed: %v", errFetch)
+		}
+		return
+	}
+	entry.snapshot = snapshot
+	entry.fetchedAt = now
+	entry.failures = 0
+	entry.nextAttempt = time.Time{}
+}
+
+// classifyCodexSnapshot maps a fresh snapshot (or nil) to a selection state.
+// A higher score means the credential can afford to spend quota faster.
+func classifyCodexSnapshot(snapshot *codexUsageSnapshot, now time.Time) (quotaState, float64, time.Time) {
+	if snapshot == nil {
+		return quotaUnknown, 0, time.Time{}
+	}
+	windows := []codexUsageWindow{snapshot.primaryWindow, snapshot.secondaryWindow}
 	for _, w := range windows {
-		if !w.hasReset || w.resetAt.IsZero() {
+		// A passed reset makes the reported usage obsolete until the next probe.
+		if !w.resetAt.IsZero() && !w.resetAt.After(now) {
+			return quotaUnknown, 0, time.Time{}
+		}
+	}
+	var next time.Time
+	exhausted := !snapshot.allowed || snapshot.limitReached
+	score := math.Inf(1)
+	for _, w := range windows {
+		if !w.hasUsedPercent || w.resetAt.IsZero() {
 			continue
 		}
-		if w.resetAt.Before(now) {
+		remaining := min(max(1-w.usedPercent/100, 0), 1)
+		if remaining <= 0 {
+			exhausted = true
+			if next.IsZero() || w.resetAt.Before(next) {
+				next = w.resetAt
+			}
 			continue
 		}
-		if earliest.IsZero() || w.resetAt.Before(earliest) {
-			earliest = w.resetAt
+		// Clamp so a reset a few minutes away does not dominate the ranking.
+		hours := math.Max(w.resetAt.Sub(now).Hours(), 0.25)
+		rate := remaining / hours
+		if remaining < 0.05 {
+			rate *= remaining / 0.05
 		}
+		score = math.Min(score, rate)
 	}
-	return earliest
+	if exhausted {
+		if next.IsZero() {
+			for _, w := range windows {
+				if !w.resetAt.IsZero() && (next.IsZero() || w.resetAt.Before(next)) {
+					next = w.resetAt
+				}
+			}
+		}
+		return quotaExhausted, 0, next
+	}
+	if math.IsInf(score, 1) {
+		return quotaUnknown, 0, time.Time{}
+	}
+	return quotaKnown, score, time.Time{}
 }
 
-func clamp01(v float64) float64 {
-	if v < 0 {
-		return 0
+func codexCredentialOf(a *Auth) codexUsageCredential {
+	cred := codexUsageCredential{proxyURL: strings.TrimSpace(a.ProxyURL)}
+	if a.Attributes != nil {
+		cred.token = strings.TrimSpace(a.Attributes["api_key"])
 	}
-	if v > 1 {
-		return 1
+	if a.Metadata != nil {
+		if cred.token == "" {
+			if v, ok := a.Metadata["access_token"].(string); ok {
+				cred.token = strings.TrimSpace(v)
+			}
+		}
+		if v, ok := a.Metadata["account_id"].(string); ok {
+			cred.accountID = strings.TrimSpace(v)
+		}
 	}
-	return v
+	return cred
 }
 
-func fetchCodexUsageDefault(ctx context.Context, auth *Auth) (*codexUsageSnapshot, error) {
-	if auth == nil {
-		return nil, fmt.Errorf("codex usage: auth is nil")
+// fetchCodexUsage probes wham/usage. It sets no timeout; the refresher's
+// context cancels it on Stop.
+func fetchCodexUsage(ctx context.Context, cred codexUsageCredential, now time.Time) (*codexUsageSnapshot, error) {
+	if cred.token == "" || cred.accountID == "" {
+		return nil, fmt.Errorf("codex usage: missing access token or account_id")
 	}
-	var token string
-	if auth.Attributes != nil {
-		token = strings.TrimSpace(auth.Attributes["api_key"])
-	}
-	if token == "" && auth.Metadata != nil {
-		if v, ok := auth.Metadata["access_token"].(string); ok {
-			token = strings.TrimSpace(v)
-		}
-	}
-	if token == "" {
-		return nil, fmt.Errorf("codex usage: missing access token")
-	}
-	accountID := ""
-	if auth.Metadata != nil {
-		if v, ok := auth.Metadata["account_id"].(string); ok {
-			accountID = strings.TrimSpace(v)
-		}
-	}
-	if accountID == "" {
-		return nil, fmt.Errorf("codex usage: missing account_id")
-	}
-
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, codexUsageEndpoint, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Chatgpt-Account-Id", accountID)
+	req.Header.Set("Authorization", "Bearer "+cred.token)
+	req.Header.Set("Chatgpt-Account-Id", cred.accountID)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", codexCLIUserAgent)
 
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := &http.Client{}
+	if cred.proxyURL != "" {
+		transport, _, errProxy := proxyutil.BuildHTTPTransport(cred.proxyURL)
+		if errProxy != nil {
+			return nil, fmt.Errorf("codex usage: proxy: %w", errProxy)
+		}
+		if transport != nil {
+			defer transport.CloseIdleConnections()
+			client.Transport = transport
+		}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Debugf("quota-aware: close usage body: %v", errClose)
+		}
+	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("codex usage: status %d", resp.StatusCode)
 	}
-	buf := make([]byte, 0, 64*1024)
-	tmp := make([]byte, 32*1024)
-	for {
-		n, readErr := resp.Body.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			if len(buf) > 512*1024 {
-				break
-			}
-		}
-		if readErr != nil {
-			break
-		}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, quotaUsageBodyLimit))
+	if err != nil {
+		return nil, err
 	}
-	return parseCodexUsage(buf)
+	return parseCodexUsage(body, now)
 }
 
-func parseCodexUsage(body []byte) (*codexUsageSnapshot, error) {
+func parseCodexUsage(body []byte, now time.Time) (*codexUsageSnapshot, error) {
 	root := gjson.ParseBytes(body)
-	if !root.Exists() {
-		return nil, fmt.Errorf("codex usage: empty payload")
+	if !root.IsObject() {
+		return nil, fmt.Errorf("codex usage: payload is not an object")
 	}
-	snap := &codexUsageSnapshot{}
-
-	allowed := root.Get("rate_limit.allowed")
-	if allowed.Exists() {
-		snap.allowed = allowed.Bool()
-	} else {
-		snap.allowed = true
+	rl := firstResult(root, "rate_limit", "rateLimit")
+	snap := &codexUsageSnapshot{allowed: true}
+	if v := rl.Get("allowed"); v.Exists() {
+		snap.allowed = v.Bool()
 	}
-	limitReached := root.Get("rate_limit.limit_reached")
-	if !limitReached.Exists() {
-		limitReached = root.Get("rate_limit.limitReached")
+	if v := firstResult(rl, "limit_reached", "limitReached"); v.Exists() {
+		snap.limitReached = v.Bool()
 	}
-	if limitReached.Exists() {
-		snap.limitReached = limitReached.Bool()
-	}
-
-	snap.primaryWindow = parseCodexWindow(root.Get("rate_limit.primary_window"))
-	if !snap.primaryWindow.hasReset {
-		snap.primaryWindow = parseCodexWindow(root.Get("rate_limit.primaryWindow"))
-	}
-	snap.secondaryWindow = parseCodexWindow(root.Get("rate_limit.secondary_window"))
-	if !snap.secondaryWindow.hasReset {
-		snap.secondaryWindow = parseCodexWindow(root.Get("rate_limit.secondaryWindow"))
-	}
+	snap.primaryWindow = parseCodexWindow(firstResult(rl, "primary_window", "primaryWindow"), now)
+	snap.secondaryWindow = parseCodexWindow(firstResult(rl, "secondary_window", "secondaryWindow"), now)
 	return snap, nil
 }
 
-func parseCodexWindow(node gjson.Result) codexUsageWindow {
-	window := codexUsageWindow{}
-	if !node.Exists() || node.Type == gjson.Null {
-		window.observedEmpty = true
-		return window
+func parseCodexWindow(node gjson.Result, now time.Time) codexUsageWindow {
+	var w codexUsageWindow
+	if !node.IsObject() {
+		return w
 	}
-
-	used := node.Get("used_percent")
-	if !used.Exists() {
-		used = node.Get("usedPercent")
-	}
-	if used.Exists() {
-		if used.Type == gjson.String {
-			if f, err := strconvParseFloat(used.String()); err == nil {
-				window.usedPercent = f
-				window.hasUsedPercent = true
-			}
-		} else if used.Type == gjson.Number {
-			window.usedPercent = used.Float()
-			window.hasUsedPercent = true
+	if used := firstResult(node, "used_percent", "usedPercent"); used.Exists() {
+		if f, err := strconv.ParseFloat(strings.TrimSpace(used.String()), 64); err == nil {
+			w.usedPercent = f
+			w.hasUsedPercent = true
 		}
 	}
-
-	resetAfter := node.Get("reset_after_seconds")
-	if !resetAfter.Exists() {
-		resetAfter = node.Get("resetAfterSeconds")
+	if sec := firstResult(node, "reset_at", "resetAt").Int(); sec > 0 {
+		w.resetAt = time.Unix(sec, 0)
+	} else if sec := firstResult(node, "reset_after_seconds", "resetAfterSeconds").Int(); sec > 0 {
+		w.resetAt = now.Add(time.Duration(sec) * time.Second)
 	}
-	if resetAfter.Exists() {
-		sec := int64(resetAfter.Int())
-		if sec > 0 {
-			window.resetAfter = time.Duration(sec) * time.Second
-		}
-	}
-
-	resetAt := node.Get("reset_at")
-	if !resetAt.Exists() {
-		resetAt = node.Get("resetAt")
-	}
-	if resetAt.Exists() {
-		// reset_at appears to be seconds since epoch in Codex usage payload.
-		sec := int64(resetAt.Int())
-		if sec > 0 {
-			window.resetAt = time.Unix(sec, 0)
-			window.hasReset = true
-		}
-	}
-
-	limitWindow := node.Get("limit_window_seconds")
-	if !limitWindow.Exists() {
-		limitWindow = node.Get("limitWindowSeconds")
-	}
-	if limitWindow.Exists() {
-		sec := int64(limitWindow.Int())
-		if sec > 0 {
-			window.limitWindow = time.Duration(sec) * time.Second
-			window.hasLimitWindow = true
-		}
-	}
-
-	if !window.hasReset && window.resetAfter > 0 {
-		window.resetAt = time.Now().Add(window.resetAfter)
-		window.hasReset = true
-	}
-
-	return window
+	return w
 }
 
-// strconvParseFloat delegates to strconv.ParseFloat. It exists as a named
-// helper so the original hand-rolled parser could be swapped for the stdlib
-// implementation without touching call sites.
-func strconvParseFloat(v string) (float64, error) {
-	return strconv.ParseFloat(strings.TrimSpace(v), 64)
-}
-
-// strconvParseInt delegates to strconv.ParseInt (base 10, int64 width).
-func strconvParseInt(v string) (int64, error) {
-	return strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+func firstResult(node gjson.Result, paths ...string) gjson.Result {
+	for _, p := range paths {
+		if v := node.Get(p); v.Exists() {
+			return v
+		}
+	}
+	return gjson.Result{}
 }
