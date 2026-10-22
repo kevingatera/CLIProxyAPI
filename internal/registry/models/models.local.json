@@ -1,104 +1,31 @@
 {
+  "source": "Kimi Coding API native model catalog",
+  "checked": "2026-10-21",
   "kimi": [
     {
-      "id": "kimi-k3-256k",
-      "object": "model",
-      "created": 1784073600,
-      "owned_by": "moonshot",
-      "type": "kimi",
-      "display_name": "Kimi K3 256K",
-      "description": "Kimi K3 256K - Moonshot AI's K3 flagship model with a 256K context window",
+      "id": "kimi-k3",
       "context_length": 262144,
-      "max_completion_tokens": 65536,
       "thinking": {
-        "zero_allowed": false,
-        "levels": [
-          "low",
-          "high",
-          "max"
-        ]
+        "zero_allowed": false
       }
     },
     {
-      "id": "kimi-k3",
-      "object": "model",
-      "created": 1784073600,
-      "owned_by": "moonshot",
-      "type": "kimi",
-      "display_name": "Kimi K3",
-      "description": "Kimi Coding OAuth model; capabilities verified against the native model catalog.",
-      "context_length": 262144,
-      "max_completion_tokens": 65536,
+      "id": "kimi-k3-256k",
       "thinking": {
-        "zero_allowed": false,
-        "levels": [
-          "low",
-          "high",
-          "max"
-        ]
-      },
-      "supportedInputModalities": [
-        "text",
-        "image",
-        "video"
-      ],
-      "supportedOutputModalities": [
-        "text"
-      ]
+        "zero_allowed": false
+      }
     },
     {
       "id": "kimi-k2.8",
-      "object": "model",
-      "created": 1789115500,
-      "owned_by": "moonshot",
-      "type": "kimi",
-      "display_name": "Kimi K2.8 Preview",
-      "description": "Kimi Coding OAuth model; capabilities verified against the native model catalog.",
-      "context_length": 1048576,
-      "max_completion_tokens": 65536,
       "thinking": {
-        "zero_allowed": false,
-        "levels": [
-          "low",
-          "high",
-          "max"
-        ]
-      },
-      "supportedInputModalities": [
-        "text",
-        "image",
-        "video"
-      ],
-      "supportedOutputModalities": [
-        "text"
-      ]
+        "zero_allowed": false
+      }
     },
     {
       "id": "kimi-k2.8-code",
-      "object": "model",
-      "created": 1789115500,
-      "owned_by": "moonshot",
-      "type": "kimi",
-      "display_name": "Kimi K2.8 Code Preview",
-      "description": "Kimi Coding OAuth model; capabilities verified against the native model catalog.",
-      "context_length": 1048576,
-      "max_completion_tokens": 65536,
       "thinking": {
-        "zero_allowed": false,
-        "levels": [
-          "low",
-          "high",
-          "max"
-        ]
-      },
-      "supportedInputModalities": [
-        "text",
-        "image",
-        "video"
-      ],
-      "supportedOutputModalities": [
-        "text"
-      ]
+        "zero_allowed": false
+      }
     }
   ]
 }

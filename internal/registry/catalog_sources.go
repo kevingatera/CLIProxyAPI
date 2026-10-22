@@ -332,6 +332,8 @@ func publishCatalogBytes(data []byte) ([]string, error) {
 	if len(parsed.Meta) == 0 && old != nil {
 		parsed.Meta = old.Meta
 	}
+	// A remote refresh replaces the whole catalog, so local patches must be re-applied.
+	applyEmbeddedLocalModelPatches(&parsed)
 	changed := detectChangedProviders(old, &parsed)
 	modelsCatalogStore.mu.Lock()
 	modelsCatalogStore.data = &parsed
