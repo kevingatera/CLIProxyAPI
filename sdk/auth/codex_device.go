@@ -263,12 +263,13 @@ func (a *CodexAuthenticator) buildAuthRecord(authSvc *codex.CodexAuth, authBundl
 		planType = tokenStorage.PlanType
 	}
 	hashAccountID := ""
+	accountID := ""
 	if tokenStorage.IDToken != "" {
 		if claims, errParse := codex.ParseJWTToken(tokenStorage.IDToken); errParse == nil && claims != nil {
 			if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
 				planType = pt
 			}
-			accountID := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID)
+			accountID = strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID)
 			if accountID != "" {
 				digest := sha256.Sum256([]byte(accountID))
 				hashAccountID = hex.EncodeToString(digest[:])[:8]
@@ -284,6 +285,11 @@ func (a *CodexAuthenticator) buildAuthRecord(authSvc *codex.CodexAuth, authBundl
 	metadata := map[string]any{
 		"email":     tokenStorage.Email,
 		"plan_type": planType,
+	}
+	// Persist account_id so FileTokenStore can dedup same-account re-logins that
+	// arrive under a different filename (email alias or plan-type change).
+	if accountID != "" {
+		metadata["account_id"] = accountID
 	}
 
 	fmt.Println("Codex authentication successful")
