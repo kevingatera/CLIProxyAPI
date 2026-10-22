@@ -2105,6 +2105,9 @@ func (s *SessionAffinitySelector) Stop() {
 	if s.matcher != nil {
 		s.matcher.Clear()
 	}
+	if stoppable, ok := s.fallback.(StoppableSelector); ok {
+		stoppable.Stop()
+	}
 }
 
 // InvalidateAuth removes all session bindings for a specific auth.
