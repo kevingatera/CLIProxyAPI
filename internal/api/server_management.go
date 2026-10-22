@@ -92,6 +92,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)
 		mgmt.PATCH("/api-keys", s.mgmt.PatchAPIKeys)
 		mgmt.DELETE("/api-keys", s.mgmt.DeleteAPIKeys)
+		// Compatibility alias for one release; /v8/management/api-key-labels is the contract.
 		mgmt.GET("/api-key-labels", s.mgmt.GetAPIKeyLabels)
 		mgmt.PUT("/api-key-labels", s.mgmt.PutAPIKeyLabels)
 		mgmt.GET("/api-key-usage", s.mgmt.GetAPIKeyUsage)
