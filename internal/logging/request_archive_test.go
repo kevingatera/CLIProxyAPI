@@ -196,3 +196,192 @@ func TestArchiveRedactorDecodedEscapesCannotHideKnownCredentials(t *testing.T) {
 		t.Fatal("mask missing")
 	}
 }
+
+func newLimitedArchive(t *testing.T, rc config.RequestArchiveConfig) *RequestArchive {
+	t.Helper()
+	rc.Enabled = true
+	cfg := &config.Config{RequestArchive: rc}
+	cfg.APIKeys = []string{"consumer-secret-123456789"}
+	return NewRequestArchive(cfg, "", t.TempDir())
+}
+
+func TestRequestArchiveStreamingCaptureCapWritesMarker(t *testing.T) {
+	a := newLimitedArchive(t, config.RequestArchiveConfig{MaxCaptureMB: 1})
+	w, err := a.LogStreamingRequest("/v1/chat/completions", "POST", nil, []byte("prompt"), "cap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = w.WriteStatus(200, nil)
+	chunk := []byte(strings.Repeat("a", 64<<10))
+	for i := 0; i < 64; i++ {
+		w.WriteChunkAsync(chunk)
+	}
+	stream := w.(*archiveStream)
+	if got := len(stream.pending); got != 1<<20 {
+		t.Fatalf("pending grew to %d bytes, want cap %d", got, 1<<20)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	log := readArchive(t, a)
+	if !strings.Contains(log, archiveTruncatedMarker) {
+		t.Fatal("missing truncation marker")
+	}
+	if len(log) > 2<<20 {
+		t.Fatalf("archive %d bytes exceeds capture cap", len(log))
+	}
+}
+
+func TestRequestArchiveCaptureCutDropsSecretFragment(t *testing.T) {
+	a := newLimitedArchive(t, config.RequestArchiveConfig{MaxCaptureMB: 1})
+	w, err := a.LogStreamingRequest("/v1/chat/completions", "POST", nil, nil, "frag")
+	if err != nil {
+		t.Fatal(err)
+	}
+	filler := strings.Repeat("b", (1<<20)-10)
+	w.WriteChunkAsync([]byte(filler + "consumer-secret-123456789"))
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	log := readArchive(t, a)
+	if strings.Contains(log, "consumer-s") {
+		t.Fatal("secret prefix persisted at the capture cut")
+	}
+	if !strings.Contains(log, archiveTruncatedMarker) {
+		t.Fatal("missing truncation marker")
+	}
+}
+
+func TestRequestArchiveConcurrentCaptureLimit(t *testing.T) {
+	a := newLimitedArchive(t, config.RequestArchiveConfig{MaxConcurrentCaptures: 1})
+	first, err := a.LogStreamingRequest("/v1/a", "POST", nil, nil, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := a.LogStreamingRequest("/v1/b", "POST", nil, nil, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.WriteChunkAsync([]byte("second-body-marker"))
+	if len(second.(*archiveStream).pending) != 0 {
+		t.Fatal("over-limit capture buffered bytes")
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+	first.WriteChunkAsync([]byte("first-body-marker"))
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n := a.activeCaptures.Load(); n != 0 {
+		t.Fatalf("active captures leaked: %d", n)
+	}
+	log := readArchive(t, a)
+	if !strings.Contains(log, archiveConcurrencyMarker) || strings.Contains(log, "second-body-marker") {
+		t.Fatal("over-limit capture not replaced by marker")
+	}
+	if !strings.Contains(log, "first-body-marker") {
+		t.Fatal("admitted capture lost")
+	}
+	third, err := a.LogStreamingRequest("/v1/c", "POST", nil, nil, "third")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !third.(*archiveStream).counted {
+		t.Fatal("slot not released after close")
+	}
+	_ = third.Close()
+}
+
+func TestRequestArchiveNonStreamingBodiesAreBoundedAndMasked(t *testing.T) {
+	a := newLimitedArchive(t, config.RequestArchiveConfig{MaxCaptureMB: 1})
+	body := []byte(`{"prompt":"masked consumer-secret-123456789"}`)
+	response := []byte(strings.Repeat("r", 2<<20))
+	if err := a.LogRequest("/v1/messages", "POST", nil, body, 200, nil, response, nil, nil, nil, nil, nil, "bounded", time.Now(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	log := readArchive(t, a)
+	if strings.Contains(log, "consumer-secret-123456789") || !strings.Contains(log, "[REDACTED]") {
+		t.Fatal("masking not applied before bounding")
+	}
+	if !strings.Contains(log, archiveTruncatedMarker) || len(log) > 2<<20 {
+		t.Fatalf("response not bounded: %d bytes", len(log))
+	}
+}
+
+func TestRequestArchiveMetadataOnlyOmitsBodies(t *testing.T) {
+	a := newLimitedArchive(t, config.RequestArchiveConfig{MetadataOnly: true})
+	if err := a.LogRequest("/v1/messages", "POST", map[string][]string{"X-Trace": {"trace-marker"}}, []byte("body-marker"), 200, nil, []byte("response-marker"), nil, nil, nil, nil, nil, "meta", time.Now(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	w, err := a.LogStreamingRequest("/v1/stream", "POST", nil, nil, "meta-stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.WriteChunkAsync([]byte("stream-marker"))
+	_ = w.WriteAPIResponse([]byte("upstream-marker"))
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	log := readArchive(t, a)
+	for _, body := range []string{"body-marker", "response-marker", "stream-marker", "upstream-marker"} {
+		if strings.Contains(log, body) {
+			t.Errorf("metadata-only kept %q", body)
+		}
+	}
+	if !strings.Contains(log, "trace-marker") || !strings.Contains(log, archiveMetadataOnlyMarker) {
+		t.Fatal("metadata or omission marker missing")
+	}
+}
+
+func TestRequestArchiveAgeRetentionUsesClock(t *testing.T) {
+	a := newLimitedArchive(t, config.RequestArchiveConfig{MaxAgeDays: 7})
+	now := time.Date(2026, 1, 20, 0, 0, 0, 0, time.UTC)
+	a.clock = func() time.Time { return now }
+	dir := a.file.logsDir
+	for name, age := range map[string]time.Duration{"expired.log": 8 * 24 * time.Hour, "fresh.log": 6 * 24 * time.Hour, "expired.tmp": 30 * 24 * time.Hour} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_ = os.Chtimes(p, now.Add(-age), now.Add(-age))
+	}
+	if err := a.retain(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "expired.log")); !os.IsNotExist(err) {
+		t.Fatal("expired log retained")
+	}
+	for _, name := range []string{"fresh.log", "expired.tmp"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("removed %s", name)
+		}
+	}
+}
+
+func TestRequestArchiveSizeRetentionStillAppliesWithAgeLimit(t *testing.T) {
+	a := newLimitedArchive(t, config.RequestArchiveConfig{MaxAgeDays: 365})
+	now := time.Now()
+	a.clock = func() time.Time { return now }
+	dir := a.file.logsDir
+	for i, name := range []string{"old.log", "new.log"} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("123456"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		ts := now.Add(time.Duration(i-2) * time.Minute)
+		_ = os.Chtimes(p, ts, ts)
+	}
+	if _, err := enforceLogDirSizeLimit(dir, 6, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.retain(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "old.log")); !os.IsNotExist(err) {
+		t.Fatal("size retention did not remove oldest log")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "new.log")); err != nil {
+		t.Fatal("age limit removed a fresh log")
+	}
+}
