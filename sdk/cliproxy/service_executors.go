@@ -473,8 +473,10 @@ func (s *Service) registerResolvedModelsForAuthFenced(a *coreauth.Auth, fence mo
 	if len(normalizedModels) == 0 {
 		return s.unregisterModelsForAuthFenced(a, fence)
 	}
-	if s.cfg != nil && len(s.cfg.GlobalExcludedModels) > 0 {
-		normalizedModels = applyExcludedModels(normalizedModels, s.cfg.GlobalExcludedModels)
+	// Filter with the list captured in the fence; publication rejects the
+	// result if the live list changed after the fence was taken.
+	if len(fence.globalExcludedModels) > 0 {
+		normalizedModels = applyExcludedModels(normalizedModels, fence.globalExcludedModels)
 		if len(normalizedModels) == 0 {
 			return s.unregisterModelsForAuthFenced(a, fence)
 		}
