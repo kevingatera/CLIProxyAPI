@@ -143,3 +143,56 @@ func TestGlobalExcludedModelsDeleteByModel(t *testing.T) {
 		t.Fatalf("expected [gpt-5-codex] after deletion, got %v", h.cfg.GlobalExcludedModels)
 	}
 }
+
+func TestGlobalExcludedModelsV8ConfigRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	// Production files carry the legacy root key; it must stay readable.
+	if err := os.WriteFile(path, []byte("port: 8317\nglobal-excluded-models: [\"cursor/*\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.GlobalExcludedModels; len(got) != 1 || got[0] != "cursor/*" {
+		t.Fatalf("legacy key loaded as %v", got)
+	}
+	h := &Handler{cfg: cfg, configFilePath: path}
+	router := gin.New()
+	router.GET("/v8/management/config/*path", h.ConfigV8)
+	router.PUT("/v8/management/config/*path", h.ConfigV8)
+	router.GET("/v0/management/global-excluded-models", h.GetGlobalExcludedModels)
+	do := func(method, url, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest(method, url, bytes.NewBufferString(body)))
+		return w
+	}
+
+	if w := do(http.MethodGet, "/v8/management/config/routing/excluded-models", ""); w.Code != http.StatusOK || !bytes.Contains(w.Body.Bytes(), []byte("cursor/*")) {
+		t.Fatalf("v8 GET status=%d body=%s", w.Code, w.Body.String())
+	}
+	if w := do(http.MethodPut, "/v8/management/config/routing/excluded-models", `["*-preview"]`); w.Code != http.StatusOK {
+		t.Fatalf("v8 PUT status=%d body=%s", w.Code, w.Body.String())
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = config.ValidateV8Config(saved); err != nil {
+		t.Fatalf("saved config is not valid v8: %v\n%s", err, saved)
+	}
+	reloaded, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.GlobalExcludedModels; len(got) != 1 || got[0] != "*-preview" {
+		t.Fatalf("v8 write reloaded as %v\n%s", got, saved)
+	}
+
+	w := do(http.MethodGet, "/v0/management/global-excluded-models", "")
+	if w.Code != http.StatusOK || w.Header().Get("Deprecation") != "true" {
+		t.Fatalf("v0 compat GET status=%d deprecation=%q", w.Code, w.Header().Get("Deprecation"))
+	}
+}

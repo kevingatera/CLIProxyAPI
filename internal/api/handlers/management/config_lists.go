@@ -1311,12 +1311,25 @@ func (h *Handler) DeleteOAuthExcludedModels(c *gin.Context) {
 	h.persistLocked(c)
 }
 
-// global-excluded-models: []string (wildcard patterns like "cursor/*", "*-preview")
+// global-excluded-models: []string (wildcard patterns like "cursor/*", "*-preview").
+// These v0 handlers are a one-release compatibility path. New callers use
+// /v8/management/config/routing/excluded-models.
+func markGlobalExcludedModelsDeprecated(c *gin.Context) {
+	c.Header("Deprecation", "true")
+	c.Header("Link", `</v8/management/config/routing/excluded-models>; rel="successor-version"`)
+}
+
 func (h *Handler) GetGlobalExcludedModels(c *gin.Context) {
+	markGlobalExcludedModelsDeprecated(c)
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	c.JSON(200, gin.H{"global-excluded-models": config.NormalizeExcludedModels(h.cfg.GlobalExcludedModels)})
 }
 
 func (h *Handler) PutGlobalExcludedModels(c *gin.Context) {
+	markGlobalExcludedModelsDeprecated(c)
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	data, err := c.GetRawData()
 	if err != nil {
 		c.JSON(400, gin.H{"error": "failed to read body"})
@@ -1340,13 +1353,14 @@ func (h *Handler) PutGlobalExcludedModels(c *gin.Context) {
 			patterns = wrapper.Items
 		}
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.cfg.GlobalExcludedModels = config.NormalizeExcludedModels(patterns)
 	h.persistLocked(c)
 }
 
 func (h *Handler) PatchGlobalExcludedModels(c *gin.Context) {
+	markGlobalExcludedModelsDeprecated(c)
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	var body struct {
 		Model  *string `json:"model"`
 		Remove *bool   `json:"remove"`
@@ -1360,8 +1374,6 @@ func (h *Handler) PatchGlobalExcludedModels(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "model pattern is required"})
 		return
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	existing := config.NormalizeExcludedModels(h.cfg.GlobalExcludedModels)
 	if body.Remove != nil && *body.Remove {
 		filtered := existing[:0]
@@ -1379,6 +1391,7 @@ func (h *Handler) PatchGlobalExcludedModels(c *gin.Context) {
 }
 
 func (h *Handler) DeleteGlobalExcludedModels(c *gin.Context) {
+	markGlobalExcludedModelsDeprecated(c)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	pattern := strings.ToLower(strings.TrimSpace(c.Query("model")))
