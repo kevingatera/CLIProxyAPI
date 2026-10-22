@@ -12,6 +12,17 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	log "github.com/sirupsen/logrus"
+)
+
+const (
+	defaultArchiveMaxSizeGB        = 30
+	defaultArchiveCaptureMB        = 32
+	defaultArchiveConcurrentCaps   = 16
+	archiveMinSecretFragmentLength = 4
+	archiveTruncatedMarker         = "[ARCHIVE TRUNCATED: per-request capture limit reached]"
+	archiveConcurrencyMarker       = "[ARCHIVE OMITTED: concurrent capture limit reached]"
+	archiveMetadataOnlyMarker      = "[ARCHIVE OMITTED: metadata-only mode]"
 )
 
 // RequestArchive sanitizes before delegating to disk storage. It intentionally
@@ -25,6 +36,10 @@ type RequestArchive struct {
 	secrets     func() []string
 	retentionMu sync.Mutex
 	startupErr  error
+	// activeCaptures counts streaming captures that buffer transcript bytes.
+	activeCaptures atomic.Int64
+	// clock is replaceable in tests so age retention needs no sleeps.
+	clock func() time.Time
 }
 
 func NewRequestArchive(cfg *config.Config, configDir, logsDir string) *RequestArchive {
@@ -35,7 +50,7 @@ func NewRequestArchive(cfg *config.Config, configDir, logsDir string) *RequestAr
 	if !filepath.IsAbs(dir) {
 		dir = filepath.Join(configDir, dir)
 	}
-	a := &RequestArchive{file: NewFileRequestLogger(true, dir, "", 0)}
+	a := &RequestArchive{file: NewFileRequestLogger(true, dir, "", 0), clock: time.Now}
 	a.startupErr = os.MkdirAll(dir, 0700)
 	if a.startupErr == nil {
 		a.startupErr = os.Chmod(dir, 0700)
@@ -101,12 +116,127 @@ func (a *RequestArchive) retain() error {
 }
 func (a *RequestArchive) retainLocked() error {
 	cfg := a.cfg.Load()
+	if days := cfg.RequestArchive.MaxAgeDays; days > 0 {
+		cutoff := a.clock().Add(-time.Duration(days) * 24 * time.Hour)
+		if _, err := removeArchiveFilesBefore(a.file.logsDir, cutoff); err != nil {
+			return err
+		}
+	}
 	gb := cfg.RequestArchive.MaxSizeGB
 	if gb <= 0 {
-		gb = 30
+		gb = defaultArchiveMaxSizeGB
 	}
 	_, err := enforceLogDirSizeLimit(a.file.logsDir, int64(gb)*1000000000, "")
 	return err
+}
+
+// removeArchiveFilesBefore deletes completed archive files last modified before
+// cutoff. Temporary captures and non-log files are never matched.
+func removeArchiveFilesBefore(dir string, cutoff time.Time) (int, error) {
+	entries, errRead := os.ReadDir(dir)
+	if errRead != nil {
+		if os.IsNotExist(errRead) {
+			return 0, nil
+		}
+		return 0, errRead
+	}
+	deleted := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !isLogFileName(entry.Name()) {
+			continue
+		}
+		info, errInfo := entry.Info()
+		if errInfo != nil || !info.Mode().IsRegular() || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		if errRemove := os.Remove(path); errRemove != nil {
+			log.WithError(errRemove).Warnf("logging: failed to remove expired archive file: %s", entry.Name())
+			continue
+		}
+		deleted++
+	}
+	return deleted, nil
+}
+
+// archiveBudget bounds the raw bytes one request may hold in memory.
+type archiveBudget struct {
+	remaining int64
+}
+
+// take returns the prefix of data that still fits and reports whether data was cut.
+func (b *archiveBudget) take(data []byte) ([]byte, bool) {
+	if int64(len(data)) <= b.remaining {
+		b.remaining -= int64(len(data))
+		return data, false
+	}
+	kept := data[:b.remaining]
+	b.remaining = 0
+	return kept, true
+}
+
+// admitRedacted charges masked bytes to the budget. A cut keeps the prefix
+// without any trailing fragment of a known secret, then appends the marker.
+func admitRedacted(b *archiveBudget, data []byte, secrets []string, marker string) []byte {
+	kept, cut := b.take(data)
+	if !cut {
+		return kept
+	}
+	return markCut(kept, secrets, marker)
+}
+
+func markCut(data []byte, secrets []string, marker string) []byte {
+	trimmed := trimSecretFragment(data, secrets)
+	out := make([]byte, 0, len(trimmed)+len(marker))
+	out = append(out, trimmed...)
+	return append(out, marker...)
+}
+
+// trimSecretFragment drops a tail that begins a known secret. A cut can land
+// inside a credential, and the unmasked prefix must not persist.
+func trimSecretFragment(data []byte, secrets []string) []byte {
+	cut := len(data)
+	for _, secret := range secrets {
+		for k := min(len(secret)-1, len(data)); k >= archiveMinSecretFragmentLength; k-- {
+			if bytes.HasSuffix(data, []byte(secret[:k])) {
+				if len(data)-k < cut {
+					cut = len(data) - k
+				}
+				break
+			}
+		}
+	}
+	return data[:cut]
+}
+
+// captureBudgetBytes returns the per-request in-memory cap. Zero or unset uses the default.
+func captureBudgetBytes(cfg *config.Config) int64 {
+	mb := cfg.RequestArchive.MaxCaptureMB
+	if mb <= 0 {
+		mb = defaultArchiveCaptureMB
+	}
+	return int64(mb) << 20
+}
+
+func concurrentCaptureLimit(cfg *config.Config) int64 {
+	if n := cfg.RequestArchive.MaxConcurrentCaptures; n > 0 {
+		return int64(n)
+	}
+	return defaultArchiveConcurrentCaps
+}
+
+// acquireCapture reserves a streaming capture slot. It returns false when the
+// concurrent limit is reached; the caller then records an omission marker only.
+func (a *RequestArchive) acquireCapture(limit int64) bool {
+	for {
+		n := a.activeCaptures.Load()
+		if n >= limit {
+			return false
+		}
+		if a.activeCaptures.CompareAndSwap(n, n+1) {
+			return true
+		}
+	}
 }
 
 func (a *RequestArchive) LogRequest(url, method string, headers map[string][]string, body []byte, status int, responseHeaders map[string][]string, response, ws, upstreamRequest, upstreamResponse, upstreamWS []byte, apiErrors []*interfaces.ErrorMessage, id string, started, received time.Time) error {
@@ -120,6 +250,7 @@ func (a *RequestArchive) LogRequestWithOptions(url, method string, headers map[s
 	if a.startupErr != nil {
 		return a.startupErr
 	}
+	cfg := a.cfg.Load()
 	combinedHeaders := make(map[string][]string)
 	for name, values := range headers {
 		combinedHeaders[name] = append(combinedHeaders[name], values...)
@@ -155,9 +286,23 @@ func (a *RequestArchive) LogRequestWithOptions(url, method string, headers map[s
 		errorsJSON, _ := json.Marshal(safeErrors)
 		upstreamResponse = append(append(bytes.Clone(upstreamResponse), '\n'), errorsJSON...)
 	}
+	// Each body section is masked first, then charged to one per-request budget
+	// so the persisted record stays bounded. Metadata-only keeps URL, headers,
+	// status and timing, and replaces every body with a marker.
+	budget := archiveBudget{remaining: captureBudgetBytes(cfg)}
+	metadataOnly := cfg.RequestArchive.MetadataOnly
+	bounded := func(data []byte) []byte {
+		if len(data) == 0 {
+			return data
+		}
+		if metadataOnly {
+			return []byte(archiveMetadataOnlyMarker)
+		}
+		return admitRedacted(&budget, data, r.secrets, archiveTruncatedMarker)
+	}
 	a.retentionMu.Lock()
 	defer a.retentionMu.Unlock()
-	err = a.file.LogRequest(string(r.Bytes([]byte(url))), method, r.Headers(headers), r.Bytes(body), status, safeHeaders, r.Transcript(decoded), r.Transcript(ws), r.Bytes(upstreamRequest), r.Transcript(upstreamResponse), r.Transcript(upstreamWS), nil, string(r.Bytes([]byte(id))), started, received)
+	err = a.file.LogRequest(string(r.Bytes([]byte(url))), method, r.Headers(headers), bounded(r.Bytes(body)), status, safeHeaders, bounded(r.Transcript(decoded)), bounded(r.Transcript(ws)), bounded(r.Bytes(upstreamRequest)), bounded(r.Transcript(upstreamResponse)), bounded(r.Transcript(upstreamWS)), nil, string(r.Bytes([]byte(id))), started, received)
 	if err != nil {
 		return err
 	}
@@ -171,15 +316,32 @@ func (a *RequestArchive) LogStreamingRequest(url, method string, headers map[str
 	if a.startupErr != nil {
 		return nil, a.startupErr
 	}
+	cfg := a.cfg.Load()
 	r := a.redactor(headers)
+	counted := a.acquireCapture(concurrentCaptureLimit(cfg))
 	w, err := a.file.LogStreamingRequest(string(r.Bytes([]byte(url))), method, r.Headers(headers), r.Bytes(body), string(r.Bytes([]byte(id))))
 	if err != nil {
+		if counted {
+			a.activeCaptures.Add(-1)
+		}
 		return nil, err
 	}
 	if file, ok := w.(*FileStreamingLogWriter); ok {
 		file.lossless = true
 	}
-	return &archiveStream{StreamingLogWriter: w, redactor: r, archive: a}, nil
+	stream := &archiveStream{StreamingLogWriter: w, redactor: r, archive: a, counted: counted, budget: archiveBudget{remaining: captureBudgetBytes(cfg)}, limitMarker: archiveTruncatedMarker}
+	if !counted {
+		// Over the concurrent limit the request is still recorded, without transcript bytes.
+		stream.budget.remaining = 0
+		stream.pendingCut = true
+		stream.limitMarker = archiveConcurrencyMarker
+	}
+	if cfg.RequestArchive.MetadataOnly {
+		stream.budget.remaining = 0
+		stream.metadataOnly = true
+		stream.limitMarker = archiveMetadataOnlyMarker
+	}
+	return stream, nil
 }
 
 type archiveStream struct {
@@ -187,30 +349,62 @@ type archiveStream struct {
 	redactor *ArchiveRedactor
 	archive  *RequestArchive
 	pending  []byte
+	budget   archiveBudget
+	// pendingCut records that raw chunks were dropped at the budget or concurrency limit.
+	pendingCut   bool
+	counted      bool
+	metadataOnly bool
+	limitMarker  string
 }
 
 func (w *archiveStream) WriteChunkAsync(chunk []byte) {
 	// SSE deltas can split credentials between JSON records. Keep the wire
 	// transcript in memory until final redaction; only sanitized bytes spool.
-	w.pending = append(w.pending, chunk...)
+	kept, cut := w.budget.take(chunk)
+	w.pending = append(w.pending, kept...)
+	if cut {
+		w.pendingCut = true
+	}
 }
 func (w *archiveStream) WriteStatus(status int, headers map[string][]string) error {
 	w.redactor = NewArchiveRedactor(append(w.redactor.secrets, w.archive.redactor(headers).secrets...))
 	return w.StreamingLogWriter.WriteStatus(status, w.redactor.Headers(headers))
 }
 func (w *archiveStream) WriteAPIRequest(body []byte) error {
-	return w.StreamingLogWriter.WriteAPIRequest(w.redactor.Transcript(body))
+	return w.StreamingLogWriter.WriteAPIRequest(w.admit(body))
 }
 func (w *archiveStream) WriteAPIResponse(body []byte) error {
-	return w.StreamingLogWriter.WriteAPIResponse(w.redactor.Transcript(body))
+	return w.StreamingLogWriter.WriteAPIResponse(w.admit(body))
 }
 func (w *archiveStream) WriteAPIWebsocketTimeline(body []byte) error {
-	return w.StreamingLogWriter.WriteAPIWebsocketTimeline(w.redactor.Transcript(body))
+	return w.StreamingLogWriter.WriteAPIWebsocketTimeline(w.admit(body))
 }
+
+// admit masks an upstream section and charges it to the same budget as chunks.
+func (w *archiveStream) admit(body []byte) []byte {
+	if len(body) == 0 {
+		return nil
+	}
+	if w.metadataOnly {
+		return []byte(archiveMetadataOnlyMarker)
+	}
+	masked := w.redactor.Transcript(body)
+	return admitRedacted(&w.budget, masked, w.redactor.secrets, w.limitMarker)
+}
+
 func (w *archiveStream) Close() error {
+	if w.counted {
+		defer w.archive.activeCaptures.Add(-1)
+	}
 	w.redactor = NewArchiveRedactor(append(w.redactor.secrets, w.archive.redactor(nil).secrets...))
-	if len(w.pending) > 0 {
-		w.StreamingLogWriter.WriteChunkAsync(w.redactor.Transcript(w.pending))
+	if len(w.pending) > 0 || w.pendingCut {
+		chunk := w.redactor.Transcript(w.pending)
+		if w.pendingCut {
+			chunk = markCut(chunk, w.redactor.secrets, w.limitMarker)
+		}
+		if len(chunk) > 0 {
+			w.StreamingLogWriter.WriteChunkAsync(chunk)
+		}
 		w.pending = nil
 	}
 	w.archive.retentionMu.Lock()
