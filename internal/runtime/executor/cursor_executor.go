@@ -16,15 +16,18 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	"github.com/tidwall/gjson"
 )
 
 // CursorExecutor runs chat requests through the cursor-agent CLI in print mode.
 type CursorExecutor struct {
 	cfg *config.Config
+	// compat sends requests to the HTTP relay when an auth carries base_url.
+	compat *OpenAICompatExecutor
 }
 
 func NewCursorExecutor(cfg *config.Config) *CursorExecutor {
-	return &CursorExecutor{cfg: cfg}
+	return &CursorExecutor{cfg: cfg, compat: NewOpenAICompatExecutor("cursor", cfg)}
 }
 
 func (e *CursorExecutor) Identifier() string { return "cursor" }
@@ -56,6 +59,12 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
+	if err = cursorRejectToolRequests(req, opts); err != nil {
+		return resp, err
+	}
+	if relay := cursorRelayAuth(auth); relay != nil {
+		return e.compat.Execute(ctx, relay, cursorRelayRequest(req), opts)
+	}
 	reporter := helps.NewExecutorUsageReporter(ctx, e, cursorModelFromRequest(req.Model), auth)
 	defer reporter.TrackFailure(ctx, &err)
 
@@ -85,6 +94,12 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
+	}
+	if err = cursorRejectToolRequests(req, opts); err != nil {
+		return nil, err
+	}
+	if relay := cursorRelayAuth(auth); relay != nil {
+		return e.compat.ExecuteStream(ctx, relay, cursorRelayRequest(req), opts)
 	}
 	reporter := helps.NewExecutorUsageReporter(ctx, e, cursorModelFromRequest(req.Model), auth)
 	defer reporter.TrackFailure(ctx, &err)
@@ -257,4 +272,80 @@ func cursorModelFromRequest(requested string) string {
 
 func newCursorChatID() string {
 	return "chatcmpl-" + uuid.NewString()
+}
+
+// cursorRelayBaseURL returns the HTTP relay endpoint for an auth, or "" when the
+// auth runs through the CLI. Production files keep base_url in metadata, and the
+// file synthesizer does not copy it into attributes, so both are checked.
+func cursorRelayBaseURL(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if v := strings.TrimSpace(auth.Attributes["base_url"]); v != "" {
+		return v
+	}
+	if v, _ := auth.Metadata["base_url"].(string); strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+// cursorRelayAuth returns a copy of auth whose attributes carry the relay base URL,
+// which the OpenAI-compatible executor reads. It returns nil for CLI auths.
+// The original auth is not modified.
+func cursorRelayAuth(auth *cliproxyauth.Auth) *cliproxyauth.Auth {
+	baseURL := cursorRelayBaseURL(auth)
+	if baseURL == "" {
+		return nil
+	}
+	attrs := make(map[string]string, len(auth.Attributes)+1)
+	for key, value := range auth.Attributes {
+		attrs[key] = value
+	}
+	attrs["base_url"] = baseURL
+	return &cliproxyauth.Auth{
+		ID:         auth.ID,
+		Provider:   auth.Provider,
+		ProxyURL:   auth.ProxyURL,
+		Attributes: attrs,
+		Metadata:   auth.Metadata,
+	}
+}
+
+// cursorRelayRequest keeps the reasoning suffix on the model name, as the relay
+// path has always done.
+func cursorRelayRequest(req cliproxyexecutor.Request) cliproxyexecutor.Request {
+	req.Model = cursorCanonicalRequestModel(req.Model)
+	return req
+}
+
+func cursorCanonicalRequestModel(model string) string {
+	parsed := thinking.ParseSuffix(strings.TrimSpace(model))
+	base := helps.CursorProviderModelID(parsed.ModelName)
+	if base == "" {
+		base = "auto"
+	}
+	if parsed.HasSuffix && strings.TrimSpace(parsed.RawSuffix) != "" {
+		return base + "(" + strings.TrimSpace(parsed.RawSuffix) + ")"
+	}
+	return base
+}
+
+// cursorRejectToolRequests fails requests with tool definitions or tool turns. The
+// CLI path would flatten them into text, and the relay does not honor them.
+func cursorRejectToolRequests(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) error {
+	payload := sdktranslator.TranslateRequest(opts.SourceFormat, sdktranslator.FromString("openai"), "", req.Payload, false)
+	hasTools := gjson.GetBytes(payload, "tools").IsArray() && len(gjson.GetBytes(payload, "tools").Array()) > 0
+	hasToolTurns := false
+	gjson.GetBytes(payload, "messages").ForEach(func(_, message gjson.Result) bool {
+		if toolCalls := message.Get("tool_calls"); message.Get("role").String() == "tool" || (toolCalls.IsArray() && len(toolCalls.Array()) > 0) {
+			hasToolTurns = true
+			return false
+		}
+		return true
+	})
+	if hasTools || hasToolTurns {
+		return statusErr{code: http.StatusBadRequest, msg: "cursor executor: tool definitions and tool calls are not supported; remove tools from the request"}
+	}
+	return nil
 }

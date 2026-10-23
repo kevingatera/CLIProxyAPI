@@ -141,3 +141,30 @@ func TestLegacyCursorAuthFileStillLoads(t *testing.T) {
 		t.Fatal("legacy file unexpectedly gained an api_key")
 	}
 }
+
+func TestCursorLoginRecordsRelayOnlyWhenConfigured(t *testing.T) {
+	installFakeCursorAgentLogin(t)
+	t.Setenv(CursorAPIKeyEnv, "")
+	t.Setenv("CURSOR_PROXY_BASE_URL", "")
+	t.Setenv("CURSOR_BASE_URL", "")
+
+	record, err := NewCursorAuthenticator().Login(context.Background(), &config.Config{}, &LoginOptions{})
+	if err != nil {
+		t.Fatalf("Login() error: %v", err)
+	}
+	if _, ok := record.Metadata["base_url"]; ok {
+		t.Fatal("base_url recorded without an explicit relay setting")
+	}
+
+	t.Setenv("CURSOR_PROXY_BASE_URL", "http://192.168.1.20:32125/v1")
+	record, err = NewCursorAuthenticator().Login(context.Background(), &config.Config{}, &LoginOptions{})
+	if err != nil {
+		t.Fatalf("Login() with relay error: %v", err)
+	}
+	if got := record.Metadata["base_url"]; got != "http://192.168.1.20:32125/v1" {
+		t.Fatalf("metadata base_url = %v, want the relay URL", got)
+	}
+	if got := record.Attributes["base_url"]; got != "http://192.168.1.20:32125/v1" {
+		t.Fatalf("attribute base_url = %q, want the relay URL", got)
+	}
+}

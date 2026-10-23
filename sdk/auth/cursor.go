@@ -100,6 +100,15 @@ func (a CursorAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 	if strings.TrimSpace(os.Getenv(CursorAPIKeyEnv)) != "" {
 		metadata[CursorAPIKeyEnvMetadataKey] = CursorAPIKeyEnv
 	}
+	attrs := map[string]string{
+		"provider_key": "cursor",
+		"compat_name":  "cursor",
+	}
+	// Only an explicit relay setting records base_url. Without one the auth runs through the CLI.
+	if relay := cursorRelayURLFromEnv(); relay != "" {
+		metadata["base_url"] = relay
+		attrs["base_url"] = relay
+	}
 
 	label := "cursor-agent"
 	if user := strings.TrimSpace(os.Getenv("USER")); user != "" {
@@ -108,16 +117,24 @@ func (a CursorAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 	}
 
 	return &coreauth.Auth{
-		ID:       fileName,
-		Provider: "cursor",
-		FileName: fileName,
-		Label:    label,
-		Attributes: map[string]string{
-			"provider_key": "cursor",
-			"compat_name":  "cursor",
-		},
-		Metadata: metadata,
+		ID:         fileName,
+		Provider:   "cursor",
+		FileName:   fileName,
+		Label:      label,
+		Attributes: attrs,
+		Metadata:   metadata,
 	}, nil
+}
+
+// cursorRelayURLFromEnv reads the HTTP relay endpoint for new logins. The
+// relay is opt-in: it is used only when one of these variables is set.
+func cursorRelayURLFromEnv() string {
+	for _, key := range []string{"CURSOR_PROXY_BASE_URL", "CURSOR_BASE_URL"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // ResolveCursorAgentPath locates the cursor-agent CLI binary. It is the single
