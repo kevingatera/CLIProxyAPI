@@ -2,17 +2,21 @@ package api
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	log "github.com/sirupsen/logrus"
 )
 
 const usageStatisticsFileName = "usage_stats.json"
+
+// renameLegacyFile is swapped in tests to force the copy fallback.
+var renameLegacyFile = os.Rename
 
 func resolveRelativeToConfig(pathValue, configFilePath string) string {
 	trimmed := strings.TrimSpace(pathValue)
@@ -76,35 +80,21 @@ func migrateUsageStatisticsFile(legacyPath, desiredPath string) error {
 	if err := os.MkdirAll(filepath.Dir(desiredPath), 0o700); err != nil {
 		return fmt.Errorf("prepare usage stats directory: %w", err)
 	}
-	if err := os.Rename(legacyPath, desiredPath); err == nil {
+	if err := renameLegacyFile(legacyPath, desiredPath); err == nil {
 		return nil
 	}
 
-	src, err := os.Open(legacyPath)
+	// Rename fails across filesystems. Copy through a synced same-directory temp file
+	// and rename it into place. The legacy file is removed only after that commit.
+	data, err := os.ReadFile(legacyPath)
 	if err != nil {
-		return fmt.Errorf("open legacy usage stats file: %w", err)
+		return fmt.Errorf("read legacy usage stats file: %w", err)
 	}
-	defer func() { _ = src.Close() }()
-
-	dst, err := os.OpenFile(desiredPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("create migrated usage stats file: %w", err)
-	}
-	copyErr := error(nil)
-	if _, err = io.Copy(dst, src); err != nil {
-		copyErr = fmt.Errorf("copy usage stats file: %w", err)
-	}
-	closeErr := dst.Close()
-	if copyErr != nil {
-		_ = os.Remove(desiredPath)
-		return copyErr
-	}
-	if closeErr != nil {
-		_ = os.Remove(desiredPath)
-		return fmt.Errorf("close migrated usage stats file: %w", closeErr)
+	if err := usage.WriteFileAtomic(desiredPath, data, 0o600); err != nil {
+		return fmt.Errorf("copy legacy usage stats file: %w", err)
 	}
 	if err := os.Remove(legacyPath); err != nil {
-		return fmt.Errorf("remove legacy usage stats file: %w", err)
+		log.WithError(err).Warn("usage: migrated usage statistics; legacy file could not be removed")
 	}
 	return nil
 }

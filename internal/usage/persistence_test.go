@@ -202,11 +202,11 @@ func TestExportImportRoundTripDeduplicates(t *testing.T) {
 		t.Fatalf("DecodeSnapshot current format: err=%v needsRewrite=%v", err, needsRewrite)
 	}
 	dst := NewRequestStatistics()
-	if got := dst.MergeSnapshot(snapshot); got.Added != 1 || got.Skipped != 0 {
-		t.Fatalf("first merge = %+v", got)
+	if got, err := dst.MergeSnapshot(snapshot); err != nil || got.Added != 1 || got.Skipped != 0 {
+		t.Fatalf("first merge = %+v, err %v", got, err)
 	}
-	if got := dst.MergeSnapshot(snapshot); got.Added != 0 || got.Skipped != 1 {
-		t.Fatalf("repeat merge = %+v", got)
+	if got, err := dst.MergeSnapshot(snapshot); err != nil || got.Added != 0 || got.Skipped != 1 {
+		t.Fatalf("repeat merge = %+v, err %v", got, err)
 	}
 }
 
@@ -216,12 +216,96 @@ func TestImportOfRawKeyExportStoresFingerprints(t *testing.T) {
 		t.Fatalf("DecodeSnapshot: %v", err)
 	}
 	dst := NewRequestStatistics()
-	dst.MergeSnapshot(snapshot)
+	if _, err := dst.MergeSnapshot(snapshot); err != nil {
+		t.Fatalf("MergeSnapshot: %v", err)
+	}
 	data, err := EncodeSnapshot(dst.Snapshot())
 	if err != nil {
 		t.Fatalf("EncodeSnapshot: %v", err)
 	}
 	if bytes.Contains(data, []byte(legacyClientKey)) || bytes.Contains(data, []byte(legacyUpstreamKey)) {
 		t.Fatal("imported raw keys reached the stored snapshot")
+	}
+}
+
+func TestLoadFailedCommitLeavesFileAndAggregateUntouched(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage_stats.json")
+	writeTestFile(t, path, legacyRawKeySnapshot)
+	stats := NewRequestStatistics()
+	p := NewPersistence(PersistenceConfig{Stats: stats, Path: path})
+
+	prevRename := renameFile
+	renameFile = func(string, string) error { return errors.New("simulated rename failure") }
+	defer func() { renameFile = prevRename }()
+
+	if err := p.Load(); err == nil {
+		t.Fatal("expected migration commit error")
+	}
+	if got := stats.Snapshot().TotalRequests; got != 0 {
+		t.Fatalf("failed load changed the aggregate: total = %d", got)
+	}
+	if got, _ := os.ReadFile(path); string(got) != legacyRawKeySnapshot {
+		t.Fatal("failed load changed the file")
+	}
+	if err := p.Flush(); err == nil {
+		t.Fatal("Flush must not overwrite a snapshot that failed to load")
+	}
+	if got, _ := os.ReadFile(path); string(got) != legacyRawKeySnapshot {
+		t.Fatal("refused flush changed the file")
+	}
+
+	renameFile = prevRename
+	if err := p.Load(); err != nil {
+		t.Fatalf("retry Load: %v", err)
+	}
+	if got := stats.Snapshot().TotalRequests; got != 3 {
+		t.Fatalf("retry total = %d, want 3", got)
+	}
+	if err := p.Load(); err != nil {
+		t.Fatalf("repeat Load: %v", err)
+	}
+	if got := stats.Snapshot().TotalRequests; got != 3 {
+		t.Fatalf("repeat Load double counted: total = %d, want 3", got)
+	}
+}
+
+func TestImportRejectsPrunedTotalsIntoNonEmptyAggregate(t *testing.T) {
+	snapshot, _, err := DecodeSnapshot([]byte(legacyRawKeySnapshot))
+	if err != nil {
+		t.Fatalf("DecodeSnapshot: %v", err)
+	}
+	dst := NewRequestStatistics()
+	if _, err := dst.MergeSnapshot(snapshot); err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	if got := dst.Snapshot().TotalRequests; got != 3 {
+		t.Fatalf("first import total = %d, want 3", got)
+	}
+	if _, err := dst.MergeSnapshot(snapshot); !errors.Is(err, ErrOverlappingSnapshot) {
+		t.Fatalf("second import err = %v, want ErrOverlappingSnapshot", err)
+	}
+	if got := dst.Snapshot().TotalRequests; got != 3 {
+		t.Fatalf("rejected import changed totals: %d, want 3", got)
+	}
+}
+
+func TestLoadSamePathTwiceMergesOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage_stats.json")
+	writeTestFile(t, path, legacyRawKeySnapshot)
+	stats := NewRequestStatistics()
+
+	if err := NewPersistence(PersistenceConfig{Stats: stats, Path: path}).Load(); err != nil {
+		t.Fatalf("first Load: %v", err)
+	}
+	// A restarted Persistence for the same file sees pruned totals; it must not reject or re-add them.
+	p := NewPersistence(PersistenceConfig{Stats: stats, Path: path})
+	if err := p.Load(); err != nil {
+		t.Fatalf("second Load: %v", err)
+	}
+	if got := stats.Snapshot().TotalRequests; got != 3 {
+		t.Fatalf("total after reload = %d, want 3", got)
+	}
+	if err := p.Flush(); err != nil {
+		t.Fatalf("Flush after reload: %v", err)
 	}
 }

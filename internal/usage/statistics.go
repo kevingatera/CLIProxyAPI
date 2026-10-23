@@ -2,7 +2,9 @@ package usage
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -104,6 +106,9 @@ type RequestStatistics struct {
 	tokensByHour   map[int]int64
 
 	lastPrune time.Time
+
+	// loadedPaths records files already merged by restoreSnapshot.
+	loadedPaths map[string]struct{}
 }
 
 // NewRequestStatistics returns an empty aggregate.
@@ -114,6 +119,7 @@ func NewRequestStatistics() *RequestStatistics {
 		requestsByHour: make(map[int]int64),
 		tokensByDay:    make(map[string]int64),
 		tokensByHour:   make(map[int]int64),
+		loadedPaths:    make(map[string]struct{}),
 	}
 }
 
@@ -273,27 +279,27 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 	return result
 }
 
-// MergeSnapshot imports a snapshot. Details already present are skipped. Totals
-// that belong to details no longer retained are added as a remainder, since those
-// records cannot be deduplicated.
-func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResult {
-	return s.mergeSnapshot(snapshot, true)
+// ErrOverlappingSnapshot reports a snapshot with totals for requests older than the
+// detail retention window. Those totals cannot be deduplicated, so they merge only
+// into an empty aggregate.
+var ErrOverlappingSnapshot = errors.New("usage snapshot has totals older than the retention window and cannot merge into a non-empty aggregate")
+
+// MergeSnapshot imports a snapshot. Retained details already present are skipped.
+// A snapshot with totals for pruned requests is rejected unless the aggregate is
+// empty, so importing the same export twice cannot count it twice. A rejected
+// import changes nothing.
+func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) (MergeResult, error) {
+	return s.mergeSnapshot(snapshot, "")
 }
 
-// restoreSnapshot merges a snapshot read from disk. Pruned remainders are restored
-// only into an empty aggregate, so reloading in the same process does not count them twice.
-func (s *RequestStatistics) restoreSnapshot(snapshot StatisticsSnapshot) MergeResult {
-	if s == nil {
-		return MergeResult{}
-	}
-	s.mu.Lock()
-	empty := s.totalRequests == 0
-	s.mu.Unlock()
-	return s.mergeSnapshot(snapshot, empty)
+// restoreSnapshot merges a snapshot loaded from path. Each path merges at most once
+// per aggregate, so reloading the same file in one process does not count it twice.
+func (s *RequestStatistics) restoreSnapshot(path string, snapshot StatisticsSnapshot) (MergeResult, error) {
+	return s.mergeSnapshot(snapshot, filepath.Clean(path))
 }
 
-// retainedCounts tallies the details present in a snapshot, so the remainder for
-// pruned records can be derived from the snapshot totals.
+// retainedCounts tallies the details kept as records, so the remainder for pruned
+// requests can be derived from the snapshot totals.
 type retainedCounts struct {
 	success, failure                         int64
 	reqByDay, tokByDay, reqByHour, tokByHour map[string]int64
@@ -322,15 +328,81 @@ func (c *retainedCounts) add(detail RequestDetail) {
 	c.tokByHour[hour] += detail.Tokens.TotalTokens
 }
 
-func (s *RequestStatistics) mergeSnapshot(snapshot StatisticsSnapshot, includeRemainder bool) MergeResult {
+type plannedDetail struct {
+	apiName   string
+	modelName string
+	detail    RequestDetail
+}
+
+type prunedTotals struct {
+	apiName   string
+	modelName string
+	requests  int64
+	tokens    int64
+}
+
+func (s *RequestStatistics) mergeSnapshot(snapshot StatisticsSnapshot, loadKey string) (MergeResult, error) {
 	result := MergeResult{}
 	if s == nil {
-		return result
+		return result, nil
 	}
 	snapshot, _ = normalizeSnapshot(snapshot)
+	cutoff := time.Now().Add(-detailRetention)
+
+	// Plan the whole merge before touching the aggregate, so a rejected snapshot changes nothing.
+	var planned []plannedDetail
+	var pruned []prunedTotals
+	retained := newRetainedCounts()
+	for apiName, apiSnapshot := range snapshot.APIs {
+		for modelName, modelSnapshot := range apiSnapshot.Models {
+			var modelReq, modelTok int64
+			for _, detail := range modelSnapshot.Details {
+				detail.Tokens = normaliseTokenStats(detail.Tokens)
+				if detail.Timestamp.IsZero() {
+					detail.Timestamp = time.Now()
+				}
+				if detail.Timestamp.Before(cutoff) {
+					continue
+				}
+				retained.add(detail)
+				modelReq++
+				modelTok += detail.Tokens.TotalTokens
+				planned = append(planned, plannedDetail{apiName: apiName, modelName: modelName, detail: detail})
+			}
+			pruned = append(pruned, prunedTotals{
+				apiName:   apiName,
+				modelName: modelName,
+				requests:  nonNegative(modelSnapshot.TotalRequests - modelReq),
+				tokens:    nonNegative(modelSnapshot.TotalTokens - modelTok),
+			})
+		}
+	}
+	successRem := nonNegative(snapshot.SuccessCount - retained.success)
+	failureRem := nonNegative(snapshot.FailureCount - retained.failure)
+	remReqDay := remainderMap(snapshot.RequestsByDay, retained.reqByDay)
+	remTokDay := remainderMap(snapshot.TokensByDay, retained.tokByDay)
+	remReqHour := remainderMap(snapshot.RequestsByHour, retained.reqByHour)
+	remTokHour := remainderMap(snapshot.TokensByHour, retained.tokByHour)
+
+	hasPruned := successRem > 0 || failureRem > 0 ||
+		len(remReqDay) > 0 || len(remTokDay) > 0 || len(remReqHour) > 0 || len(remTokHour) > 0
+	for _, p := range pruned {
+		if p.requests > 0 || p.tokens > 0 {
+			hasPruned = true
+		}
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if loadKey != "" {
+		if _, loaded := s.loadedPaths[loadKey]; loaded {
+			return result, nil
+		}
+	}
+	if s.totalRequests > 0 && hasPruned {
+		return MergeResult{}, ErrOverlappingSnapshot
+	}
 
 	seen := make(map[string]struct{})
 	for apiName, stats := range s.apis {
@@ -340,49 +412,43 @@ func (s *RequestStatistics) mergeSnapshot(snapshot StatisticsSnapshot, includeRe
 			}
 		}
 	}
-
-	retained := newRetainedCounts()
-	for apiName, apiSnapshot := range snapshot.APIs {
-		stats, ok := s.apis[apiName]
-		if !ok {
-			stats = &apiStats{Models: make(map[string]*modelStats)}
-			s.apis[apiName] = stats
-		}
-		for modelName, modelSnapshot := range apiSnapshot.Models {
-			var modelReq, modelTok int64
-			for _, detail := range modelSnapshot.Details {
-				detail.Tokens = normaliseTokenStats(detail.Tokens)
-				if detail.Timestamp.IsZero() {
-					detail.Timestamp = time.Now()
-				}
-				retained.add(detail)
-				modelReq++
-				modelTok += detail.Tokens.TotalTokens
-
-				key := dedupKey(apiName, modelName, detail)
-				if _, exists := seen[key]; exists {
-					result.Skipped++
-					continue
-				}
-				seen[key] = struct{}{}
-				s.recordImported(apiName, modelName, stats, detail)
-				result.Added++
-			}
-			if includeRemainder {
-				s.addPrunedTotals(stats, modelName, modelSnapshot.TotalRequests-modelReq, modelSnapshot.TotalTokens-modelTok)
-			}
-		}
+	for apiName := range snapshot.APIs {
+		s.apiStatsFor(apiName)
 	}
-
-	if includeRemainder {
-		s.successCount += nonNegative(snapshot.SuccessCount - retained.success)
-		s.failureCount += nonNegative(snapshot.FailureCount - retained.failure)
-		addRemainderMap(s.requestsByDay, snapshot.RequestsByDay, retained.reqByDay)
-		addRemainderMap(s.tokensByDay, snapshot.TokensByDay, retained.tokByDay)
-		addRemainderHourMap(s.requestsByHour, snapshot.RequestsByHour, retained.reqByHour)
-		addRemainderHourMap(s.tokensByHour, snapshot.TokensByHour, retained.tokByHour)
+	for _, p := range planned {
+		key := dedupKey(p.apiName, p.modelName, p.detail)
+		if _, exists := seen[key]; exists {
+			result.Skipped++
+			continue
+		}
+		seen[key] = struct{}{}
+		s.recordImported(s.apiStatsFor(p.apiName), p.modelName, p.detail)
+		result.Added++
 	}
-	return result
+	for _, p := range pruned {
+		s.addPrunedTotals(s.apiStatsFor(p.apiName), p.modelName, p.requests, p.tokens)
+	}
+	s.successCount += successRem
+	s.failureCount += failureRem
+	addRemainderMap(s.requestsByDay, remReqDay)
+	addRemainderMap(s.tokensByDay, remTokDay)
+	addRemainderHourMap(s.requestsByHour, remReqHour)
+	addRemainderHourMap(s.tokensByHour, remTokHour)
+
+	if loadKey != "" {
+		s.loadedPaths[loadKey] = struct{}{}
+	}
+	return result, nil
+}
+
+// apiStatsFor returns the aggregate entry for apiName, creating it if needed. The caller holds s.mu.
+func (s *RequestStatistics) apiStatsFor(apiName string) *apiStats {
+	stats, ok := s.apis[apiName]
+	if !ok {
+		stats = &apiStats{Models: make(map[string]*modelStats)}
+		s.apis[apiName] = stats
+	}
+	return stats
 }
 
 // addPrunedTotals adds request and token totals that have no retained detail.
@@ -411,27 +477,34 @@ func nonNegative(v int64) int64 {
 	return v
 }
 
-func addRemainderMap(dst map[string]int64, total, retained map[string]int64) {
+// remainderMap returns the positive part of total minus retained, per key.
+func remainderMap(total, retained map[string]int64) map[string]int64 {
+	out := make(map[string]int64)
 	for key, value := range total {
 		if remainder := nonNegative(value - retained[key]); remainder > 0 {
-			dst[key] += remainder
+			out[key] = remainder
 		}
+	}
+	return out
+}
+
+func addRemainderMap(dst map[string]int64, remainder map[string]int64) {
+	for key, value := range remainder {
+		dst[key] += value
 	}
 }
 
-func addRemainderHourMap(dst map[int]int64, total, retained map[string]int64) {
-	for key, value := range total {
+func addRemainderHourMap(dst map[int]int64, remainder map[string]int64) {
+	for key, value := range remainder {
 		hour, err := strconv.Atoi(key)
-		if err != nil {
+		if err != nil || hour < 0 || hour > 23 {
 			continue
 		}
-		if remainder := nonNegative(value - retained[formatHour(hour)]); remainder > 0 {
-			dst[hour%24] += remainder
-		}
+		dst[hour] += value
 	}
 }
 
-func (s *RequestStatistics) recordImported(apiName, modelName string, stats *apiStats, detail RequestDetail) {
+func (s *RequestStatistics) recordImported(stats *apiStats, modelName string, detail RequestDetail) {
 	totalTokens := detail.Tokens.TotalTokens
 	if totalTokens < 0 {
 		totalTokens = 0

@@ -43,14 +43,18 @@ func (s *Server) configureUsagePersistence(oldCfg, newCfg *config.Config) {
 	}
 	if strings.TrimSpace(newCfg.UsageStatisticsFile) == "" {
 		if err := migrateUsageStatisticsFile(resolveLegacyUsageStatisticsPath(newCfg), desiredPath); err != nil {
-			log.WithError(err).Warn("usage: failed to migrate persisted usage statistics")
+			// Not started: starting would create the destination and skip the migration on later runs.
+			log.WithError(err).Error("usage: failed to migrate persisted usage statistics; persistence not started")
+			return
 		}
 	}
 	persistence := usage.NewPersistence(usage.PersistenceConfig{
 		Stats: usage.GetRequestStatistics(), Path: desiredPath, Interval: desiredInterval,
 	})
 	if err := persistence.Load(); err != nil {
-		log.WithError(err).Warn("usage: failed to load persisted usage statistics")
+		// Not started: a rejected file must stay as it is. The next config reload retries.
+		log.WithError(err).Error("usage: failed to load persisted usage statistics; the file is unchanged and persistence is not started")
+		return
 	}
 	persistence.Start()
 	s.usagePersistence = persistence
