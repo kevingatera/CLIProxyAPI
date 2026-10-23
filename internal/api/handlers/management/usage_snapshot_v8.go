@@ -1,6 +1,7 @@
 package management
 
 import (
+	"errors"
 	"io"
 	"net/http"
 
@@ -34,5 +35,14 @@ func (h *Handler) ImportUsageSnapshotV8(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, usage.GetRequestStatistics().MergeSnapshot(snapshot))
+	result, err := usage.GetRequestStatistics().MergeSnapshot(snapshot)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, usage.ErrOverlappingSnapshot) {
+			status = http.StatusConflict
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
 }

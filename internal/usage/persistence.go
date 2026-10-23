@@ -20,6 +20,10 @@ const snapshotVersion = 2
 // renameFile is swapped in tests to simulate a failed commit.
 var renameFile = os.Rename
 
+// errSnapshotNotLoaded is returned by Flush when the existing file did not load.
+// Writing over it would destroy data this process never read.
+var errSnapshotNotLoaded = errors.New("usage snapshot was not loaded; refusing to overwrite it")
+
 type persistedSnapshot struct {
 	Version int                `json:"version"`
 	SavedAt time.Time          `json:"saved_at"`
@@ -81,6 +85,9 @@ type Persistence struct {
 	path     string
 	interval time.Duration
 
+	// blocked is set when Load failed. A blocked Persistence never writes the file.
+	blocked bool
+
 	stop chan struct{}
 	done chan struct{}
 }
@@ -102,27 +109,44 @@ func NewPersistence(cfg PersistenceConfig) *Persistence {
 }
 
 // Load merges the snapshot at path into the aggregate. A missing file is not an error.
-// Legacy or raw-key snapshots are rewritten in the current format once, atomically.
-// A malformed or unsupported file is left untouched and returns an error.
+// Legacy or raw-key snapshots are migrated once. The migration is committed to disk
+// before the aggregate changes, so a failed Load leaves both untouched and the
+// next Load can retry. A failed Load blocks Flush.
 func (p *Persistence) Load() error {
 	if p == nil || p.stats == nil || p.path == "" {
 		return nil
 	}
+	err := p.load()
+	p.mu.Lock()
+	p.blocked = err != nil
+	p.mu.Unlock()
+	return err
+}
+
+func (p *Persistence) load() error {
 	data, err := os.ReadFile(p.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
-		return err
+		return fmt.Errorf("read usage snapshot %s: %w", p.path, err)
 	}
 	snapshot, needsRewrite, err := DecodeSnapshot(data)
 	if err != nil {
 		return fmt.Errorf("load usage snapshot %s: %w", p.path, err)
 	}
-	p.stats.restoreSnapshot(snapshot)
 	if needsRewrite {
+		encoded, err := EncodeSnapshot(snapshot)
+		if err != nil {
+			return fmt.Errorf("encode migrated usage snapshot: %w", err)
+		}
+		if err := writeFileAtomic(p.path, encoded, 0o600); err != nil {
+			return fmt.Errorf("migrate usage snapshot %s: %w", p.path, err)
+		}
 		log.Info("usage: migrated persisted snapshot to the fingerprinted format")
-		return p.Flush()
+	}
+	if _, err := p.stats.restoreSnapshot(p.path, snapshot); err != nil {
+		return fmt.Errorf("load usage snapshot %s: %w", p.path, err)
 	}
 	return nil
 }
@@ -132,6 +156,12 @@ func (p *Persistence) Flush() error {
 	if p == nil || p.stats == nil || p.path == "" {
 		return nil
 	}
+	p.mu.Lock()
+	blocked := p.blocked
+	p.mu.Unlock()
+	if blocked {
+		return errSnapshotNotLoaded
+	}
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
 
@@ -140,6 +170,12 @@ func (p *Persistence) Flush() error {
 		return fmt.Errorf("encode usage snapshot: %w", err)
 	}
 	return writeFileAtomic(p.path, data, 0o600)
+}
+
+// WriteFileAtomic replaces path with data through a same-directory temp file, fsync,
+// and rename. On failure path is unchanged and no temp file is left behind.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	return writeFileAtomic(path, data, perm)
 }
 
 // writeFileAtomic writes data to a unique temp file in the target directory, fsyncs it,
@@ -187,7 +223,7 @@ func (p *Persistence) Start() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.stop != nil {
+	if p.stop != nil || p.blocked {
 		return
 	}
 	if p.interval <= 0 {
