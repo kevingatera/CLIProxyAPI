@@ -20,8 +20,18 @@ const unifiedQuotaFreshness = 10 * time.Minute
 type unifiedQuotaSnapshot struct {
 	Report    pluginapi.QuotaFetchResponse
 	At        time.Time
+	ExpiresAt time.Time
 	Depletion map[string]float64
 }
+
+// fresh honors the earlier of the reporter's expiry and the local freshness window.
+func (s unifiedQuotaSnapshot) fresh(now time.Time) bool {
+	if s.At.IsZero() || now.Before(s.At) || now.Sub(s.At) > unifiedQuotaFreshness {
+		return false
+	}
+	return s.ExpiresAt.IsZero() || now.Before(s.ExpiresAt)
+}
+
 type unifiedTokenWindow struct {
 	Minutes [10]int64
 	Epochs  [10]int64
@@ -87,7 +97,8 @@ func (m *Manager) SetUnifiedQuotaFetcher(fetch func(context.Context, *Auth) (plu
 }
 
 // SetUnifiedAllowanceRefresher installs an optional background snapshot reader.
-func (m *Manager) SetUnifiedAllowanceRefresher(refresh func(context.Context) bool) {
+// Credentials it leaves without a fresh report are refreshed through the quota fetcher.
+func (m *Manager) SetUnifiedAllowanceRefresher(refresh func(context.Context)) {
 	m.unifiedMu.Lock()
 	defer m.unifiedMu.Unlock()
 	m.unifiedAllowanceRefresher = refresh
@@ -129,15 +140,15 @@ func (m *Manager) refreshUnifiedQuotas(ctx context.Context) {
 	fetch := m.unifiedQuotaFetcher
 	refresh := m.unifiedAllowanceRefresher
 	m.unifiedMu.Unlock()
-	if refresh != nil && refresh(ctx) {
-		return
+	if refresh != nil {
+		refresh(ctx)
 	}
 	if fetch == nil {
 		return
 	}
 	var done []chan struct{}
 	for _, a := range m.List() {
-		if a.Disabled {
+		if a.Disabled || m.unifiedQuotaFresh(a.ID, time.Now()) {
 			continue
 		}
 		participates := false
@@ -170,15 +181,26 @@ func (m *Manager) refreshUnifiedQuotas(ctx context.Context) {
 	}
 }
 
+func (m *Manager) unifiedQuotaFresh(authID string, now time.Time) bool {
+	m.unifiedMu.Lock()
+	defer m.unifiedMu.Unlock()
+	return m.unifiedQuota[authID].fresh(now)
+}
+
 // ObserveUnifiedQuota records provider reports. Unknown and stale capacity never become unlimited capacity.
 func (m *Manager) ObserveUnifiedQuota(authID string, report pluginapi.QuotaFetchResponse, now time.Time) {
+	m.ObserveUnifiedQuotaUntil(authID, report, now, time.Time{})
+}
+
+// ObserveUnifiedQuotaUntil records a report that its source declared valid only until expiresAt.
+func (m *Manager) ObserveUnifiedQuotaUntil(authID string, report pluginapi.QuotaFetchResponse, now, expiresAt time.Time) {
 	m.unifiedMu.Lock()
 	defer m.unifiedMu.Unlock()
 	if m.unifiedQuota == nil {
 		m.unifiedQuota = make(map[string]unifiedQuotaSnapshot)
 	}
 	old := m.unifiedQuota[authID]
-	next := unifiedQuotaSnapshot{Report: report, At: now, Depletion: make(map[string]float64)}
+	next := unifiedQuotaSnapshot{Report: report, At: now, ExpiresAt: expiresAt, Depletion: make(map[string]float64)}
 	hours := now.Sub(old.At).Hours()
 	if hours >= 1.0/60 && hours <= 1 {
 		for _, group := range report.Groups {
@@ -297,7 +319,7 @@ func (m *Manager) UnifiedRoutes(model string, now time.Time) []UnifiedRouteStatu
 			at := snapshot.At
 			status.ObservedAt = &at
 		}
-		if now.Sub(snapshot.At) >= 0 && now.Sub(snapshot.At) <= unifiedQuotaFreshness {
+		if snapshot.fresh(now) {
 			for _, group := range snapshot.Report.Groups {
 				for _, bucket := range group.Buckets {
 					if bucket.Scope == "model" && !slices.Contains(bucket.Models, route.Model) {
@@ -331,7 +353,7 @@ func (m *Manager) UnifiedRoutes(model string, now time.Time) []UnifiedRouteStatu
 				}
 			}
 		}
-		if now.Sub(snapshot.At) >= 0 && now.Sub(snapshot.At) <= unifiedQuotaFreshness {
+		if snapshot.fresh(now) {
 			credits, count := 0.0, 0
 			for _, metric := range snapshot.Report.Summary {
 				if metric.Key == "monthlyCredits" || metric.Key == "purchasedCredits" || metric.Key == "freeCredits" {
