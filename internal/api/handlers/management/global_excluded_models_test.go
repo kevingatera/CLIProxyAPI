@@ -196,3 +196,55 @@ func TestGlobalExcludedModelsV8ConfigRoute(t *testing.T) {
 		t.Fatalf("v0 compat GET status=%d deprecation=%q", w.Code, w.Header().Get("Deprecation"))
 	}
 }
+
+func TestGlobalExcludedModelsPutAcceptsEnvelopes(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want []string
+	}{
+		{"global-excluded-models envelope", `{"global-excluded-models":["cursor/*","*-preview"]}`, []string{"cursor/*", "*-preview"}},
+		{"items envelope", `{"items":["cursor/*"]}`, []string{"cursor/*"}},
+		{"items envelope clears", `{"items":[]}`, []string{}},
+		{"bare array", `["cursor/*"]`, []string{"cursor/*"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _ := setupGlobalExcludedHandler(t)
+			router := newGlobalExcludedRouter(h)
+
+			req := httptest.NewRequest(http.MethodPut, "/v0/management/global-excluded-models", bytes.NewBufferString(tc.body))
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != 200 {
+				t.Fatalf("PUT status = %d, want 200; body=%s", w.Code, w.Body.String())
+			}
+			if got := config.NormalizeExcludedModels(h.cfg.GlobalExcludedModels); len(got) != len(tc.want) {
+				t.Fatalf("stored = %v, want %v", got, tc.want)
+			}
+			for i, want := range tc.want {
+				if h.cfg.GlobalExcludedModels[i] != want {
+					t.Fatalf("stored[%d] = %q, want %q", i, h.cfg.GlobalExcludedModels[i], want)
+				}
+			}
+		})
+	}
+}
+
+func TestGlobalExcludedModelsPutRejectsUnknownEnvelope(t *testing.T) {
+	h, _ := setupGlobalExcludedHandler(t)
+	h.cfg.GlobalExcludedModels = []string{"cursor/*"}
+	router := newGlobalExcludedRouter(h)
+
+	for _, body := range []string{`{}`, `{"models":["gpt-5"]}`, `not json`} {
+		req := httptest.NewRequest(http.MethodPut, "/v0/management/global-excluded-models", bytes.NewBufferString(body))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != 400 {
+			t.Fatalf("PUT %s status = %d, want 400", body, w.Code)
+		}
+	}
+	if len(h.cfg.GlobalExcludedModels) != 1 || h.cfg.GlobalExcludedModels[0] != "cursor/*" {
+		t.Fatalf("rejected PUT changed stored list: %v", h.cfg.GlobalExcludedModels)
+	}
+}
