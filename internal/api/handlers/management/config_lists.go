@@ -1337,20 +1337,24 @@ func (h *Handler) PutGlobalExcludedModels(c *gin.Context) {
 	}
 	var patterns []string
 	if err = json.Unmarshal(data, &patterns); err != nil {
-		var wrapper struct {
-			Items []string `json:"items"`
+		// Envelopes are matched by key, so an unknown object is rejected instead of
+		// clearing the list.
+		var envelope struct {
+			Models *[]string `json:"global-excluded-models"`
+			Items  *[]string `json:"items"`
 		}
-		if err2 := json.Unmarshal(data, &wrapper); err2 != nil {
-			var single struct {
-				Models []string `json:"global-excluded-models"`
-			}
-			if err3 := json.Unmarshal(data, &single); err3 != nil {
-				c.JSON(400, gin.H{"error": "invalid body"})
-				return
-			}
-			patterns = single.Models
-		} else {
-			patterns = wrapper.Items
+		if err2 := json.Unmarshal(data, &envelope); err2 != nil {
+			c.JSON(400, gin.H{"error": "invalid body"})
+			return
+		}
+		switch {
+		case envelope.Models != nil:
+			patterns = *envelope.Models
+		case envelope.Items != nil:
+			patterns = *envelope.Items
+		default:
+			c.JSON(400, gin.H{"error": "invalid body; expected a string array or {\"global-excluded-models\": [...]}"})
+			return
 		}
 	}
 	h.cfg.GlobalExcludedModels = config.NormalizeExcludedModels(patterns)
