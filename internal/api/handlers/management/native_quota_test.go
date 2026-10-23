@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -249,6 +251,85 @@ func TestFetchCredentialQuotaV8Dispatch(t *testing.T) {
 		h.FetchCredentialQuotaV8(c)
 		if rec.Code != tc.status {
 			t.Fatalf("%s: status=%d body=%s", tc.body, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestFetchCredentialQuotaV8PrefersPluginReport(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	a := &coreauth.Auth{ID: "opencode", Provider: "opencode-go", Attributes: map[string]string{"api_key": "k", "base_url": "https://opencode.ai/zen/go/v1", "source": "config:opencode"}}
+	index := a.EnsureIndex()
+	if _, err := manager.Register(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	host := pluginhost.New()
+	host.RegisterPluginForTest("opencode-plugin", pluginapi.Plugin{Capabilities: pluginapi.Capabilities{QuotaProvider: &mockQuotaProvider{
+		identifier: "opencode-go",
+		fetchFn: func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+			calls++
+			return pluginapi.QuotaFetchResponse{Subscription: &pluginapi.QuotaSubscription{TierID: "plugin-tier"}}, nil
+		},
+	}}})
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.SetPluginHost(host)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v8/management/credentials/quota", strings.NewReader(`{"auth_index":"`+index+`"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.FetchCredentialQuotaV8(c)
+	if rec.Code != http.StatusOK || calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", rec.Code, calls, rec.Body.String())
+	}
+	var report pluginapi.QuotaFetchResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Subscription == nil || report.Subscription.TierID != "plugin-tier" {
+		t.Fatalf("report=%+v; the plugin report must be served without the built-in adapter", report)
+	}
+}
+
+// Config reloads swap h.cfg while native fetches read the proxy transport. Both proxies point at
+// closed local ports, so the fetch fails without network access; the race detector checks the locking.
+func TestNativeQuotaFetchReadsConfigSnapshotUnderReload(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	a := &coreauth.Auth{ID: "native", Provider: "openai-compatibility", Attributes: map[string]string{"api_key": "k", "base_url": "https://opencode.ai/zen/go/v1", "source": "config:native"}}
+	index := a.EnsureIndex()
+	if _, err := manager.Register(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir, SDKConfig: config.SDKConfig{ProxyURL: "http://127.0.0.1:1"}}, manager)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			h.SetConfig(&config.Config{AuthDir: authDir, SDKConfig: config.SDKConfig{ProxyURL: "http://127.0.0.1:" + strconv.Itoa(1+i%2)}})
+		}
+	}()
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
+
+	for i := 0; i < 20; i++ {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v8/management/credentials/quota", strings.NewReader(`{"auth_index":"`+index+`"}`))
+		c.Request.Header.Set("Content-Type", "application/json")
+		h.FetchCredentialQuotaV8(c)
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("iteration %d: status=%d body=%s", i, rec.Code, rec.Body.String())
 		}
 	}
 }
