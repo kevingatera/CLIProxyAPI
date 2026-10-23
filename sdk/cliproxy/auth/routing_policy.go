@@ -162,7 +162,9 @@ func buildRoutingPlan(policy internalconfig.RoutingPolicy, providers []string, m
 			allowOnly[provider] = seen
 		}
 	}
-	if rule.IncludeRemainingProviders || len(plan.steps) == 0 {
+	// A rule with no routes is absent, so every provider is open. A configured route that the
+	// request does not offer must not open the omitted providers unless include-remaining-providers is set.
+	if rule.IncludeRemainingProviders || len(rule.Route) == 0 {
 		var remaining []string
 		for _, provider := range providers {
 			if _, ok := routed[strings.ToLower(strings.TrimSpace(provider))]; ok {
@@ -181,12 +183,22 @@ func buildRoutingPlan(policy internalconfig.RoutingPolicy, providers []string, m
 	return plan
 }
 
-// retryProviders returns the providers the upstream retry loop should consider.
+// retryProviders returns the providers the upstream retry loop and the credits fallback may use.
+// An empty result means the policy offers none of the request's providers.
 func (p *routingPlan) retryProviders(fallback []string) []string {
-	if p == nil || len(p.providers) == 0 {
+	if p == nil {
 		return fallback
 	}
 	return p.providers
+}
+
+// routingAuthFilterFromContext returns the plan-wide auth restriction, or nil when none applies.
+func routingAuthFilterFromContext(ctx context.Context) *routingAuthFilter {
+	if ctx == nil {
+		return nil
+	}
+	filter, _ := ctx.Value(routingAuthFilterContextKey{}).(*routingAuthFilter)
+	return filter
 }
 
 // context applies the plan-wide auth restrictions to the request context.

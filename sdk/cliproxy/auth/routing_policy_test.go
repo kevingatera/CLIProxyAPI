@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
@@ -383,5 +384,153 @@ func TestRoutingPolicyCandidatesResolveModelAliases(t *testing.T) {
 	calls := executor.snapshot()
 	if len(calls) != 1 || calls[0].authID != executor.provider+"-b" || calls[0].model != model {
 		t.Fatalf("calls = %+v, want one pinned call to b with upstream model %s", calls, model)
+	}
+}
+
+// A configured route that the request does not offer must fail closed when
+// include-remaining-providers is false. It must not open the providers the policy omits.
+func TestRoutingPolicyUnofferedRouteFailsClosed(t *testing.T) {
+	manager, executor, model := newRoutingPolicyTestManager(t, "unoffered", []string{"a"}, pinnedPolicy([]string{"a"}, false))
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{Policy: internalconfig.RoutingPolicy{
+		Enabled: true,
+		Defaults: internalconfig.RoutingPolicyRule{Route: []internalconfig.RoutingPolicyRoute{
+			{Provider: "routing-policy-elsewhere", AuthOrder: []string{"x"}},
+		}},
+	}}})
+
+	if _, err := manager.Execute(context.Background(), []string{executor.provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err == nil {
+		t.Fatal("Execute error = nil, want fail-closed error")
+	}
+	assertRouteCalls(t, executor)
+}
+
+// creditsPolicyExecutor records every Antigravity call with whether it carried the credits flag.
+// Plain calls and, when failCredits is set, credits calls return 429.
+type creditsPolicyExecutor struct {
+	failCredits bool
+	mu          sync.Mutex
+	calls       []string
+}
+
+func (e *creditsPolicyExecutor) Identifier() string { return "antigravity" }
+
+func (e *creditsPolicyExecutor) record(ctx context.Context, auth *Auth) error {
+	credits := AntigravityCreditsRequested(ctx)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	label := auth.ID + ":plain"
+	if credits {
+		label = auth.ID + ":credits"
+	}
+	e.calls = append(e.calls, label)
+	if !credits || e.failCredits {
+		return &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}
+	}
+	return nil
+}
+
+func (e *creditsPolicyExecutor) snapshot() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.calls...)
+}
+
+func (e *creditsPolicyExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if err := e.record(ctx, auth); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	return cliproxyexecutor.Response{Payload: []byte("completion:" + auth.ID)}, nil
+}
+
+func (e *creditsPolicyExecutor) ExecuteStream(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	if err := e.record(ctx, auth); err != nil {
+		return nil, err
+	}
+	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("chunk:" + auth.ID)}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (*creditsPolicyExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (*creditsPolicyExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusNotImplemented, Message: "CountTokens not implemented"}
+}
+
+func (*creditsPolicyExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, &Error{HTTPStatus: http.StatusNotImplemented, Message: "HttpRequest not implemented"}
+}
+
+func newCreditsPolicyTestManager(t *testing.T, authIDs []string, policy internalconfig.RoutingPolicy, maxRetryCredentials int) (*Manager, *creditsPolicyExecutor) {
+	t.Helper()
+	const model = "claude-credits-policy"
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(0, 0, maxRetryCredentials)
+	executor := &creditsPolicyExecutor{}
+	manager.RegisterExecutor(executor)
+	limits := make(map[string]int, len(authIDs))
+	for _, id := range authIDs {
+		limits[id] = 0
+	}
+	registerRetryRoundLocalAuths(t, manager, "antigravity", model, limits)
+	manager.SetConfig(&internalconfig.Config{
+		QuotaExceeded: internalconfig.QuotaExceeded{AntigravityCredits: true},
+		Routing:       internalconfig.RoutingConfig{Policy: policy},
+	})
+	return manager, executor
+}
+
+func antigravityPinnedPolicy(authID string) internalconfig.RoutingPolicy {
+	policy := pinnedPolicy([]string{authID}, false)
+	policy.Defaults.Route[0].Provider = "antigravity"
+	return policy
+}
+
+// The credits fallback must not dispatch to an Antigravity auth the policy omits. The omitted
+// auth sorts first, so a fallback that ignores the policy would reach it before the allowed one.
+func TestRoutingPolicyCreditsFallbackHonoursAuthFilter(t *testing.T) {
+	const model = "claude-credits-policy"
+	t.Run("execute", func(t *testing.T) {
+		manager, executor := newCreditsPolicyTestManager(t, []string{"a-omitted", "b"}, antigravityPinnedPolicy("b"), 0)
+		if _, err := manager.Execute(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err != nil {
+			t.Fatalf("Execute error = %v, want credits success", err)
+		}
+		if got, want := fmt.Sprint(executor.snapshot()), "[b:plain b:credits]"; got != want {
+			t.Fatalf("calls = %s, want %s", got, want)
+		}
+	})
+	t.Run("stream", func(t *testing.T) {
+		manager, executor := newCreditsPolicyTestManager(t, []string{"a-omitted", "b"}, antigravityPinnedPolicy("b"), 0)
+		result, err := manager.ExecuteStream(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+		if err != nil {
+			t.Fatalf("ExecuteStream error = %v, want credits success", err)
+		}
+		if err := drainStream(t, result); err != nil {
+			t.Fatalf("stream error = %v", err)
+		}
+		if got, want := fmt.Sprint(executor.snapshot()), "[b:plain b:credits]"; got != want {
+			t.Fatalf("calls = %s, want %s", got, want)
+		}
+	})
+}
+
+// The credits fallback is capped by max-retry-credentials instead of sweeping every candidate.
+func TestAntigravityCreditsFallbackStopsAtRetryBudget(t *testing.T) {
+	manager, executor := newCreditsPolicyTestManager(t, []string{"a", "b", "c"}, internalconfig.RoutingPolicy{}, 1)
+	executor.failCredits = true
+	if _, err := manager.Execute(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: "claude-credits-policy"}, cliproxyexecutor.Options{}); err == nil {
+		t.Fatal("Execute error = nil, want the quota error")
+	}
+	credits := 0
+	for _, call := range executor.snapshot() {
+		if strings.HasSuffix(call, ":credits") {
+			credits++
+		}
+	}
+	if credits != 1 {
+		t.Fatalf("credits calls = %d, want 1 under max-retry-credentials 1: %v", credits, executor.snapshot())
 	}
 }

@@ -1281,6 +1281,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 		return nil, nil
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	routing := routingAuthFilterFromContext(ctx)
 	var candidates []creditsCandidateEntry
 	m.mu.RLock()
 	for _, auth := range m.auths {
@@ -1288,6 +1289,9 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 			continue
 		}
 		if pinnedAuthID != "" && auth.ID != pinnedAuthID {
+			continue
+		}
+		if !routing.allows(auth) {
 			continue
 		}
 		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
@@ -1401,9 +1405,13 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 	if errCandidates != nil {
 		return cliproxyexecutor.Response{}, false, errCandidates
 	}
-	for _, c := range candidates {
+	_, maxRetryCredentials, _ := m.retrySettings()
+	for i, c := range candidates {
 		if ctx.Err() != nil {
 			return cliproxyexecutor.Response{}, false, nil
+		}
+		if maxRetryCredentials > 0 && i >= maxRetryCredentials {
+			break
 		}
 		creditsCtx := WithAntigravityCredits(ctx)
 		if rt := m.roundTripperFor(c.auth); rt != nil {
@@ -1465,9 +1473,13 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 	if errCandidates != nil {
 		return nil, false, errCandidates
 	}
-	for _, c := range candidates {
+	_, maxRetryCredentials, _ := m.retrySettings()
+	for i, c := range candidates {
 		if ctx.Err() != nil {
 			return nil, false, nil
+		}
+		if maxRetryCredentials > 0 && i >= maxRetryCredentials {
+			break
 		}
 		creditsCtx := WithAntigravityCredits(ctx)
 		if rt := m.roundTripperFor(c.auth); rt != nil {
