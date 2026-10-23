@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -224,5 +225,46 @@ func TestUnifiedPriorityWithinIncludedPlans(t *testing.T) {
 	routes = m.UnifiedRoutes("cliproxy/unified-test", now)
 	if routes[0].Provider != "unified-paid" || routes[1].Eligible {
 		t.Fatalf("exhaustion ignored: %+v", routes)
+	}
+}
+
+// A report whose source declares an earlier expiry must stop being fresh at that expiry,
+// even inside the ten-minute local window.
+func TestUnifiedQuotaObservationHonorsEarlierExpiry(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	now := time.Now()
+	report := reportUnified(0.5, now.Add(time.Hour))
+	m.ObserveUnifiedQuotaUntil("short", report, now, now.Add(time.Minute))
+	if !m.unifiedQuotaFresh("short", now.Add(30*time.Second)) {
+		t.Fatal("report rejected before its declared expiry")
+	}
+	if m.unifiedQuotaFresh("short", now.Add(2*time.Minute)) {
+		t.Fatal("report outlived its declared expiry")
+	}
+	m.ObserveUnifiedQuota("local", report, now)
+	if !m.unifiedQuotaFresh("local", now.Add(5*time.Minute)) {
+		t.Fatal("report without an expiry rejected inside the freshness window")
+	}
+}
+
+// A service snapshot that covers only some credentials must not stop the native refresh
+// for the rest.
+func TestUnifiedRefreshFetchesCredentialsTheServiceDidNotCover(t *testing.T) {
+	m, _, _, _ := setupUnified(t)
+	now := time.Now()
+	var mu sync.Mutex
+	fetched := map[string]int{}
+	m.SetUnifiedQuotaFetcher(func(_ context.Context, a *Auth) (pluginapi.QuotaFetchResponse, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		fetched[a.ID]++
+		return reportUnified(0.5, now.Add(time.Hour)), nil
+	})
+	m.SetUnifiedAllowanceRefresher(func(context.Context) {
+		m.ObserveUnifiedQuotaUntil("unified-go-auth", reportUnified(0.9, now.Add(time.Hour)), now, now.Add(time.Hour))
+	})
+	m.refreshUnifiedQuotas(context.Background())
+	if fetched["unified-go-auth"] != 0 || fetched["unified-paid-auth"] != 1 {
+		t.Fatalf("fetches=%v; only the uncovered credential should be fetched", fetched)
 	}
 }

@@ -174,7 +174,7 @@ type Manager struct {
 	unifiedQuota              map[string]unifiedQuotaSnapshot
 	unifiedBurn               map[string]*unifiedTokenWindow
 	unifiedQuotaFetcher       func(context.Context, *Auth) (pluginapi.QuotaFetchResponse, error)
-	unifiedAllowanceRefresher func(context.Context) bool
+	unifiedAllowanceRefresher func(context.Context)
 	store                     Store
 	cooldownStore             CooldownStateStore
 	pendingCooldownStateStore CooldownStateStore
