@@ -56,6 +56,9 @@ type FileTokenStore struct {
 	mu      sync.Mutex
 	dirLock sync.RWMutex
 	baseDir string
+
+	// codexIndex maps Codex identities to credential files. Guarded by mu.
+	codexIndex codexIdentityIndex
 }
 
 // NewFileTokenStore creates a token store that saves credentials to disk through the
@@ -98,8 +101,11 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		}
 	}
 
+	// Identity lookup and the write share one lock, so concurrent logins cannot both miss.
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	path = s.redirectCodexDuplicateLocked(auth, path)
 
 	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
@@ -160,6 +166,8 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		}
 	}
 
+	s.indexSavedCodexLocked(auth, path)
+
 	if auth.Attributes == nil {
 		auth.Attributes = make(map[string]string)
 	}
@@ -216,9 +224,12 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("auth filestore: delete failed: %w", err)
 	}
+	s.forgetCodexFileLocked(path)
 	return nil
 }
 
