@@ -101,7 +101,9 @@ func TestConfiguredQuotaCredentialsShareAccountAcrossProtocols(t *testing.T) {
 	}
 }
 
-// fixtureTransport serves sanitized provider responses by URL and records each request.
+// fixtureTransport serves fixture responses by URL and records each request.
+// The fixtures are shaped from the parsers, not captured from providers. Replace them with
+// sanitized live captures before relying on the balances.
 type fixtureTransport struct {
 	t         *testing.T
 	responses map[string]fixtureResponse
