@@ -345,6 +345,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.SanitizeOAuthSettings()
 	// Normalize routing policy fields.
 	cfg.SanitizeRoutingPolicy()
+	if err := cfg.Routing.UnifiedModels.Validate(); err != nil {
+		return nil, err
+	}
 
 	// Normalize global OAuth request-scoped error rules.
 	cfg.SanitizeOAuthRequestScopedErrors()

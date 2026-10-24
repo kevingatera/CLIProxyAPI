@@ -289,6 +289,10 @@ func TestClassifyRoutingFailureUsesStructuredSignals(t *testing.T) {
 		{"quota text without status", context.Background(), errors.New("quota exhausted, cooldown"), ""},
 		{"bare eof text", context.Background(), errors.New("unexpected eof from upstream"), ""},
 		{"402", context.Background(), &Error{HTTPStatus: http.StatusPaymentRequired}, "exhausted"},
+		{"400 structured insufficient_quota", context.Background(), &Error{HTTPStatus: http.StatusBadRequest, Message: `{"error":{"type":"insufficient_quota","code":"insufficient_quota","message":"out of credit"}}`}, "exhausted"},
+		{"400 structured billing limit", context.Background(), &Error{HTTPStatus: http.StatusBadRequest, Message: `{"error":{"code":"billing_hard_limit_reached","message":"limit"}}`}, "exhausted"},
+		{"400 invalid request stays terminal", context.Background(), &Error{HTTPStatus: http.StatusBadRequest, Message: `{"error":{"type":"invalid_request_error","code":"invalid_value","message":"bad field"}}`}, ""},
+		{"400 credit text without code stays terminal", context.Background(), &Error{HTTPStatus: http.StatusBadRequest, Message: "Your credit balance is too low"}, ""},
 		{"model cooldown", context.Background(), newModelCooldownError("m", "p", 0), "exhausted"},
 		{"429", context.Background(), &Error{HTTPStatus: http.StatusTooManyRequests}, "rate_limited"},
 		{"503", context.Background(), &Error{HTTPStatus: http.StatusServiceUnavailable}, "server_error"},
@@ -567,4 +571,16 @@ func TestAntigravityCreditsFallbackSpendsPlainRoundBudget(t *testing.T) {
 			t.Fatalf("calls = %s, want %s", got, want)
 		}
 	})
+}
+
+// A 400 that names an exhausted balance in its structured error must fail over to the next
+// route, while a plain invalid request on the same route stays terminal.
+func TestRoutingPolicyFailsOverOnStructuredCreditExhaustion(t *testing.T) {
+	manager, executor, model := newRoutingPolicyTestManager(t, "credit400", []string{"a", "b"}, pinnedPolicy([]string{"a"}, true))
+	executor.errs[executor.provider+"-a"] = &Error{HTTPStatus: http.StatusBadRequest, Message: `{"error":{"type":"insufficient_quota","code":"insufficient_quota","message":"out of credit"}}`}
+
+	if _, err := manager.Execute(context.Background(), []string{executor.provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err != nil {
+		t.Fatalf("Execute error = %v, want failover success", err)
+	}
+	assertRouteCalls(t, executor, "execute:a", "execute:b")
 }

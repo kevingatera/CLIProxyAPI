@@ -169,6 +169,13 @@ type resultPolicyHolder struct {
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
+	unifiedWake               chan struct{}
+	unifiedMu                 sync.Mutex
+	unifiedQuota              map[string]unifiedQuotaSnapshot
+	unifiedBurn               map[string]*unifiedTokenWindow
+	unifiedFetches            map[string]*unifiedFetchState
+	unifiedQuotaFetcher       func(context.Context, *Auth) (pluginapi.QuotaFetchResponse, error)
+	unifiedAllowanceRefresher func(context.Context)
 	store                     Store
 	cooldownStore             CooldownStateStore
 	pendingCooldownStateStore CooldownStateStore
@@ -247,6 +254,9 @@ type Manager struct {
 
 	// routingTraces keeps recent routing policy traces; it is written only while the policy is enabled.
 	routingTraces routingTraceRing
+
+	// unifiedAllowanceRunning marks an allowance refresh still in flight; guarded by unifiedMu.
+	unifiedAllowanceRunning bool
 }
 
 // NewManager constructs a manager with optional custom selector and hook.

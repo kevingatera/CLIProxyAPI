@@ -429,6 +429,8 @@ type QuotaExceeded struct {
 
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
+	Allowances    AllowancesConfig `yaml:"allowances,omitempty" json:"-"`
+	UnifiedModels UnifiedModels    `yaml:"unified-models,omitempty" json:"unified-models,omitempty"`
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first", "quota-aware".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
@@ -463,6 +465,13 @@ type RoutingConfig struct {
 	//     auth errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
 	// Ignored when SessionAffinity is false.
 	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+}
+
+// AllowancesConfig separates the read-only collector credential from management access.
+type AllowancesConfig struct {
+	CollectorKey string `yaml:"collector-key,omitempty" json:"-"`
+	ServiceURL   string `yaml:"service-url,omitempty" json:"-"`
+	ServiceKey   string `yaml:"service-key,omitempty" json:"-"`
 }
 
 // RoutingPolicy configures explicit model routing order and fallback behavior.
