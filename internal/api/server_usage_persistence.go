@@ -13,6 +13,12 @@ func (s *Server) configureUsagePersistence(oldCfg, newCfg *config.Config) {
 	if s == nil {
 		return
 	}
+	s.usagePersistenceMu.Lock()
+	defer s.usagePersistenceMu.Unlock()
+	if s.usagePersistenceClosed {
+		// Shutdown already flushed and stopped persistence; a late reload must not restart it.
+		return
+	}
 	shouldPersist := newCfg != nil && newCfg.UsageStatisticsEnabled &&
 		(newCfg.UsageStatisticsPersist || strings.TrimSpace(newCfg.UsageStatisticsFile) != "")
 	desiredPath := ""
@@ -34,7 +40,7 @@ func (s *Server) configureUsagePersistence(oldCfg, newCfg *config.Config) {
 	if !needsRestart {
 		return
 	}
-	s.stopUsagePersistence()
+	s.stopUsagePersistenceLocked()
 	if !shouldPersist || desiredPath == "" {
 		return
 	}
@@ -57,10 +63,23 @@ func (s *Server) configureUsagePersistence(oldCfg, newCfg *config.Config) {
 	s.usagePersistence = persistence
 }
 
-// stopUsagePersistence stops periodic flushing and writes a final snapshot.
-// Server shutdown calls this so usage recorded since the last periodic flush is not lost.
-func (s *Server) stopUsagePersistence() {
-	if s == nil || s.usagePersistence == nil {
+// shutdownUsagePersistence stops periodic flushing and writes a final snapshot. Server
+// shutdown calls this so usage recorded since the last periodic flush is not lost. Later
+// reloads are ignored.
+func (s *Server) shutdownUsagePersistence() {
+	if s == nil {
+		return
+	}
+	s.usagePersistenceMu.Lock()
+	defer s.usagePersistenceMu.Unlock()
+	s.usagePersistenceClosed = true
+	s.stopUsagePersistenceLocked()
+}
+
+// stopUsagePersistenceLocked stops the current persistence handle. The caller must hold
+// usagePersistenceMu.
+func (s *Server) stopUsagePersistenceLocked() {
+	if s.usagePersistence == nil {
 		return
 	}
 	s.usagePersistence.Stop()

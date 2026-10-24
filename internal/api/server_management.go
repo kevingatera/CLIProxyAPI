@@ -93,6 +93,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/api-key-labels", s.mgmt.GetAPIKeyLabels)
 		mgmt.PUT("/api-key-labels", s.mgmt.PutAPIKeyLabels)
 		mgmt.GET("/api-key-usage", s.mgmt.GetAPIKeyUsage)
+		// Restored for the management UI; see GetUsageStatistics.
+		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
 		mgmt.GET("/usage-queue", s.mgmt.GetUsageQueue)
 
 		mgmt.GET("/gemini-api-key", s.mgmt.GetGeminiKeys)

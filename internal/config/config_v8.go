@@ -108,6 +108,9 @@ func buildV8Paths() []configPath {
 		{"request-archive", "observability.logs.request-archive"},
 		{"error-logs-max-files", "observability.logs.error-logs-max-files"},
 		{"usage-statistics-enabled", "observability.usage.usage-statistics-enabled"},
+		{"usage-statistics-persist", "observability.usage.usage-statistics-persist"},
+		{"usage-statistics-file", "observability.usage.usage-statistics-file"},
+		{"usage-statistics-save-interval-seconds", "observability.usage.usage-statistics-save-interval-seconds"},
 		{"redis-usage-queue-retention-seconds", "observability.usage.redis-usage-queue-retention-seconds"}, {"pprof", "observability.pprof"},
 	}
 	var out []configPath
