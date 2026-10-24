@@ -69,14 +69,20 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		archive.SetConfig(cfg)
 	}
 	previousRequestLog := false
+	previousArchiveEnabled := false
 	if oldCfg != nil {
 		previousRequestLog = oldCfg.RequestLog
+		previousArchiveEnabled = oldCfg.RequestArchive.Enabled
 	}
-	if s.requestLogger != nil && (oldCfg == nil || previousRequestLog != cfg.RequestLog) {
+	// The archive is enabled by request-log or request-archive. Use that combined
+	// state so the legacy toggle cannot disable an explicitly enabled archive.
+	loggerEnabled := cfg.RequestLog || cfg.RequestArchive.Enabled
+	previousLoggerEnabled := previousRequestLog || previousArchiveEnabled
+	if s.requestLogger != nil && (oldCfg == nil || previousLoggerEnabled != loggerEnabled) {
 		if s.loggerToggle != nil {
-			s.loggerToggle(cfg.RequestLog)
+			s.loggerToggle(loggerEnabled)
 		} else if toggler, ok := s.requestLogger.(interface{ SetEnabled(bool) }); ok {
-			toggler.SetEnabled(cfg.RequestLog)
+			toggler.SetEnabled(loggerEnabled)
 		}
 	}
 
