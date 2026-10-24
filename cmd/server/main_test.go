@@ -25,6 +25,8 @@ func TestArgvEnablesBoolFlag(t *testing.T) {
 		{name: "assigned true", args: []string{"--discover-json=true"}, flag: "discover-json", want: true},
 		{name: "assigned false", args: []string{"--discover-json=false"}, flag: "discover-json", want: false},
 		{name: "does not match timeout", args: []string{"--discover-timeout", "3"}, flag: "discover", want: false},
+		{name: "cursor login bare", args: []string{"--cursor-login"}, flag: "cursor-login", want: true},
+		{name: "cursor login before config", args: []string{"--cursor-login", "--config", "config.yaml"}, flag: "cursor-login", want: true},
 		{name: "bare discover", args: []string{"--discover"}, flag: "discover", want: true},
 		{name: "stops at terminator", args: []string{"--", "--discover-json"}, flag: "discover-json", want: false},
 		{name: "stops at non-flag", args: []string{"foo", "--discover-json"}, flag: "discover-json", want: false},
