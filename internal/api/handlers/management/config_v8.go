@@ -64,6 +64,11 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 					deleteConfigV8Path(server, []string{"credential"})
 				}
 			}
+			if allowances := configV8Node(root, v8AllowancesPath); allowances != nil {
+				for _, name := range v8AllowanceSecrets {
+					deleteConfigV8Path(allowances, []string{name})
+				}
+			}
 			h.injectV8APIKeyAuthIndexesLocked(root, data)
 		}
 		value := configV8Node(root, parts)
@@ -153,6 +158,7 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 	}
 	if !yamlRequest && c.Request.Method != http.MethodDelete {
 		preserveV8TURNSecrets(root, before)
+		preserveV8AllowanceSecrets(root, before)
 	}
 	// Revisions are owned by Home and must not become ordinary editable settings.
 	for _, field := range []string{"credentials/concurrency/lifecycle-config-revision", "credentials/concurrency/observation-barrier-revision", "plugins/auth-revision"} {
@@ -266,6 +272,40 @@ var v8ICEServersPath = []string{"oauth", "providers", "codex", "live-media-relay
 // writes that JSON back, matching by endpoint rather than array position so a
 // changed URL cannot inherit credentials for a different server. Explicit empty
 // strings/null clear a secret; YAML writes retain full replacement semantics.
+var v8AllowancesPath = []string{"routing", "allowances"}
+
+// v8AllowanceSecrets are hidden from JSON reads, so JSON writes that omit them keep the stored values.
+var v8AllowanceSecrets = []string{"collector-key", "service-key", "service-url"}
+
+func preserveV8AllowanceSecrets(root, before *yaml.Node) {
+	previous := configV8Node(before, v8AllowancesPath)
+	if previous == nil || previous.Kind != yaml.MappingNode {
+		return
+	}
+	next := root
+	for _, part := range v8AllowancesPath {
+		if next.Kind != yaml.MappingNode {
+			return
+		}
+		child := configV8Node(next, []string{part})
+		if child == nil {
+			child = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			next.Content = append(next.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: part}, child)
+		}
+		next = child
+	}
+	if next.Kind != yaml.MappingNode {
+		return
+	}
+	for _, name := range v8AllowanceSecrets {
+		if configV8Node(next, []string{name}) == nil {
+			if secret := configV8Node(previous, []string{name}); secret != nil {
+				next.Content = append(next.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: name}, cloneConfigV8Node(secret))
+			}
+		}
+	}
+}
+
 func preserveV8TURNSecrets(root, before *yaml.Node) {
 	next := configV8Node(root, v8ICEServersPath)
 	previous := configV8Node(before, v8ICEServersPath)

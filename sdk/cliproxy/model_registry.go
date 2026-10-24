@@ -2,8 +2,10 @@ package cliproxy
 
 import (
 	"maps"
+	"reflect"
 	"strings"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/diff"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -63,6 +65,15 @@ type modelRegistrationFence struct {
 	disabled                  bool
 	authKind                  string
 	attributes                map[string]string
+	// unifiedModels and subscriptionActive shape unified aliases. A change to either
+	// before publication supersedes the computation, like a changed exclusion.
+	unifiedModels      internalconfig.UnifiedModels
+	subscriptionActive bool
+}
+
+func subscriptionActive(a *coreauth.Auth) bool {
+	active, _ := a.Metadata["is_subs_active"].(bool)
+	return active
 }
 
 func newModelRegistrationFence(a *coreauth.Auth, cfg *config.Config) modelRegistrationFence {
@@ -73,23 +84,29 @@ func newModelRegistrationFence(a *coreauth.Auth, cfg *config.Config) modelRegist
 			exclusions[provider] = diff.SummarizeExcludedModels(rules)
 		}
 	}
+	var unified internalconfig.UnifiedModels
+	if cfg != nil {
+		unified = cfg.Routing.UnifiedModels
+	}
 	if a == nil {
-		return modelRegistrationFence{globalExclusions: exclusions}
+		return modelRegistrationFence{globalExclusions: exclusions, unifiedModels: unified}
 	}
 	provider := strings.ToLower(strings.TrimSpace(a.Provider))
 	if _, _, compat := openAICompatInfoFromAuth(a); compat {
 		provider = "openai-compatibility"
 	}
 	return modelRegistrationFence{
-		globalExclusions:  exclusions,
-		exclusionProvider: provider,
-		registryEpoch:     GlobalModelRegistry().ClientRegistrationEpoch(a.ID),
-		registrationEpoch: a.RegistrationEpoch,
-		prefix:            a.Prefix,
-		provider:          a.Provider,
-		disabled:          a.Disabled || a.Status == coreauth.StatusDisabled,
-		authKind:          a.AuthKind(),
-		attributes:        maps.Clone(a.Attributes),
+		globalExclusions:   exclusions,
+		exclusionProvider:  provider,
+		registryEpoch:      GlobalModelRegistry().ClientRegistrationEpoch(a.ID),
+		registrationEpoch:  a.RegistrationEpoch,
+		prefix:             a.Prefix,
+		provider:           a.Provider,
+		disabled:           a.Disabled || a.Status == coreauth.StatusDisabled,
+		authKind:           a.AuthKind(),
+		attributes:         maps.Clone(a.Attributes),
+		unifiedModels:      unified,
+		subscriptionActive: subscriptionActive(a),
 	}
 }
 
@@ -104,6 +121,7 @@ func (f modelRegistrationFence) withAuth(a *coreauth.Auth) modelRegistrationFenc
 	next.globalExclusions = f.globalExclusions
 	next.fallbackExclusionProvider = f.fallbackExclusionProvider
 	next.registryEpoch = f.registryEpoch
+	next.unifiedModels = f.unifiedModels
 	return next
 }
 
@@ -121,9 +139,27 @@ func (f modelRegistrationFence) publishUnregister(s *Service, authID string) boo
 
 func (f modelRegistrationFence) publishIfCurrent(s *Service, authID string, publish func() bool) bool {
 	publishWithConfig := func() bool {
-		if s != nil && !f.disabled && f.authKind != coreauth.AuthKindAPIKey && strings.TrimSpace(f.attributes["excluded_models"]) == "" {
-			s.cfgMu.RLock()
-			defer s.cfgMu.RUnlock()
+		if s == nil {
+			return publish()
+		}
+		// Read the subscription flag before cfgMu so the manager lock is never taken inside it.
+		subscriptionNow := f.subscriptionActive
+		if s.coreManager != nil {
+			if current, ok := s.coreManager.GetByID(authID); ok && current != nil {
+				subscriptionNow = subscriptionActive(current)
+			}
+		}
+		s.cfgMu.RLock()
+		defer s.cfgMu.RUnlock()
+		// Hold cfgMu through publication so a config commit cannot slip in between the check and the write.
+		var currentUnified internalconfig.UnifiedModels
+		if s.cfg != nil {
+			currentUnified = s.cfg.Routing.UnifiedModels
+		}
+		if !reflect.DeepEqual(currentUnified, f.unifiedModels) || subscriptionNow != f.subscriptionActive {
+			return false
+		}
+		if !f.disabled && f.authKind != coreauth.AuthKindAPIKey && strings.TrimSpace(f.attributes["excluded_models"]) == "" {
 			// Match the watcher's normalization so no-op and unrelated reloads do not
 			// discard work. A real change always schedules a replacement: the watcher
 			// redispatches affected auths, and applyConfigRuntime re-registers every
@@ -137,7 +173,6 @@ func (f modelRegistrationFence) publishIfCurrent(s *Service, authID string, publ
 					return false
 				}
 			}
-			// Hold cfgMu through registry publication, not just the comparison.
 		}
 		return publish()
 	}
