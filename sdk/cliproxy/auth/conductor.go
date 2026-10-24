@@ -287,6 +287,9 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		manager.ApplyHomeInFlightPublisherConfig(defaultInFlightConfig)
 	}
 	manager.scheduler = newAuthScheduler(selector)
+	if quota := quotaSelectorOf(selector); quota != nil {
+		quota.setObserver(manager.observeQuotaProbe)
+	}
 	return manager
 }
 

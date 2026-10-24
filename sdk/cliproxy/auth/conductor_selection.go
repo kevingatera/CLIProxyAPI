@@ -440,6 +440,9 @@ func (m *Manager) SetSelector(selector Selector) {
 		return
 	}
 	m.selector = selector
+	if quota := quotaSelectorOf(selector); quota != nil {
+		quota.setObserver(m.observeQuotaProbe)
+	}
 	m.mu.Unlock()
 
 	if oldSelector != nil {
