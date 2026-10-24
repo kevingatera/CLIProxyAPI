@@ -42,3 +42,51 @@ func TestReloadKeepsExplicitlyEnabledArchiveWhenRequestLogTurnsOff(t *testing.T)
 		t.Fatal("reload with request-log off disabled an explicitly enabled request archive")
 	}
 }
+
+// TestReloadEnablingArchiveKeepsLegacyLoggerDisabled guards the opposite
+// transition: enabling request-archive on a server that started with it off must
+// not switch on the legacy file logger through the combined archive state.
+// Archive mode itself only starts on the restart documented in
+// docs/request-archive.md.
+func TestReloadEnablingArchiveKeepsLegacyLoggerDisabled(t *testing.T) {
+	cfg := &config.Config{}
+	server := newTestServerWithConfig(t, cfg)
+
+	legacy, ok := server.requestLogger.(*logging.FileRequestLogger)
+	if !ok {
+		t.Fatalf("request logger = %T, want *logging.FileRequestLogger", server.requestLogger)
+	}
+	if legacy.IsEnabled() {
+		t.Fatal("legacy request logger should start disabled")
+	}
+
+	// Old runtime state: archive off and request-log off.
+	oldCfg := *cfg
+	server.oldConfigYaml, _ = yaml.Marshal(&oldCfg)
+
+	// Reload with the archive enabled while request-log stays off.
+	newCfg := oldCfg
+	newCfg.RequestArchive = config.RequestArchiveConfig{Enabled: true, Directory: t.TempDir()}
+
+	if okUpdate := server.UpdateClientsContext(context.Background(), &newCfg); !okUpdate {
+		t.Fatal("UpdateClientsContext returned false")
+	}
+	if legacy.IsEnabled() {
+		t.Fatal("enabling the request archive switched on the legacy file logger")
+	}
+
+	// The archive intent survives the reload so a restart enters archive mode.
+	server.cfgMu.RLock()
+	active := server.cfg
+	server.cfgMu.RUnlock()
+	if active == nil || !active.RequestArchive.Enabled {
+		t.Fatal("reload dropped the enabled request archive")
+	}
+	restarted, ok := defaultRequestLoggerFactory(active, "config.yaml").(*logging.RequestArchive)
+	if !ok {
+		t.Fatal("restarted request logger is not an archive")
+	}
+	if !restarted.IsEnabled() {
+		t.Fatal("restart with the reloaded config did not enable the request archive")
+	}
+}
