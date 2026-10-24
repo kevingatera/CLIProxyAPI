@@ -55,6 +55,8 @@ type QuotaAwareSelector struct {
 	fetch func(context.Context, codexUsageCredential, time.Time) (*codexUsageSnapshot, error)
 	// manualRefresh keeps Pick from starting the background loop (tests drive refreshDue).
 	manualRefresh bool
+	// hostProxyURL is the global proxy-url, used by probes when an auth has no override.
+	hostProxyURL string
 
 	mu       sync.Mutex
 	entries  map[string]*quotaEntry
@@ -107,11 +109,18 @@ const (
 
 // NewQuotaAwareSelector returns a selector that probes Codex usage in the background.
 func NewQuotaAwareSelector() *QuotaAwareSelector {
+	return NewQuotaAwareSelectorWithProxy("")
+}
+
+// NewQuotaAwareSelectorWithProxy sets the global proxy-url that probes use when an auth
+// has no proxy override. Changing it requires a new selector.
+func NewQuotaAwareSelectorWithProxy(hostProxyURL string) *QuotaAwareSelector {
 	return &QuotaAwareSelector{
-		now:     time.Now,
-		fetch:   fetchCodexUsage,
-		entries: make(map[string]*quotaEntry),
-		wake:    make(chan struct{}, 1),
+		now:          time.Now,
+		fetch:        fetchCodexUsage,
+		entries:      make(map[string]*quotaEntry),
+		wake:         make(chan struct{}, 1),
+		hostProxyURL: strings.TrimSpace(hostProxyURL),
 	}
 }
 
@@ -224,7 +233,7 @@ func (s *QuotaAwareSelector) trackLocked(a *Auth, now time.Time) *quotaEntry {
 		entry = &quotaEntry{}
 		s.entries[a.ID] = entry
 	}
-	entry.cred = codexCredentialOf(a)
+	entry.cred = codexCredentialOf(a, s.hostProxyURL)
 	entry.lastSeen = now
 	return entry
 }
@@ -356,21 +365,25 @@ func (s *QuotaAwareSelector) record(id string, snapshot *codexUsageSnapshot, err
 
 // classifyCodexSnapshot maps a fresh snapshot (or nil) to a selection state.
 // A higher score means the credential can afford to spend quota faster.
+// Each window expires on its own: a passed reset makes that window's usage
+// obsolete, but a live window that is still exhausted keeps the credential out.
 func classifyCodexSnapshot(snapshot *codexUsageSnapshot, now time.Time) (quotaState, float64, time.Time) {
 	if snapshot == nil {
 		return quotaUnknown, 0, time.Time{}
 	}
-	windows := []codexUsageWindow{snapshot.primaryWindow, snapshot.secondaryWindow}
-	for _, w := range windows {
-		// A passed reset makes the reported usage obsolete until the next probe.
+	var live []codexUsageWindow
+	expired := false
+	for _, w := range []codexUsageWindow{snapshot.primaryWindow, snapshot.secondaryWindow} {
 		if !w.resetAt.IsZero() && !w.resetAt.After(now) {
-			return quotaUnknown, 0, time.Time{}
+			expired = true
+			continue
 		}
+		live = append(live, w)
 	}
 	var next time.Time
 	exhausted := !snapshot.allowed || snapshot.limitReached
 	score := math.Inf(1)
-	for _, w := range windows {
+	for _, w := range live {
 		if !w.hasUsedPercent || w.resetAt.IsZero() {
 			continue
 		}
@@ -392,7 +405,8 @@ func classifyCodexSnapshot(snapshot *codexUsageSnapshot, now time.Time) (quotaSt
 	}
 	if exhausted {
 		if next.IsZero() {
-			for _, w := range windows {
+			// The snapshot-level flag names no window, so report the nearest live reset.
+			for _, w := range live {
 				if !w.resetAt.IsZero() && (next.IsZero() || w.resetAt.Before(next)) {
 					next = w.resetAt
 				}
@@ -400,14 +414,18 @@ func classifyCodexSnapshot(snapshot *codexUsageSnapshot, now time.Time) (quotaSt
 		}
 		return quotaExhausted, 0, next
 	}
-	if math.IsInf(score, 1) {
+	// An expired window's usage is unknown until the next probe.
+	if expired || math.IsInf(score, 1) {
 		return quotaUnknown, 0, time.Time{}
 	}
 	return quotaKnown, score, time.Time{}
 }
 
-func codexCredentialOf(a *Auth) codexUsageCredential {
+func codexCredentialOf(a *Auth, hostProxyURL string) codexUsageCredential {
 	cred := codexUsageCredential{proxyURL: strings.TrimSpace(a.ProxyURL)}
+	if cred.proxyURL == "" {
+		cred.proxyURL = hostProxyURL
+	}
 	if a.Attributes != nil {
 		cred.token = strings.TrimSpace(a.Attributes["api_key"])
 	}
