@@ -34,10 +34,7 @@ func (s *Server) configureUsagePersistence(oldCfg, newCfg *config.Config) {
 	if !needsRestart {
 		return
 	}
-	if s.usagePersistence != nil {
-		s.usagePersistence.Stop()
-		s.usagePersistence = nil
-	}
+	s.stopUsagePersistence()
 	if !shouldPersist || desiredPath == "" {
 		return
 	}
@@ -58,4 +55,14 @@ func (s *Server) configureUsagePersistence(oldCfg, newCfg *config.Config) {
 	}
 	persistence.Start()
 	s.usagePersistence = persistence
+}
+
+// stopUsagePersistence stops periodic flushing and writes a final snapshot.
+// Server shutdown calls this so usage recorded since the last periodic flush is not lost.
+func (s *Server) stopUsagePersistence() {
+	if s == nil || s.usagePersistence == nil {
+		return
+	}
+	s.usagePersistence.Stop()
+	s.usagePersistence = nil
 }
