@@ -1,1 +1,10 @@
-{"org":{"id":"org-redacted","name":"redacted"},"user":{"email":"redacted@example.com"}}
+{
+  "success": true,
+  "user": {
+    "id": "[REDACTED_ID]",
+    "name": "[REDACTED_ID]",
+    "email": "[REDACTED_ID]",
+    "userName": "[REDACTED_ID]"
+  },
+  "org": null
+}
