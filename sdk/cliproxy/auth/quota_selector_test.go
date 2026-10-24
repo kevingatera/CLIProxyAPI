@@ -338,3 +338,56 @@ func TestParseCodexUsageUsesGivenClock(t *testing.T) {
 		t.Fatal("want an error for a non-object payload")
 	}
 }
+
+// A passed primary reset must not hide a live exhausted secondary window.
+func TestQuotaAwareLiveExhaustionSurvivesPassedReset(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	s := newQuotaTestSelector(clock, nil)
+	now := clock.Now()
+	snapshot := &codexUsageSnapshot{
+		allowed:         true,
+		primaryWindow:   codexUsageWindow{usedPercent: 50, hasUsedPercent: true, resetAt: now.Add(time.Minute)},
+		secondaryWindow: codexUsageWindow{usedPercent: 100, hasUsedPercent: true, resetAt: now.Add(time.Hour)},
+	}
+	seedQuota(s, "a", snapshot, now)
+	clock.Advance(2 * time.Minute)
+
+	if picked, err := s.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, quotaTestAuths("a")); err == nil {
+		t.Fatalf("Pick() = %v; a weekly window at 100%% must stay exhausted after the primary reset passed", picked.ID)
+	}
+}
+
+// Probes must use the host proxy-url when the auth has no proxy override, as
+// the executors do, and an auth override must still win.
+func TestQuotaAwareProbesUseHostProxyWithoutAuthOverride(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	probed := make(chan codexUsageCredential, 2)
+	s := newQuotaTestSelector(clock, func(_ context.Context, cred codexUsageCredential, _ time.Time) (*codexUsageSnapshot, error) {
+		probed <- cred
+		return nil, errors.New("probe skipped")
+	})
+	s.hostProxyURL = "http://host-proxy.example:3128"
+	override := quotaTestAuths("b")[0]
+	override.ProxyURL = "http://auth-proxy.example:8080"
+	auths := append(quotaTestAuths("a"), override)
+	if _, err := s.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, auths); err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	s.refreshDue(context.Background())
+
+	got := map[string]string{}
+	for range auths {
+		select {
+		case cred := <-probed:
+			got[cred.accountID] = cred.proxyURL
+		case <-time.After(10 * time.Second):
+			t.Fatal("probe did not start")
+		}
+	}
+	if got["acct-a"] != "http://host-proxy.example:3128" {
+		t.Fatalf("auth without override probed via %q, want host proxy", got["acct-a"])
+	}
+	if got["acct-b"] != "http://auth-proxy.example:8080" {
+		t.Fatalf("auth with override probed via %q, want its own proxy", got["acct-b"])
+	}
+}
