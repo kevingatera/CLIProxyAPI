@@ -325,6 +325,8 @@ func TestUnifiedRefreshNotBlockedByStalledAllowanceService(t *testing.T) {
 	if !got["unified-go-auth"] || !got["unified-paid-auth"] {
 		t.Fatalf("native fetches = %v, want both credentials", got)
 	}
+	// The refresher runs in its own goroutine, so a fetch landing does not mean it has started yet.
+	waitUnifiedCondition(t, "allowance refresh call", func() bool { return refreshCalls.Load() > 0 })
 	if got := refreshCalls.Load(); got != 1 {
 		t.Fatalf("allowance refresh calls = %d, want 1 while the first call is stalled", got)
 	}
