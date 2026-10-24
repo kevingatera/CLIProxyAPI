@@ -1,1 +1,30 @@
-{"usages":{"limit_5h":{"used_ratio":0.25,"reset_time":"2026-10-12T05:00:00Z"},"limit_7d":{"used_ratio":0.5,"reset_time":"2026-10-15T00:00:00Z"}},"user":{"id":"user-redacted"}}
+{
+  "usage": {
+    "limit": "100",
+    "remaining": "100",
+    "resetTime": "2026-10-30T13:15:15.421249Z"
+  },
+  "limits": [
+    {
+      "window": {
+        "duration": 300,
+        "timeUnit": "TIME_UNIT_MINUTE"
+      },
+      "detail": {
+        "limit": "100",
+        "remaining": "100",
+        "resetTime": "2026-10-24T03:15:15.421249Z"
+      }
+    }
+  ],
+  "usages": {
+    "limit_5h": {
+      "used_ratio": 0,
+      "reset_time": "2026-10-24T03:15:14Z"
+    },
+    "limit_7d": {
+      "used_ratio": 0,
+      "reset_time": "2026-10-30T13:15:14Z"
+    }
+  }
+}
