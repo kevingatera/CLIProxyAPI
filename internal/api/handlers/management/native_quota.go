@@ -154,6 +154,11 @@ func (h *Handler) observeNativeQuota(a *coreauth.Auth, report pluginapi.QuotaFet
 // unifiedQuotaFetch adapts the built-in adapters to the routing refresh. An unsupported account is an
 // error here, so it never becomes an empty report.
 func (h *Handler) unifiedQuotaFetch(ctx context.Context, a *coreauth.Auth) (pluginapi.QuotaFetchResponse, error) {
+	// Shared plugin dispatch goes first, as in the management quota endpoint, so plugin-only
+	// credentials refresh even when no built-in adapter matches.
+	if report, handled, err := h.fetchPluginQuota(ctx, a, "", ""); handled || err != nil {
+		return report, err
+	}
 	report, handled, err := h.fetchNativeQuota(ctx, a)
 	if err == nil && !handled {
 		return report, errors.New(nativeQuotaUnsupported)

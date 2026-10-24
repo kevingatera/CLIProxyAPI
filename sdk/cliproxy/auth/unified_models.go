@@ -141,7 +141,7 @@ func (m *Manager) refreshUnifiedQuotas(ctx context.Context) {
 	refresh := m.unifiedAllowanceRefresher
 	m.unifiedMu.Unlock()
 	if refresh != nil {
-		refresh(ctx)
+		m.startUnifiedAllowanceRefresh(ctx, refresh)
 	}
 	if fetch == nil {
 		return
@@ -179,6 +179,26 @@ func (m *Manager) refreshUnifiedQuotas(ctx context.Context) {
 		case <-ch:
 		}
 	}
+}
+
+// startUnifiedAllowanceRefresh runs the allowance read beside native fetches, so a stalled
+// service cannot delay them. A call still in flight is not repeated, which bounds the goroutines.
+func (m *Manager) startUnifiedAllowanceRefresh(ctx context.Context, refresh func(context.Context)) {
+	m.unifiedMu.Lock()
+	if m.unifiedAllowanceRunning {
+		m.unifiedMu.Unlock()
+		return
+	}
+	m.unifiedAllowanceRunning = true
+	m.unifiedMu.Unlock()
+	go func() {
+		defer func() {
+			m.unifiedMu.Lock()
+			m.unifiedAllowanceRunning = false
+			m.unifiedMu.Unlock()
+		}()
+		refresh(ctx)
+	}()
 }
 
 func (m *Manager) unifiedQuotaFresh(authID string, now time.Time) bool {

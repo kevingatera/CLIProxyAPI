@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -260,11 +261,69 @@ func TestUnifiedRefreshFetchesCredentialsTheServiceDidNotCover(t *testing.T) {
 		fetched[a.ID]++
 		return reportUnified(0.5, now.Add(time.Hour)), nil
 	})
+	covered := make(chan struct{}, 1)
 	m.SetUnifiedAllowanceRefresher(func(context.Context) {
 		m.ObserveUnifiedQuotaUntil("unified-go-auth", reportUnified(0.9, now.Add(time.Hour)), now, now.Add(time.Hour))
+		select {
+		case covered <- struct{}{}:
+		default:
+		}
 	})
 	m.refreshUnifiedQuotas(context.Background())
-	if fetched["unified-go-auth"] != 0 || fetched["unified-paid-auth"] != 1 {
-		t.Fatalf("fetches=%v; only the uncovered credential should be fetched", fetched)
+	mu.Lock()
+	uncovered := fetched["unified-paid-auth"]
+	mu.Unlock()
+	if uncovered != 1 {
+		t.Fatalf("paid fetches=%d; the uncovered credential should be fetched once", uncovered)
+	}
+	// The allowance read runs beside native fetches, so wait for it before judging coverage.
+	<-covered
+	mu.Lock()
+	fetched = map[string]int{}
+	mu.Unlock()
+	m.refreshUnifiedQuotas(context.Background())
+	mu.Lock()
+	defer mu.Unlock()
+	if len(fetched) != 0 {
+		t.Fatalf("fetches=%v after coverage; both credentials are fresh and should not be fetched", fetched)
+	}
+}
+
+// A stalled allowance service must not hold back native quota fetches, and a second cycle
+// must not start another service call while the first is still blocked.
+func TestUnifiedRefreshNotBlockedByStalledAllowanceService(t *testing.T) {
+	m, _, _, _ := setupUnified(t)
+	now := time.Now()
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var refreshCalls atomic.Int32
+	m.SetUnifiedAllowanceRefresher(func(context.Context) {
+		refreshCalls.Add(1)
+		<-release
+	})
+	fetched := make(chan string, 4)
+	m.SetUnifiedQuotaFetcher(func(_ context.Context, a *Auth) (pluginapi.QuotaFetchResponse, error) {
+		fetched <- a.ID
+		return reportUnified(0.5, now.Add(time.Hour)), nil
+	})
+
+	done := make(chan struct{})
+	go func() {
+		m.refreshUnifiedQuotas(context.Background())
+		m.refreshUnifiedQuotas(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("refresh cycle blocked on the allowance service")
+	}
+	// The service never answers, so both credentials are uncovered and fetched natively.
+	got := map[string]bool{<-fetched: true, <-fetched: true}
+	if !got["unified-go-auth"] || !got["unified-paid-auth"] {
+		t.Fatalf("native fetches = %v, want both credentials", got)
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("allowance refresh calls = %d, want 1 while the first call is stalled", got)
 	}
 }

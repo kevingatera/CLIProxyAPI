@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -276,6 +277,9 @@ func classifyRoutingFailure(ctx context.Context, err error) string {
 	}
 	if ctx != nil && ctx.Err() != nil {
 		return ""
+	}
+	if clienterror.IsCreditExhaustedBody(statusCodeFromError(err), err) {
+		return internalconfig.RoutingFallbackExhausted
 	}
 	if errors.Is(err, context.Canceled) || isRequestInvalidError(err) || isRequestStopError(err) || isRequestTerminatedError(err) {
 		return ""
