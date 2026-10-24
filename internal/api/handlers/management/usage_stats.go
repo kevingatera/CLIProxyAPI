@@ -2,6 +2,7 @@ package management
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -65,7 +66,15 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported version"})
 		return
 	}
-	result := h.usageStats.MergeSnapshot(payload.Usage)
+	result, errMerge := h.usageStats.MergeSnapshot(payload.Usage)
+	if errMerge != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(errMerge, usage.ErrOverlappingSnapshot) {
+			status = http.StatusConflict
+		}
+		c.JSON(status, gin.H{"error": errMerge.Error()})
+		return
+	}
 	snapshot := h.usageStats.Snapshot()
 	c.JSON(http.StatusOK, gin.H{
 		"added":           result.Added,
