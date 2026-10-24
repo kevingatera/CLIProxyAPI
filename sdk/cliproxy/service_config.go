@@ -60,6 +60,8 @@ type routingRuntimeState struct {
 	sessionAffinityTTL       time.Duration
 	sessionAffinitySubagents bool
 	sessionAffinityRebindOn  string
+	// hostProxyURL is the global proxy-url; a change rebuilds the selector so probes follow it.
+	hostProxyURL string
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
@@ -72,12 +74,15 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	if cfg == nil {
 		return state
 	}
+	state.hostProxyURL = strings.TrimSpace(cfg.ProxyURL)
 
 	switch strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy)) {
 	case "weighted-round-robin", "weightedroundrobin", "wrr":
 		state.strategy = "weighted-round-robin"
 	case "fill-first", "fillfirst", "ff":
 		state.strategy = "fill-first"
+	case "quota-aware", "quotaaware", "quota", "qa":
+		state.strategy = "quota-aware"
 	}
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
@@ -104,6 +109,8 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 		selector = &coreauth.WeightedRoundRobinSelector{}
 	case "fill-first":
 		selector = &coreauth.FillFirstSelector{}
+	case "quota-aware":
+		selector = coreauth.NewQuotaAwareSelectorWithProxy(state.hostProxyURL)
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}
