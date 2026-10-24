@@ -110,7 +110,11 @@ type Server struct {
 	exampleAPIKeySafeModeEnabled bool
 	exampleAPIKeySafeModeActive  atomic.Bool
 
-	usagePersistence *usage.Persistence
+	// usagePersistenceMu guards usagePersistence and usagePersistenceClosed. Config
+	// reloads and server shutdown both replace the persistence handle.
+	usagePersistenceMu     sync.Mutex
+	usagePersistenceClosed bool
+	usagePersistence       *usage.Persistence
 }
 
 // NewServer creates and initializes a new API server instance.
@@ -462,7 +466,7 @@ func (s *Server) Stop(ctx context.Context) error {
 		s.codexLiveHandler.Close()
 	}
 	// Flush usage recorded since the last periodic write before returning.
-	s.stopUsagePersistence()
+	s.shutdownUsagePersistence()
 	if errCloseServer != nil {
 		return fmt.Errorf("failed to shutdown HTTP server: %v", errCloseServer)
 	}
