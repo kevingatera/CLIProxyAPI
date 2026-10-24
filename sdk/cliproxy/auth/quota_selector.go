@@ -146,7 +146,9 @@ func (s *QuotaAwareSelector) clock() time.Time {
 
 // Pick selects a Codex credential from passive observations only.
 func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	if provider != "codex" {
+	// The Manager selects with "mixed" for every Execute, so Codex candidates
+	// must be ranked on that path too.
+	if provider != "codex" && provider != "mixed" {
 		return s.rr.Pick(ctx, provider, model, opts, auths)
 	}
 	now := s.clock()
@@ -169,6 +171,12 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 
 	s.mu.Lock()
 	for _, a := range available {
+		if !isCodexQuotaAuth(a) {
+			// Non-Codex credentials in a mixed pool have no quota to rank. They are
+			// unknown, so they share the shortlist with the best known Codex ones.
+			unknown = append(unknown, a)
+			continue
+		}
 		entry := s.trackLocked(a, now)
 		if entry != nil {
 			entry.needsProbe = !observedWithin(a.Quota, now, quotaRefreshInterval)
@@ -221,6 +229,10 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 		ctx = context.Background()
 	}
 	return s.rr.Pick(context.WithValue(ctx, prevalidatedAuthCandidatesKey{}, true), provider, model, opts, shortlist)
+}
+
+func isCodexQuotaAuth(a *Auth) bool {
+	return a != nil && strings.EqualFold(strings.TrimSpace(executorKeyFromAuth(a)), "codex")
 }
 
 // observedWithin reports whether a passive observation is younger than d.
@@ -466,7 +478,7 @@ func classifyCodexSnapshot(snapshot *codexUsageSnapshot, now time.Time) (quotaSt
 		live = append(live, w)
 	}
 	var next time.Time
-	exhausted := !snapshot.allowed || snapshot.limitReached
+	windowExhausted := false
 	score := math.Inf(1)
 	for _, w := range live {
 		if !w.hasUsedPercent || w.resetAt.IsZero() {
@@ -474,7 +486,7 @@ func classifyCodexSnapshot(snapshot *codexUsageSnapshot, now time.Time) (quotaSt
 		}
 		remaining := min(max(1-w.usedPercent/100, 0), 1)
 		if remaining <= 0 {
-			exhausted = true
+			windowExhausted = true
 			if next.IsZero() || w.resetAt.Before(next) {
 				next = w.resetAt
 			}
@@ -488,7 +500,14 @@ func classifyCodexSnapshot(snapshot *codexUsageSnapshot, now time.Time) (quotaSt
 		}
 		score = math.Min(score, rate)
 	}
-	if exhausted {
+	// The snapshot-level flags name no window. Once a window has reset, the flags
+	// most likely belong to it, so they expire with it. A live exhausted window
+	// still keeps the credential out.
+	flagged := !snapshot.allowed || snapshot.limitReached
+	if expired && !windowExhausted {
+		flagged = false
+	}
+	if windowExhausted || flagged {
 		if next.IsZero() {
 			// The snapshot-level flag names no window, so report the nearest live reset.
 			for _, w := range live {
