@@ -119,7 +119,7 @@ func preferredExecutionAttemptError(fallback, upstream error) error {
 
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
-func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ cliproxyexecutor.Response, err error) {
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	normalized := m.normalizeProviders(providers)
@@ -130,16 +130,25 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		resp, errHome := m.executeHome(ctx, normalized, req, opts, false)
 		return resp, unwrapExecutionBoundaryError(errHome)
 	}
+	plan := m.routingPlanFor("execute", normalized, req.Model, opts)
+	if plan != nil {
+		ctx = plan.context(ctx)
+		defer func() { plan.finish(err) }()
+	}
 
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
 
 	var lastErr error
 	var preferredUpstreamErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
+	var lastRoundAttempted map[string]struct{}
 	for attempt := 0; ; attempt++ {
 		roundAttempted := make(map[string]struct{})
+		lastRoundAttempted = roundAttempted
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
-		resp, errExec := m.executeMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry)
+		resp, errExec := runRoutingRound(ctx, plan, normalized, roundOpts, maxRetryCredentials, roundAttempted, func(stepCtx context.Context, stepProviders []string, stepOpts cliproxyexecutor.Options, stepMaxCredentials int) (cliproxyexecutor.Response, error) {
+			return m.executeMixedOnce(stepCtx, stepProviders, req, stepOpts, stepMaxCredentials, attempt, defaultRequestRetry)
+		})
 		if errExec == nil {
 			return resp, nil
 		}
@@ -150,7 +159,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 			preferredUpstreamErr = errExec
 		}
 		lastErr = errExec
-		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errExec, attempt, normalized, retryModel, maxWait, -1, defaultRequestRetry, roundAttempted)
+		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errExec, attempt, plan.retryProviders(normalized), retryModel, maxWait, -1, defaultRequestRetry, roundAttempted)
 		if !shouldRetry {
 			break
 		}
@@ -166,8 +175,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		}
 		lastErr = preferredExecutionAttemptError(lastErr, preferredUpstreamErr)
 		lastErr = unwrapExecutionBoundaryError(lastErr)
-		if hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
-			if resp, ok, errCredits := m.tryAntigravityCreditsExecute(ctx, req, opts); errCredits != nil {
+		creditsProviders := plan.retryProviders(normalized)
+		if hasAntigravityProvider(creditsProviders) && shouldAttemptAntigravityCreditsFallback(m, lastErr, creditsProviders) {
+			if resp, ok, errCredits := m.tryAntigravityCreditsExecute(ctx, req, opts, lastRoundAttempted); errCredits != nil {
 				return cliproxyexecutor.Response{}, errCredits
 			} else if ok {
 				return resp, nil
@@ -179,7 +189,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 }
 
 // It supports multiple providers for the same model and round-robins the starting provider per model.
-func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ cliproxyexecutor.Response, err error) {
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	normalized := m.normalizeProviders(providers)
@@ -190,6 +200,11 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		resp, errHome := m.executeHome(ctx, normalized, req, opts, true)
 		return resp, unwrapExecutionBoundaryError(errHome)
 	}
+	plan := m.routingPlanFor("count_tokens", normalized, req.Model, opts)
+	if plan != nil {
+		ctx = plan.context(ctx)
+		defer func() { plan.finish(err) }()
+	}
 
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
 
@@ -199,7 +214,9 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	for attempt := 0; ; attempt++ {
 		roundAttempted := make(map[string]struct{})
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
-		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry)
+		resp, errExec := runRoutingRound(ctx, plan, normalized, roundOpts, maxRetryCredentials, roundAttempted, func(stepCtx context.Context, stepProviders []string, stepOpts cliproxyexecutor.Options, stepMaxCredentials int) (cliproxyexecutor.Response, error) {
+			return m.executeCountMixedOnce(stepCtx, stepProviders, req, stepOpts, stepMaxCredentials, attempt, defaultRequestRetry)
+		})
 		if errExec == nil {
 			return resp, nil
 		}
@@ -210,7 +227,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 			preferredUpstreamErr = errExec
 		}
 		lastErr = errExec
-		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errExec, attempt, normalized, retryModel, maxWait, -1, defaultRequestRetry, roundAttempted)
+		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errExec, attempt, plan.retryProviders(normalized), retryModel, maxWait, -1, defaultRequestRetry, roundAttempted)
 		if !shouldRetry {
 			break
 		}
@@ -235,12 +252,22 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
+	normalized := m.normalizeProviders(providers)
+	plan := m.routingPlanFor("stream", normalized, req.Model, opts)
+	if plan == nil {
+		return m.executeStream(ctx, normalized, req, opts, nil)
+	}
+	ctx = plan.context(ctx)
+	result, errStream := m.executeStream(ctx, normalized, req, opts, plan)
+	return plan.finishStream(ctx, result, errStream), errStream
+}
+
+func (m *Manager) executeStream(ctx context.Context, normalized []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, plan *routingPlan) (*cliproxyexecutor.StreamResult, error) {
 	if m.HomeEnabled() {
 		if unlockSession := m.lockHomeWebsocketSession(ctx, opts); unlockSession != nil {
 			defer unlockSession()
 		}
 	}
-	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -254,10 +281,14 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	attempt := 0
 	retryRoundPending := false
 	retryRoundWaited := false
+	var lastRoundAttempted map[string]struct{}
 	for {
 		roundAttempted := make(map[string]struct{})
+		lastRoundAttempted = roundAttempted
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
-		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, &homeRetryLimit, attempt, defaultRequestRetry)
+		result, errStream := runRoutingRound(ctx, plan, normalized, roundOpts, maxRetryCredentials, roundAttempted, func(stepCtx context.Context, stepProviders []string, stepOpts cliproxyexecutor.Options, stepMaxCredentials int) (*cliproxyexecutor.StreamResult, error) {
+			return m.executeStreamMixedOnce(stepCtx, stepProviders, req, stepOpts, stepMaxCredentials, &homeRetryLimit, attempt, defaultRequestRetry)
+		})
 		if errStream == nil {
 			return result, nil
 		}
@@ -282,7 +313,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 			return nil, unwrapExecutionBoundaryError(errStream)
 		}
 		lastErr = errStream
-		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errStream, attempt, normalized, retryModel, maxWait, homeRetryLimit, defaultRequestRetry, roundAttempted)
+		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errStream, attempt, plan.retryProviders(normalized), retryModel, maxWait, homeRetryLimit, defaultRequestRetry, roundAttempted)
 		if !shouldRetry {
 			break
 		}
@@ -303,8 +334,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 			lastErr = preferredExecutionAttemptError(lastErr, preferredUpstreamErr)
 		}
 		lastErr = unwrapExecutionBoundaryError(lastErr)
-		if hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
-			if result, ok, errCredits := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); errCredits != nil {
+		creditsProviders := plan.retryProviders(normalized)
+		if hasAntigravityProvider(creditsProviders) && shouldAttemptAntigravityCreditsFallback(m, lastErr, creditsProviders) {
+			if result, ok, errCredits := m.tryAntigravityCreditsExecuteStream(ctx, req, opts, lastRoundAttempted); errCredits != nil {
 				return nil, errCredits
 			} else if ok {
 				return result, nil

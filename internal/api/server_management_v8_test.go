@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 func TestManagementV8RoutesShareAccessControl(t *testing.T) {
@@ -216,5 +217,38 @@ func TestManagementV8PluginOperationMigratesConfiguration(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("missing configuration reload")
+	}
+}
+
+func TestManagementV8RoutingTracesRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("port: 8317\nremote-management: {secret-key: test-password}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := management.NewHandler(cfg, path, nil)
+	h.SetLocalPassword("test-password")
+	h.SetAuthManager(coreauth.NewManager(nil, nil, nil))
+	s := &Server{cfg: cfg, engine: gin.New(), mgmt: h}
+	s.managementRoutesEnabled.Store(true)
+	s.registerManagementRoutes()
+	for route, want := range map[string]int{
+		"/v8/management/routing/traces":          http.StatusOK,
+		"/v8/management/routing/traces?limit=0":  http.StatusBadRequest,
+		"/v8/management/routing/traces?failed=x": http.StatusBadRequest,
+		"/v0/management/routing/traces":          http.StatusNotFound,
+	} {
+		req := httptest.NewRequest(http.MethodGet, route, nil)
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Header.Set("Authorization", "Bearer test-password")
+		recorder := httptest.NewRecorder()
+		s.engine.ServeHTTP(recorder, req)
+		if recorder.Code != want {
+			t.Fatalf("%s: status=%d want=%d body=%s", route, recorder.Code, want, recorder.Body.String())
+		}
 	}
 }
