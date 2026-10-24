@@ -36,23 +36,36 @@ const (
 	quotaUsageBodyLimit    = 512 * 1024
 )
 
+// Passive observation names, as upstream stores them in Auth.Quota.Signals
+// (sdk/cliproxy/auth/quota_signals.go, internal/runtime/executor/helps/codex_quota.go).
+const (
+	codexSignalAllowed      = "X-Codex-Allowed"
+	codexSignalLimitReached = "X-Codex-Limit-Reached"
+	codexSignalPrimary      = "X-Codex-Primary-"
+	codexSignalSecondary    = "X-Codex-Secondary-"
+)
+
 // QuotaAwareSelector ranks Codex credentials by remaining usage window and
 // round-robins among the best of them. Other providers use round-robin.
 //
-// Pick never performs I/O. It reads cached usage snapshots and records the
-// Codex credentials it saw; a background loop probes the usage endpoint for
-// those credentials. Each candidate is in exactly one state:
-//   - exhausted: a fresh snapshot says the limit is reached. Never picked.
-//   - known: a fresh snapshot with a score. Only the best scores are shortlisted.
-//   - unknown: no snapshot, a snapshot older than quotaMaxStaleness, a snapshot
-//     whose reset time has passed, or one without usable windows. Always
-//     shortlisted next to the best known candidates, so it is neither starved
-//     nor preferred over them.
+// Quota input is the passive observation the Manager keeps on each auth
+// (Auth.Quota, filled from Codex response headers and websocket quota events).
+// Pick never performs I/O. A credential whose observation is missing or older
+// than quotaRefreshInterval is marked, and a background loop probes wham/usage
+// for it. The probe result is stored as that same observation, so there is one
+// source. Each candidate is in exactly one state:
+//   - exhausted: a fresh observation says the limit is reached. Never picked.
+//   - known: a fresh observation with a score. Only the best scores are shortlisted.
+//   - unknown: no observation, one older than quotaMaxStaleness, one whose reset
+//     time has passed, or one without usable windows. Always shortlisted next to
+//     the best known candidates, so it is neither starved nor preferred over them.
 type QuotaAwareSelector struct {
 	rr RoundRobinSelector
 
 	now   func() time.Time
-	fetch func(context.Context, codexUsageCredential, time.Time) (*codexUsageSnapshot, error)
+	fetch func(context.Context, codexUsageCredential) (http.Header, error)
+	// observe stores a successful probe as the credential's observation. The Manager sets it.
+	observe func(authID string, headers http.Header, observedAt time.Time)
 	// manualRefresh keeps Pick from starting the background loop (tests drive refreshDue).
 	manualRefresh bool
 	// hostProxyURL is the global proxy-url, used by probes when an auth has no override.
@@ -70,11 +83,11 @@ type QuotaAwareSelector struct {
 	wg        sync.WaitGroup
 }
 
+// quotaEntry is probe scheduling for one credential. It holds no quota data.
 type quotaEntry struct {
 	cred        codexUsageCredential
 	lastSeen    time.Time
-	snapshot    *codexUsageSnapshot
-	fetchedAt   time.Time
+	needsProbe  bool
 	failures    int
 	nextAttempt time.Time
 	fetching    bool
@@ -131,7 +144,7 @@ func (s *QuotaAwareSelector) clock() time.Time {
 	return time.Now()
 }
 
-// Pick selects a Codex credential from cached usage only.
+// Pick selects a Codex credential from passive observations only.
 func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	if provider != "codex" {
 		return s.rr.Pick(ctx, provider, model, opts, auths)
@@ -152,22 +165,18 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 	var known []scoredAuth
 	var unknown []*Auth
 	var earliest time.Time
-	needRefresh := false
+	needProbe := false
 
 	s.mu.Lock()
 	for _, a := range available {
 		entry := s.trackLocked(a, now)
-		var snapshot *codexUsageSnapshot
 		if entry != nil {
-			if entry.snapshot != nil && now.Sub(entry.fetchedAt) <= quotaMaxStaleness {
-				snapshot = entry.snapshot
-			}
-			due := entry.snapshot == nil || now.Sub(entry.fetchedAt) >= quotaRefreshInterval
-			if due && !entry.fetching && !now.Before(entry.nextAttempt) {
-				needRefresh = true
+			entry.needsProbe = !observedWithin(a.Quota, now, quotaRefreshInterval)
+			if entry.needsProbe && !entry.fetching && !now.Before(entry.nextAttempt) {
+				needProbe = true
 			}
 		}
-		state, score, next := classifyCodexSnapshot(snapshot, now)
+		state, score, next := classifyCodexSnapshot(codexSnapshotOf(a.Quota, now), now)
 		switch state {
 		case quotaExhausted:
 			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
@@ -180,7 +189,7 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 		}
 	}
 	s.mu.Unlock()
-	if needRefresh {
+	if needProbe {
 		s.signal()
 	}
 
@@ -212,6 +221,11 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 		ctx = context.Background()
 	}
 	return s.rr.Pick(context.WithValue(ctx, prevalidatedAuthCandidatesKey{}, true), provider, model, opts, shortlist)
+}
+
+// observedWithin reports whether a passive observation is younger than d.
+func observedWithin(q QuotaState, now time.Time, d time.Duration) bool {
+	return !q.ObservedAt.IsZero() && now.Sub(q.ObservedAt) < d
 }
 
 // trackLocked records the credential so the refresher can probe it. Caller holds s.mu.
@@ -297,9 +311,9 @@ func (s *QuotaAwareSelector) Stop() {
 	})
 }
 
-// refreshDue starts probes for credentials whose snapshot is missing or older
-// than quotaRefreshInterval, skipping any still in failure backoff. It does not
-// wait for them, so one slow probe cannot stall the others.
+// refreshDue starts probes for credentials that Pick marked as lacking a fresh
+// observation, skipping any still in failure backoff. It does not wait for them,
+// so one slow probe cannot stall the others.
 func (s *QuotaAwareSelector) refreshDue(ctx context.Context) {
 	if ctx.Err() != nil || s.fetch == nil {
 		return
@@ -316,10 +330,7 @@ func (s *QuotaAwareSelector) refreshDue(ctx context.Context) {
 		if s.inflight+len(jobs) >= quotaMaxConcurrent {
 			break
 		}
-		if entry.fetching || now.Before(entry.nextAttempt) {
-			continue
-		}
-		if entry.snapshot != nil && now.Sub(entry.fetchedAt) < quotaRefreshInterval {
+		if !entry.needsProbe || entry.fetching || now.Before(entry.nextAttempt) {
 			continue
 		}
 		entry.fetching = true
@@ -332,35 +343,109 @@ func (s *QuotaAwareSelector) refreshDue(ctx context.Context) {
 		s.wg.Add(1)
 		go func(j job) {
 			defer s.wg.Done()
-			snapshot, errFetch := s.fetch(ctx, j.cred, now)
-			s.record(j.id, snapshot, errFetch)
+			headers, errFetch := s.fetch(ctx, j.cred)
+			s.record(j.id, now, headers, errFetch)
 		}(j)
 	}
 }
 
-func (s *QuotaAwareSelector) record(id string, snapshot *codexUsageSnapshot, errFetch error) {
+// record hands a successful probe to observe, which stores it as the credential's
+// passive observation. Failures back off per credential.
+func (s *QuotaAwareSelector) record(id string, observedAt time.Time, headers http.Header, errFetch error) {
 	now := s.clock()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.inflight--
 	entry, ok := s.entries[id]
-	if !ok {
-		return
+	if ok {
+		entry.fetching = false
 	}
-	entry.fetching = false
-	if errFetch != nil || snapshot == nil {
-		entry.failures++
-		backoff := quotaRefreshBackoff << min(entry.failures-1, 8)
-		entry.nextAttempt = now.Add(min(backoff, quotaRefreshBackoffMax))
+	if errFetch != nil || len(headers) == 0 {
+		if ok {
+			entry.failures++
+			backoff := quotaRefreshBackoff << min(entry.failures-1, 8)
+			entry.nextAttempt = now.Add(min(backoff, quotaRefreshBackoffMax))
+		}
+		s.mu.Unlock()
 		if errFetch != nil {
 			log.WithField("auth", id).Debugf("quota-aware: codex usage probe failed: %v", errFetch)
 		}
 		return
 	}
-	entry.snapshot = snapshot
-	entry.fetchedAt = now
-	entry.failures = 0
-	entry.nextAttempt = time.Time{}
+	if ok {
+		entry.failures = 0
+		entry.nextAttempt = time.Time{}
+		entry.needsProbe = false
+	}
+	observe := s.observe
+	s.mu.Unlock()
+	if observe != nil {
+		observe(id, headers, observedAt)
+	}
+}
+
+func (s *QuotaAwareSelector) setObserver(observe func(string, http.Header, time.Time)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.observe = observe
+}
+
+// quotaSelectorOf returns the quota selector behind selector, looking through a
+// session-affinity wrapper, or nil.
+func quotaSelectorOf(selector Selector) *QuotaAwareSelector {
+	if affinity, ok := selector.(*SessionAffinitySelector); ok {
+		selector = affinity.fallback
+	}
+	quota, _ := selector.(*QuotaAwareSelector)
+	return quota
+}
+
+// observeQuotaProbe stores a probe as the credential's passive observation. A
+// newer observation from a live response wins. Caller must not hold m.mu.
+func (m *Manager) observeQuotaProbe(authID string, headers http.Header, observedAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	auth := m.auths[authID]
+	if auth == nil || (!auth.Quota.ObservedAt.IsZero() && auth.Quota.ObservedAt.After(observedAt)) {
+		return
+	}
+	auth.Quota.ObserveResponseHeadersForProvider("codex", headers, observedAt)
+}
+
+// codexSnapshotOf reads Codex usage windows from a passive observation. It returns
+// nil when there is no observation or it is older than quotaMaxStaleness. Reset
+// offsets are relative to the observation time, not to the read.
+func codexSnapshotOf(q QuotaState, now time.Time) *codexUsageSnapshot {
+	if q.ObservedAt.IsZero() || len(q.Signals) == 0 || now.Sub(q.ObservedAt) > quotaMaxStaleness {
+		return nil
+	}
+	return &codexUsageSnapshot{
+		allowed:         signalBool(q.Signals, codexSignalAllowed, true),
+		limitReached:    signalBool(q.Signals, codexSignalLimitReached, false),
+		primaryWindow:   codexSignalWindow(q.Signals, codexSignalPrimary, q.ObservedAt),
+		secondaryWindow: codexSignalWindow(q.Signals, codexSignalSecondary, q.ObservedAt),
+	}
+}
+
+func signalBool(signals map[string]string, name string, fallback bool) bool {
+	v, err := strconv.ParseBool(strings.TrimSpace(signals[name]))
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func codexSignalWindow(signals map[string]string, prefix string, observedAt time.Time) codexUsageWindow {
+	var w codexUsageWindow
+	if f, err := strconv.ParseFloat(strings.TrimSpace(signals[prefix+"Used-Percent"]), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+		w.usedPercent = f
+		w.hasUsedPercent = true
+	}
+	if sec, err := strconv.ParseInt(strings.TrimSpace(signals[prefix+"Reset-At"]), 10, 64); err == nil && sec > 0 {
+		w.resetAt = time.Unix(sec, 0)
+	} else if sec, err := strconv.ParseInt(strings.TrimSpace(signals[prefix+"Reset-After-Seconds"]), 10, 64); err == nil && sec > 0 {
+		w.resetAt = observedAt.Add(time.Duration(sec) * time.Second)
+	}
+	return w
 }
 
 // classifyCodexSnapshot maps a fresh snapshot (or nil) to a selection state.
@@ -442,9 +527,9 @@ func codexCredentialOf(a *Auth, hostProxyURL string) codexUsageCredential {
 	return cred
 }
 
-// fetchCodexUsage probes wham/usage. It sets no timeout; the refresher's
-// context cancels it on Stop.
-func fetchCodexUsage(ctx context.Context, cred codexUsageCredential, now time.Time) (*codexUsageSnapshot, error) {
+// fetchCodexUsage probes wham/usage and returns the result in observation form.
+// It sets no timeout; the refresher's context cancels it on Stop.
+func fetchCodexUsage(ctx context.Context, cred codexUsageCredential) (http.Header, error) {
 	if cred.token == "" || cred.accountID == "" {
 		return nil, fmt.Errorf("codex usage: missing access token or account_id")
 	}
@@ -484,44 +569,51 @@ func fetchCodexUsage(ctx context.Context, cred codexUsageCredential, now time.Ti
 	if err != nil {
 		return nil, err
 	}
-	return parseCodexUsage(body, now)
+	return parseCodexUsage(body)
 }
 
-func parseCodexUsage(body []byte, now time.Time) (*codexUsageSnapshot, error) {
+// parseCodexUsage converts a wham/usage payload into the X-Codex-* observation
+// names that upstream stores for response headers, so probe results and passive
+// observations share one representation. Reset offsets stay relative and are
+// resolved against the observation time.
+func parseCodexUsage(body []byte) (http.Header, error) {
 	root := gjson.ParseBytes(body)
 	if !root.IsObject() {
 		return nil, fmt.Errorf("codex usage: payload is not an object")
 	}
 	rl := firstResult(root, "rate_limit", "rateLimit")
-	snap := &codexUsageSnapshot{allowed: true}
-	if v := rl.Get("allowed"); v.Exists() {
-		snap.allowed = v.Bool()
+	if !rl.IsObject() {
+		return nil, fmt.Errorf("codex usage: no rate_limit object")
 	}
-	if v := firstResult(rl, "limit_reached", "limitReached"); v.Exists() {
-		snap.limitReached = v.Bool()
+	headers := make(http.Header)
+	setCodexUsageScalar(headers, codexSignalAllowed, firstResult(rl, "allowed"))
+	setCodexUsageScalar(headers, codexSignalLimitReached, firstResult(rl, "limit_reached", "limitReached"))
+	setCodexUsageWindow(headers, codexSignalPrimary, firstResult(rl, "primary_window", "primaryWindow"))
+	setCodexUsageWindow(headers, codexSignalSecondary, firstResult(rl, "secondary_window", "secondaryWindow"))
+	if headers.Get(codexSignalPrimary+"Used-Percent") == "" && headers.Get(codexSignalSecondary+"Used-Percent") == "" {
+		return nil, fmt.Errorf("codex usage: no usage windows")
 	}
-	snap.primaryWindow = parseCodexWindow(firstResult(rl, "primary_window", "primaryWindow"), now)
-	snap.secondaryWindow = parseCodexWindow(firstResult(rl, "secondary_window", "secondaryWindow"), now)
-	return snap, nil
+	return headers, nil
 }
 
-func parseCodexWindow(node gjson.Result, now time.Time) codexUsageWindow {
-	var w codexUsageWindow
-	if !node.IsObject() {
-		return w
+func setCodexUsageWindow(headers http.Header, prefix string, window gjson.Result) {
+	if !window.IsObject() {
+		return
 	}
-	if used := firstResult(node, "used_percent", "usedPercent"); used.Exists() {
-		if f, err := strconv.ParseFloat(strings.TrimSpace(used.String()), 64); err == nil {
-			w.usedPercent = f
-			w.hasUsedPercent = true
+	setCodexUsageScalar(headers, prefix+"Used-Percent", firstResult(window, "used_percent", "usedPercent"))
+	setCodexUsageScalar(headers, prefix+"Reset-At", firstResult(window, "reset_at", "resetAt"))
+	setCodexUsageScalar(headers, prefix+"Reset-After-Seconds", firstResult(window, "reset_after_seconds", "resetAfterSeconds"))
+}
+
+func setCodexUsageScalar(headers http.Header, name string, value gjson.Result) {
+	switch value.Type {
+	case gjson.Number, gjson.True, gjson.False:
+		headers.Set(name, strings.TrimSpace(value.Raw))
+	case gjson.String:
+		if s := strings.TrimSpace(value.Str); s != "" {
+			headers.Set(name, s)
 		}
 	}
-	if sec := firstResult(node, "reset_at", "resetAt").Int(); sec > 0 {
-		w.resetAt = time.Unix(sec, 0)
-	} else if sec := firstResult(node, "reset_after_seconds", "resetAfterSeconds").Int(); sec > 0 {
-		w.resetAt = now.Add(time.Duration(sec) * time.Second)
-	}
-	return w
 }
 
 func firstResult(node gjson.Result, paths ...string) gjson.Result {
