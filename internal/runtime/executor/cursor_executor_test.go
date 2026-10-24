@@ -291,6 +291,9 @@ func TestCursorExecutorRejectsToolRequestsBeforeAnyTransport(t *testing.T) {
 	toolPayloads := map[string][]byte{
 		"tool definitions": []byte(`{"model":"cursor/auto","tools":[{"type":"function","function":{"name":"lookup"}}],"messages":[{"role":"user","content":"hi"}]}`),
 		"tool turn":        []byte(`{"model":"cursor/auto","messages":[{"role":"user","content":"hi"},{"role":"tool","tool_call_id":"1","content":"42"}]}`),
+		"legacy functions": []byte(`{"model":"cursor/auto","functions":[{"name":"lookup"}],"messages":[{"role":"user","content":"hi"}]}`),
+		"function_call":    []byte(`{"model":"cursor/auto","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":null,"function_call":{"name":"lookup","arguments":"{}"}}]}`),
+		"function role":    []byte(`{"model":"cursor/auto","messages":[{"role":"user","content":"hi"},{"role":"function","name":"lookup","content":"42"}]}`),
 	}
 	for name, payload := range toolPayloads {
 		req := cliproxyexecutor.Request{Model: "cursor/auto", Payload: payload}
@@ -370,5 +373,37 @@ func TestCursorExecutorPayloadRulesApplyAfterBuiltIns(t *testing.T) {
 	}
 	if got := gjson.GetBytes(payload, "reasoning_effort").String(); got != "low" {
 		t.Fatalf("reasoning_effort = %q, want the payload override to win; payload=%s", got, payload)
+	}
+}
+
+// Relay auths keep their HTTP contract. CLI auths have no HTTP endpoint and still return 501.
+func TestCursorExecutorHTTPRequestDelegatesToRelay(t *testing.T) {
+	hits := 0
+	srv := relayServer(t, false, &hits)
+	exec := NewCursorExecutor(&config.Config{})
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := exec.HttpRequest(context.Background(), relayCursorAuth(srv.URL+"/v1"), req)
+	if err != nil {
+		t.Fatalf("relay HttpRequest() error: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || hits != 1 {
+		t.Fatalf("relay HttpRequest() status=%d hits=%d, want 200 and one hit", resp.StatusCode, hits)
+	}
+
+	cliReq, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = exec.HttpRequest(context.Background(), cliCursorAuth(), cliReq)
+	if status, ok := err.(interface{ StatusCode() int }); !ok || status.StatusCode() != http.StatusNotImplemented {
+		t.Fatalf("CLI HttpRequest() error = %#v, want 501", err)
+	}
+	if hits != 1 {
+		t.Fatalf("CLI HttpRequest reached the relay: hits=%d", hits)
 	}
 }

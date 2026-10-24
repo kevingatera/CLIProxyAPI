@@ -32,8 +32,11 @@ func NewCursorExecutor(cfg *config.Config) *CursorExecutor {
 
 func (e *CursorExecutor) Identifier() string { return "cursor" }
 
-// HttpRequest is unsupported: cursor auth has no HTTP endpoint to call.
+// HttpRequest serves relay auths through the OpenAI-compatible path. CLI auths have no HTTP endpoint.
 func (e *CursorExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
+	if relay := cursorRelayAuth(auth); relay != nil {
+		return e.compat.HttpRequest(ctx, relay, req)
+	}
 	return nil, statusErr{code: http.StatusNotImplemented, msg: "cursor executor: direct HTTP requests are not supported"}
 }
 
@@ -333,12 +336,15 @@ func cursorCanonicalRequestModel(model string) string {
 
 // cursorRejectToolRequests fails requests with tool definitions or tool turns. The
 // CLI path would flatten them into text, and the relay does not honor them.
+// It also covers the legacy functions API: a functions list, a function_call on an assistant turn,
+// and role "function" results.
 func cursorRejectToolRequests(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) error {
 	payload := sdktranslator.TranslateRequest(opts.SourceFormat, sdktranslator.FromString("openai"), "", req.Payload, false)
-	hasTools := gjson.GetBytes(payload, "tools").IsArray() && len(gjson.GetBytes(payload, "tools").Array()) > 0
+	hasTools := cursorNonEmptyArray(gjson.GetBytes(payload, "tools")) || cursorNonEmptyArray(gjson.GetBytes(payload, "functions"))
 	hasToolTurns := false
 	gjson.GetBytes(payload, "messages").ForEach(func(_, message gjson.Result) bool {
-		if toolCalls := message.Get("tool_calls"); message.Get("role").String() == "tool" || (toolCalls.IsArray() && len(toolCalls.Array()) > 0) {
+		role := message.Get("role").String()
+		if role == "tool" || role == "function" || message.Get("function_call").IsObject() || cursorNonEmptyArray(message.Get("tool_calls")) {
 			hasToolTurns = true
 			return false
 		}
@@ -348,4 +354,8 @@ func cursorRejectToolRequests(req cliproxyexecutor.Request, opts cliproxyexecuto
 		return statusErr{code: http.StatusBadRequest, msg: "cursor executor: tool definitions and tool calls are not supported; remove tools from the request"}
 	}
 	return nil
+}
+
+func cursorNonEmptyArray(v gjson.Result) bool {
+	return v.IsArray() && len(v.Array()) > 0
 }
