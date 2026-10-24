@@ -253,6 +253,9 @@ type Manager struct {
 
 	// routingTraces keeps recent routing policy traces; it is written only while the policy is enabled.
 	routingTraces routingTraceRing
+
+	// unifiedAllowanceRunning marks an allowance refresh still in flight; guarded by unifiedMu.
+	unifiedAllowanceRunning bool
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
