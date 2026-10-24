@@ -146,7 +146,6 @@ func (m *Manager) refreshUnifiedQuotas(ctx context.Context) {
 	if fetch == nil {
 		return
 	}
-	var done []chan struct{}
 	for _, a := range m.List() {
 		if a.Disabled || m.unifiedQuotaFresh(a.ID, time.Now()) {
 			continue
@@ -162,23 +161,71 @@ func (m *Manager) refreshUnifiedQuotas(ctx context.Context) {
 		if !participates {
 			continue
 		}
-		finished := make(chan struct{})
-		done = append(done, finished)
-		go func(a *Auth) {
-			defer close(finished)
-			report, err := fetch(ctx, a)
-			if err == nil {
-				m.ObserveUnifiedQuota(a.ID, report, time.Now())
-			}
-		}(a)
-	}
-	for _, ch := range done {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ch:
+		// Fetches are never joined, so a stalled provider cannot hold back later ticks.
+		if m.beginUnifiedFetch(a.ID, time.Now()) {
+			go m.runUnifiedFetch(ctx, fetch, a)
 		}
 	}
+}
+
+const (
+	unifiedFetchBackoffBase = 30 * time.Second
+	unifiedFetchBackoffMax  = 5 * time.Minute
+)
+
+// unifiedFetchState is one credential's native quota fetch slot. At most one call is in flight per
+// credential, and consecutive failures push the next attempt out with exponential backoff.
+type unifiedFetchState struct {
+	inFlight bool
+	failures int
+	retryAt  time.Time
+}
+
+// beginUnifiedFetch claims the credential's slot unless a call is in flight or backoff is pending.
+func (m *Manager) beginUnifiedFetch(authID string, now time.Time) bool {
+	m.unifiedMu.Lock()
+	defer m.unifiedMu.Unlock()
+	if m.unifiedFetches == nil {
+		m.unifiedFetches = make(map[string]*unifiedFetchState)
+	}
+	st := m.unifiedFetches[authID]
+	if st == nil {
+		st = &unifiedFetchState{}
+		m.unifiedFetches[authID] = st
+	}
+	if st.inFlight || now.Before(st.retryAt) {
+		return false
+	}
+	st.inFlight = true
+	return true
+}
+
+func (m *Manager) runUnifiedFetch(ctx context.Context, fetch func(context.Context, *Auth) (pluginapi.QuotaFetchResponse, error), a *Auth) {
+	report, err := fetch(ctx, a)
+	now := time.Now()
+	m.unifiedMu.Lock()
+	st := m.unifiedFetches[a.ID]
+	st.inFlight = false
+	if err != nil {
+		st.failures++
+		st.retryAt = now.Add(unifiedFetchBackoff(st.failures))
+	} else {
+		st.failures = 0
+		st.retryAt = time.Time{}
+	}
+	m.unifiedMu.Unlock()
+	if err == nil {
+		m.ObserveUnifiedQuota(a.ID, report, now)
+	}
+}
+
+// unifiedFetchBackoff doubles the delay per consecutive failure, capped at the refresh interval.
+func unifiedFetchBackoff(failures int) time.Duration {
+	delay := unifiedFetchBackoffBase
+	for i := 1; i < failures && delay < unifiedFetchBackoffMax; i++ {
+		delay *= 2
+	}
+	return min(delay, unifiedFetchBackoffMax)
 }
 
 // startUnifiedAllowanceRefresh runs the allowance read beside native fetches, so a stalled
@@ -220,6 +267,10 @@ func (m *Manager) ObserveUnifiedQuotaUntil(authID string, report pluginapi.Quota
 		m.unifiedQuota = make(map[string]unifiedQuotaSnapshot)
 	}
 	old := m.unifiedQuota[authID]
+	// A late arrival carrying an older observation must not replace a newer report.
+	if now.Before(old.At) {
+		return
+	}
 	next := unifiedQuotaSnapshot{Report: report, At: now, ExpiresAt: expiresAt, Depletion: make(map[string]float64)}
 	hours := now.Sub(old.At).Hours()
 	if hours >= 1.0/60 && hours <= 1 {
