@@ -1,1 +1,7 @@
-{"base_resp":{"status_code":2062,"status_msg":"no active token plan"},"model_remains":null}
+{
+  "model_remains": null,
+  "base_resp": {
+    "status_code": 2062,
+    "status_msg": "[REDACTED]"
+  }
+}
