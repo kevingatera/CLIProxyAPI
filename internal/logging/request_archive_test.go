@@ -217,8 +217,9 @@ func TestRequestArchiveStreamingCaptureCapWritesMarker(t *testing.T) {
 		w.WriteChunkAsync(chunk)
 	}
 	stream := w.(*archiveStream)
-	if got := len(stream.pending); got != 1<<20 {
-		t.Fatalf("pending grew to %d bytes, want cap %d", got, 1<<20)
+	// The request body is charged to the same per-request budget as chunks.
+	if want := 1<<20 - len("prompt"); len(stream.pending) != want {
+		t.Fatalf("pending grew to %d bytes, want cap less body %d", len(stream.pending), want)
 	}
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
@@ -384,4 +385,67 @@ func TestRequestArchiveSizeRetentionStillAppliesWithAgeLimit(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "new.log")); err != nil {
 		t.Fatal("age limit removed a fresh log")
 	}
+}
+
+func TestRequestArchiveStreamingRequestBodyIsBoundedAndOmitted(t *testing.T) {
+	t.Run("metadata only", func(t *testing.T) {
+		a := newLimitedArchive(t, config.RequestArchiveConfig{MetadataOnly: true})
+		w, err := a.LogStreamingRequest("/v1/chat/completions", "POST", nil, []byte(`{"prompt":"prompt-marker"}`), "meta-body")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = w.WriteStatus(200, nil)
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		log := readArchive(t, a)
+		if strings.Contains(log, "prompt-marker") {
+			t.Fatal("metadata-only archive kept the streaming request body")
+		}
+		if !strings.Contains(log, archiveMetadataOnlyMarker) {
+			t.Fatal("missing metadata-only marker for request body")
+		}
+	})
+
+	t.Run("over capture cap", func(t *testing.T) {
+		a := newLimitedArchive(t, config.RequestArchiveConfig{MaxCaptureMB: 1})
+		body := []byte(`{"prompt":"` + strings.Repeat("p", 3<<20) + `"}`)
+		w, err := a.LogStreamingRequest("/v1/chat/completions", "POST", nil, body, "big-body")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = w.WriteStatus(200, nil)
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		log := readArchive(t, a)
+		if len(log) > 2<<20 {
+			t.Fatalf("archive %d bytes holds a 3 MiB request body under a 1 MiB cap", len(log))
+		}
+		if !strings.Contains(log, archiveTruncatedMarker) {
+			t.Fatal("missing truncation marker for request body")
+		}
+	})
+
+	t.Run("over concurrency limit", func(t *testing.T) {
+		a := newLimitedArchive(t, config.RequestArchiveConfig{MaxConcurrentCaptures: 1})
+		first, err := a.LogStreamingRequest("/v1/a", "POST", nil, nil, "first")
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := a.LogStreamingRequest("/v1/b", "POST", nil, []byte(`{"prompt":"second-prompt-marker"}`), "second")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = second.WriteStatus(200, nil)
+		if err := second.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := first.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if log := readArchive(t, a); strings.Contains(log, "second-prompt-marker") {
+			t.Fatal("request over the concurrency limit persisted its body")
+		}
+	})
 }
