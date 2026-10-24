@@ -141,8 +141,10 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	var lastErr error
 	var preferredUpstreamErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
+	var lastRoundAttempted map[string]struct{}
 	for attempt := 0; ; attempt++ {
 		roundAttempted := make(map[string]struct{})
+		lastRoundAttempted = roundAttempted
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
 		resp, errExec := runRoutingRound(ctx, plan, normalized, roundOpts, maxRetryCredentials, roundAttempted, func(stepCtx context.Context, stepProviders []string, stepOpts cliproxyexecutor.Options, stepMaxCredentials int) (cliproxyexecutor.Response, error) {
 			return m.executeMixedOnce(stepCtx, stepProviders, req, stepOpts, stepMaxCredentials, attempt, defaultRequestRetry)
@@ -175,7 +177,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		lastErr = unwrapExecutionBoundaryError(lastErr)
 		creditsProviders := plan.retryProviders(normalized)
 		if hasAntigravityProvider(creditsProviders) && shouldAttemptAntigravityCreditsFallback(m, lastErr, creditsProviders) {
-			if resp, ok, errCredits := m.tryAntigravityCreditsExecute(ctx, req, opts); errCredits != nil {
+			if resp, ok, errCredits := m.tryAntigravityCreditsExecute(ctx, req, opts, lastRoundAttempted); errCredits != nil {
 				return cliproxyexecutor.Response{}, errCredits
 			} else if ok {
 				return resp, nil
@@ -279,8 +281,10 @@ func (m *Manager) executeStream(ctx context.Context, normalized []string, req cl
 	attempt := 0
 	retryRoundPending := false
 	retryRoundWaited := false
+	var lastRoundAttempted map[string]struct{}
 	for {
 		roundAttempted := make(map[string]struct{})
+		lastRoundAttempted = roundAttempted
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
 		result, errStream := runRoutingRound(ctx, plan, normalized, roundOpts, maxRetryCredentials, roundAttempted, func(stepCtx context.Context, stepProviders []string, stepOpts cliproxyexecutor.Options, stepMaxCredentials int) (*cliproxyexecutor.StreamResult, error) {
 			return m.executeStreamMixedOnce(stepCtx, stepProviders, req, stepOpts, stepMaxCredentials, &homeRetryLimit, attempt, defaultRequestRetry)
@@ -332,7 +336,7 @@ func (m *Manager) executeStream(ctx context.Context, normalized []string, req cl
 		lastErr = unwrapExecutionBoundaryError(lastErr)
 		creditsProviders := plan.retryProviders(normalized)
 		if hasAntigravityProvider(creditsProviders) && shouldAttemptAntigravityCreditsFallback(m, lastErr, creditsProviders) {
-			if result, ok, errCredits := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); errCredits != nil {
+			if result, ok, errCredits := m.tryAntigravityCreditsExecuteStream(ctx, req, opts, lastRoundAttempted); errCredits != nil {
 				return nil, errCredits
 			} else if ok {
 				return result, nil

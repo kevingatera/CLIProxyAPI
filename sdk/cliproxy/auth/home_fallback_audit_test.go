@@ -38,10 +38,10 @@ func TestAuditHomeCreditsFailClosed(t *testing.T) {
 	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
 	manager.auths["local-credits"] = &Auth{ID: "local-credits", Provider: "antigravity", Status: StatusActive}
 
-	_, _, errExecute := manager.tryAntigravityCreditsExecute(context.Background(), cliproxyexecutor.Request{Model: "claude-test"}, cliproxyexecutor.Options{})
+	_, _, errExecute := manager.tryAntigravityCreditsExecute(context.Background(), cliproxyexecutor.Request{Model: "claude-test"}, cliproxyexecutor.Options{}, nil)
 	assertHomeCreditsFallbackUnsupported(t, errExecute)
 
-	_, _, errStream := manager.tryAntigravityCreditsExecuteStream(context.Background(), cliproxyexecutor.Request{Model: "claude-test"}, cliproxyexecutor.Options{Stream: true})
+	_, _, errStream := manager.tryAntigravityCreditsExecuteStream(context.Background(), cliproxyexecutor.Request{Model: "claude-test"}, cliproxyexecutor.Options{Stream: true}, nil)
 	assertHomeCreditsFallbackUnsupported(t, errStream)
 }
 

@@ -534,3 +534,37 @@ func TestAntigravityCreditsFallbackStopsAtRetryBudget(t *testing.T) {
 		t.Fatalf("credits calls = %d, want 1 under max-retry-credentials 1: %v", credits, executor.snapshot())
 	}
 }
+
+// The credits fallback shares the plain round's max-retry-credentials budget. With a budget of one,
+// b is the only credential the round tried, so the fallback may retry b's credits mode but must not
+// add a as a second credential.
+func TestAntigravityCreditsFallbackSpendsPlainRoundBudget(t *testing.T) {
+	const model = "claude-credits-policy"
+	policy := pinnedPolicy([]string{"b", "a"}, true)
+	policy.Defaults.Route[0].Provider = "antigravity"
+	const want = "[b:plain b:credits]"
+	t.Run("execute", func(t *testing.T) {
+		manager, executor := newCreditsPolicyTestManager(t, []string{"a", "b"}, policy, 1)
+		executor.failCredits = true
+		if _, err := manager.Execute(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err == nil {
+			t.Fatal("Execute error = nil, want the quota error")
+		}
+		if got := fmt.Sprint(executor.snapshot()); got != want {
+			t.Fatalf("calls = %s, want %s", got, want)
+		}
+	})
+	t.Run("stream", func(t *testing.T) {
+		manager, executor := newCreditsPolicyTestManager(t, []string{"a", "b"}, policy, 1)
+		executor.failCredits = true
+		result, err := manager.ExecuteStream(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+		if err == nil {
+			err = drainStream(t, result)
+		}
+		if err == nil {
+			t.Fatal("ExecuteStream error = nil, want the quota error")
+		}
+		if got := fmt.Sprint(executor.snapshot()); got != want {
+			t.Fatalf("calls = %s, want %s", got, want)
+		}
+	})
+}

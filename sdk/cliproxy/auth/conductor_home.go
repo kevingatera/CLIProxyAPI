@@ -1393,7 +1393,36 @@ func shouldAttemptAntigravityCreditsFallback(m *Manager, lastErr error, provider
 	}
 }
 
-func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, bool, error) {
+// creditsAttemptBudget applies the plain round's max-retry-credentials cap to the credits fallback.
+// A credential the round already tried may take a credits attempt; a new credential needs spare budget.
+type creditsAttemptBudget struct {
+	limit     int
+	attempted map[string]struct{}
+}
+
+func newCreditsAttemptBudget(limit int, attempted map[string]struct{}) *creditsAttemptBudget {
+	seen := make(map[string]struct{}, len(attempted)+1)
+	for id := range attempted {
+		seen[id] = struct{}{}
+	}
+	return &creditsAttemptBudget{limit: limit, attempted: seen}
+}
+
+func (b *creditsAttemptBudget) allow(authID string) bool {
+	if b.limit <= 0 {
+		return true
+	}
+	if _, ok := b.attempted[authID]; ok {
+		return true
+	}
+	if len(b.attempted) >= b.limit {
+		return false
+	}
+	b.attempted[authID] = struct{}{}
+	return true
+}
+
+func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, attempted map[string]struct{}) (cliproxyexecutor.Response, bool, error) {
 	if m != nil && m.HomeEnabled() {
 		return cliproxyexecutor.Response{}, false, &Error{Code: "home_fallback_unsupported", Message: "Home does not support Antigravity credits fallback", HTTPStatus: http.StatusServiceUnavailable}
 	}
@@ -1406,12 +1435,13 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		return cliproxyexecutor.Response{}, false, errCandidates
 	}
 	_, maxRetryCredentials, _ := m.retrySettings()
-	for i, c := range candidates {
+	budget := newCreditsAttemptBudget(maxRetryCredentials, attempted)
+	for _, c := range candidates {
 		if ctx.Err() != nil {
 			return cliproxyexecutor.Response{}, false, nil
 		}
-		if maxRetryCredentials > 0 && i >= maxRetryCredentials {
-			break
+		if !budget.allow(c.auth.ID) {
+			continue
 		}
 		creditsCtx := WithAntigravityCredits(ctx)
 		if rt := m.roundTripperFor(c.auth); rt != nil {
@@ -1461,7 +1491,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 	return cliproxyexecutor.Response{}, false, nil
 }
 
-func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, bool, error) {
+func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, attempted map[string]struct{}) (*cliproxyexecutor.StreamResult, bool, error) {
 	if m != nil && m.HomeEnabled() {
 		return nil, false, &Error{Code: "home_fallback_unsupported", Message: "Home does not support Antigravity credits fallback", HTTPStatus: http.StatusServiceUnavailable}
 	}
@@ -1474,12 +1504,13 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		return nil, false, errCandidates
 	}
 	_, maxRetryCredentials, _ := m.retrySettings()
-	for i, c := range candidates {
+	budget := newCreditsAttemptBudget(maxRetryCredentials, attempted)
+	for _, c := range candidates {
 		if ctx.Err() != nil {
 			return nil, false, nil
 		}
-		if maxRetryCredentials > 0 && i >= maxRetryCredentials {
-			break
+		if !budget.allow(c.auth.ID) {
+			continue
 		}
 		creditsCtx := WithAntigravityCredits(ctx)
 		if rt := m.roundTripperFor(c.auth); rt != nil {
