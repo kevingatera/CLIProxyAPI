@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
@@ -522,5 +523,181 @@ func TestQuotaAwareProbesUseHostProxyWithoutAuthOverride(t *testing.T) {
 	}
 	if got["acct-b"] != "http://auth-proxy.example:8080" {
 		t.Fatalf("auth with override probed via %q, want its own proxy", got["acct-b"])
+	}
+}
+
+// Sole-window reset: flags from the same window expire with it, so the credential is unknown.
+func TestQuotaAwareExpiredFlagsBecomeUnknown(t *testing.T) {
+	for _, flags := range []map[string]string{
+		{codexSignalAllowed: "false"},
+		{codexSignalLimitReached: "true"},
+	} {
+		clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+		s := newQuotaTestSelector(clock, nil)
+		now := clock.Now()
+		signals := usageSignals(100, now.Add(time.Minute))
+		for k, v := range flags {
+			signals[k] = v
+		}
+		auths := []*Auth{observed(quotaTestAuths("a")[0], now, signals)}
+		clock.Advance(2 * time.Minute)
+
+		picked, err := s.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, auths)
+		if err != nil || picked.ID != "a" {
+			t.Fatalf("flags %v: Pick() = %v, %v; want a once its window reset", flags, picked, err)
+		}
+	}
+}
+
+// A passed window's flag must not hide a live exhausted window, and a live
+// window at a known usage level does not justify keeping the expired flag.
+func TestQuotaAwareExpiredFlagKeepsLiveExhaustion(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	s := newQuotaTestSelector(clock, nil)
+	now := clock.Now()
+	spent := map[string]string{
+		codexSignalAllowed:                    "false",
+		codexSignalLimitReached:               "true",
+		codexSignalPrimary + "Used-Percent":   "50",
+		codexSignalPrimary + "Reset-At":       strconv.FormatInt(now.Add(time.Minute).Unix(), 10),
+		codexSignalSecondary + "Used-Percent": "100",
+		codexSignalSecondary + "Reset-At":     strconv.FormatInt(now.Add(time.Hour).Unix(), 10),
+	}
+	steady := map[string]string{
+		codexSignalAllowed:                    "false",
+		codexSignalPrimary + "Used-Percent":   "50",
+		codexSignalPrimary + "Reset-At":       strconv.FormatInt(now.Add(time.Minute).Unix(), 10),
+		codexSignalSecondary + "Used-Percent": "50",
+		codexSignalSecondary + "Reset-At":     strconv.FormatInt(now.Add(time.Hour).Unix(), 10),
+	}
+	spentAuths := []*Auth{observed(quotaTestAuths("spent")[0], now, spent)}
+	steadyAuths := []*Auth{observed(quotaTestAuths("steady")[0], now, steady)}
+	clock.Advance(2 * time.Minute)
+
+	if picked, err := s.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, spentAuths); err == nil {
+		t.Fatalf("Pick() = %v; a live exhausted secondary window must keep the credential out", picked.ID)
+	}
+	if picked, err := s.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, steadyAuths); err != nil || picked.ID != "steady" {
+		t.Fatalf("Pick() = %v, %v; want the expired flag dropped when no live window is exhausted", picked, err)
+	}
+}
+
+// quotaTestExecutor counts calls for a provider identifier.
+type quotaTestExecutor struct {
+	id    string
+	calls atomic.Int32
+}
+
+func (e *quotaTestExecutor) Identifier() string { return e.id }
+
+func (e *quotaTestExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.calls.Add(1)
+	return cliproxyexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+}
+
+func (e *quotaTestExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, errors.New("stream not supported")
+}
+
+func (e *quotaTestExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *quotaTestExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, errors.New("not supported")
+}
+
+func (e *quotaTestExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not supported")
+}
+
+func quotaCodexAuth(id string, quota QuotaState) *Auth {
+	return &Auth{
+		ID:       id,
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"access_token": "tok-" + id, "account_id": "acct-" + id},
+		Quota:    quota,
+	}
+}
+
+// quotaExecuteManager returns a manager that selects with s and serves the auths
+// under model. Probes stay manual, so no network call can happen in these tests.
+func quotaExecuteManager(t *testing.T, s *QuotaAwareSelector, model string, executors []*quotaTestExecutor, auths []*Auth) *Manager {
+	t.Helper()
+	m := NewManager(nil, s, nil)
+	for _, e := range executors {
+		m.RegisterExecutor(e)
+	}
+	for _, a := range auths {
+		if _, err := m.Register(context.Background(), a); err != nil {
+			t.Fatalf("Register(%s): %v", a.ID, err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(a.ID, a.Provider, []*registry.ModelInfo{{ID: model}})
+		id := a.ID
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+	}
+	return m
+}
+
+// Execute always selects with provider "mixed". A freshly exhausted Codex singleton
+// must be rejected there, not served by round-robin.
+func TestManagerExecuteRejectsExhaustedCodexSingleton(t *testing.T) {
+	const model = "quota-test-singleton"
+	now := time.Now()
+	s := NewQuotaAwareSelector()
+	s.manualRefresh = true
+	codex := &quotaTestExecutor{id: "codex"}
+	m := quotaExecuteManager(t, s, model, []*quotaTestExecutor{codex}, []*Auth{
+		quotaCodexAuth("codex-spent", QuotaState{ObservedAt: now, Signals: usageSignals(100, now.Add(time.Hour))}),
+	})
+
+	_, err := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if err == nil {
+		t.Fatal("Execute served an exhausted Codex credential")
+	}
+	if got := codex.calls.Load(); got != 0 {
+		t.Fatalf("exhausted credential reached the executor %d times", got)
+	}
+}
+
+// In a mixed pool, an exhausted Codex credential is skipped and the other provider serves.
+func TestManagerExecuteSkipsExhaustedCodexInMixedPool(t *testing.T) {
+	const model = "quota-test-mixed"
+	now := time.Now()
+	s := NewQuotaAwareSelector()
+	s.manualRefresh = true
+	codex := &quotaTestExecutor{id: "codex"}
+	other := &quotaTestExecutor{id: "quota-test-other"}
+	m := quotaExecuteManager(t, s, model, []*quotaTestExecutor{codex, other}, []*Auth{
+		quotaCodexAuth("a-codex-spent", QuotaState{ObservedAt: now, Signals: usageSignals(100, now.Add(time.Hour))}),
+		{ID: "b-other", Provider: "quota-test-other", Status: StatusActive},
+	})
+
+	resp, err := m.Execute(context.Background(), []string{"codex", "quota-test-other"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if string(resp.Payload) != `{"ok":true}` {
+		t.Fatalf("payload = %s", resp.Payload)
+	}
+	if codex.calls.Load() != 0 || other.calls.Load() != 1 {
+		t.Fatalf("calls codex=%d other=%d, want 0 and 1", codex.calls.Load(), other.calls.Load())
+	}
+}
+
+// A Codex credential with no observation is still served through Execute (not starved).
+func TestManagerExecuteServesUnobservedCodexSingleton(t *testing.T) {
+	const model = "quota-test-unobserved"
+	s := NewQuotaAwareSelector()
+	s.manualRefresh = true
+	codex := &quotaTestExecutor{id: "codex"}
+	m := quotaExecuteManager(t, s, model, []*quotaTestExecutor{codex}, []*Auth{quotaCodexAuth("codex-new", QuotaState{})})
+
+	if _, err := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := codex.calls.Load(); got != 1 {
+		t.Fatalf("executor calls = %d, want 1", got)
 	}
 }
