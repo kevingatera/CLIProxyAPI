@@ -15,6 +15,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 func TestManagementV8RoutesShareAccessControl(t *testing.T) {
@@ -45,7 +48,7 @@ func TestManagementV8RoutesShareAccessControl(t *testing.T) {
 			s := &Server{cfg: cfg, engine: gin.New(), mgmt: h}
 			s.managementRoutesEnabled.Store(tc.enabled)
 			s.registerManagementRoutes()
-			for _, route := range []string{"/v0/management/config", "/v8/management/config", "/v0/management/plugins", "/v8/management/plugins"} {
+			for _, route := range []string{"/v0/management/config", "/v8/management/config", "/v0/management/plugins", "/v8/management/plugins", "/v8/management/usage"} {
 				req := httptest.NewRequest(http.MethodGet, route, nil)
 				req.RemoteAddr = "127.0.0.1:1234"
 				if tc.authorized {
@@ -90,8 +93,9 @@ func TestManagementV8IndependentContract(t *testing.T) {
 		"GET /v8/management/observability/logs", "GET /v8/management/observability/usage/queue",
 		"GET /v8/management/credentials", "POST /v8/management/credentials",
 		"GET /v8/management/oauth/auth-url", "POST /v8/management/oauth/import", "POST /v8/management/oauth/callback",
-		"POST /v8/management/routing/cooldown/reset", "GET /v8/management/routing/traces",
+		"POST /v8/management/routing/cooldown/reset",
 		"GET /v8/management/plugins/:id/quota", "POST /v8/management/plugins/:id/quota", "DELETE /v8/management/plugins/:id/quota",
+		"GET /v8/management/credentials/configured-quota", "POST /v8/management/credentials/quota", "POST /v8/management/credentials/quota/native",
 		"POST /v8/management/plugins/store/:id/install", "DELETE /v8/management/plugins/:id",
 	} {
 		if !routes[route] {
@@ -217,4 +221,107 @@ func TestManagementV8PluginOperationMigratesConfiguration(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("missing configuration reload")
 	}
+}
+
+func TestManagementV8RoutingTracesRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("port: 8317\nremote-management: {secret-key: test-password}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := management.NewHandler(cfg, path, nil)
+	h.SetLocalPassword("test-password")
+	h.SetAuthManager(coreauth.NewManager(nil, nil, nil))
+	s := &Server{cfg: cfg, engine: gin.New(), mgmt: h}
+	s.managementRoutesEnabled.Store(true)
+	s.registerManagementRoutes()
+	for route, want := range map[string]int{
+		"/v8/management/routing/traces":          http.StatusOK,
+		"/v8/management/routing/traces?limit=0":  http.StatusBadRequest,
+		"/v8/management/routing/traces?failed=x": http.StatusBadRequest,
+		"/v0/management/routing/traces":          http.StatusNotFound,
+	} {
+		req := httptest.NewRequest(http.MethodGet, route, nil)
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Header.Set("Authorization", "Bearer test-password")
+		recorder := httptest.NewRecorder()
+		s.engine.ServeHTTP(recorder, req)
+		if recorder.Code != want {
+			t.Fatalf("%s: status=%d want=%d body=%s", route, recorder.Code, want, recorder.Body.String())
+		}
+	}
+}
+
+func TestManagementUsageV8MirrorsV0(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const rawKey = "sk-v8-usage-regression-0001"
+	const model = "v8-usage-regression"
+	usage.GetRequestStatistics().Record(context.Background(), coreusage.Record{
+		APIKey: rawKey, Source: rawKey, Model: model, AuthIndex: "v8-usage-auth", Failed: true,
+	})
+	cfg := &config.Config{}
+	cfg.RemoteManagement.SecretKey = "test-password"
+	h := management.NewHandler(cfg, "", nil)
+	h.SetLocalPassword("test-password")
+	s := &Server{cfg: cfg, engine: gin.New(), mgmt: h}
+	s.managementRoutesEnabled.Store(true)
+	s.registerManagementRoutes()
+	request := func(path string, authorized bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.RemoteAddr = "127.0.0.1:1234"
+		if authorized {
+			req.Header.Set("Authorization", "Bearer test-password")
+		}
+		rr := httptest.NewRecorder()
+		s.engine.ServeHTTP(rr, req)
+		return rr
+	}
+	t.Run("auth required", func(t *testing.T) {
+		if rr := request("/v8/management/usage", false); rr.Code != http.StatusUnauthorized {
+			t.Fatalf("status=%d want=401 body=%s", rr.Code, rr.Body.String())
+		}
+	})
+	t.Run("same snapshot and envelope", func(t *testing.T) {
+		v0 := request("/v0/management/usage", true)
+		v8 := request("/v8/management/usage", true)
+		if v0.Code != http.StatusOK || v8.Code != http.StatusOK {
+			t.Fatalf("v0 status=%d v8 status=%d", v0.Code, v8.Code)
+		}
+		if v0.Body.String() != v8.Body.String() {
+			t.Fatal("v8 response differs from v0")
+		}
+		var payload struct {
+			Usage          usage.StatisticsSnapshot `json:"usage"`
+			FailedRequests *int64                   `json:"failed_requests"`
+		}
+		if err := json.Unmarshal(v8.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.FailedRequests == nil || *payload.FailedRequests != payload.Usage.FailureCount {
+			t.Fatal("missing or incorrect failed_requests")
+		}
+		details := payload.Usage.APIs[usage.KeyFingerprint(rawKey)].Models[model].Details
+		if len(details) == 0 {
+			t.Fatal("missing recorded model details")
+		}
+		if detail := details[len(details)-1]; detail.Source != usage.KeyFingerprint(rawKey) || detail.AuthIndex != "v8-usage-auth" || !detail.Failed {
+			t.Fatalf("unexpected detail: %+v", detail)
+		}
+	})
+	t.Run("no raw key", func(t *testing.T) {
+		rr := request("/v8/management/usage", true)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status=%d want=200", rr.Code)
+		}
+		if strings.Contains(rr.Body.String(), rawKey) {
+			t.Fatal("response exposes raw API key")
+		}
+		if !strings.Contains(rr.Body.String(), usage.KeyFingerprint(rawKey)) {
+			t.Fatal("response lacks key fingerprint")
+		}
+	})
 }

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"gopkg.in/yaml.v3"
 )
@@ -18,15 +19,26 @@ const ConfigV8ContextKey = "management.config-v8"
 
 // ConfigV8 serves the persisted configuration using v8 names. GET is a view;
 // only a successful configuration mutation migrates the stored document.
+//
+// Reads return an ETag holding the SHA-256 of the on-disk config bytes.
+// Writes honour an optional If-Match against that token, so a client can
+// detect that another writer saved after its read (412) instead of silently
+// overwriting the change. Without If-Match, writes stay unconditional.
 func (h *Handler) ConfigV8(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	data, err := os.ReadFile(h.configFilePath)
+	raw, err := os.ReadFile(h.configFilePath)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "read_failed"})
 		return
 	}
-	data, _, err = config.NormalizeConfigLayout(data, true)
+	diskHash := config.ComputeSourceHash(raw)
+	if c.Request.Method != http.MethodGet && !ifMatchSatisfied(c.Request.Header.Values("If-Match"), diskHash) {
+		c.Header("ETag", configV8ETag(diskHash))
+		c.JSON(http.StatusPreconditionFailed, gin.H{"error": "precondition_failed"})
+		return
+	}
+	data, _, err := config.NormalizeConfigLayout(raw, true)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid_config", "message": err.Error()})
 		return
@@ -52,6 +64,11 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 					deleteConfigV8Path(server, []string{"credential"})
 				}
 			}
+			if allowances := configV8Node(root, v8AllowancesPath); allowances != nil {
+				for _, name := range v8AllowanceSecrets {
+					deleteConfigV8Path(allowances, []string{name})
+				}
+			}
 			h.injectV8APIKeyAuthIndexesLocked(root, data)
 		}
 		value := configV8Node(root, parts)
@@ -60,6 +77,7 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 			return
 		}
 		c.Header("Cache-Control", "no-store")
+		c.Header("ETag", configV8ETag(diskHash))
 		if yamlRequest {
 			c.Data(http.StatusOK, "application/yaml; charset=utf-8", data)
 			return
@@ -86,7 +104,7 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 	} else {
 		body, errRead := io.ReadAll(c.Request.Body)
 		if errRead != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body"})
+			c.JSON(clienterror.HTTPStatusFromErrorOr(errRead, http.StatusBadRequest), gin.H{"error": "invalid_body"})
 			return
 		}
 		if !yamlRequest && !json.Valid(body) {
@@ -140,6 +158,7 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 	}
 	if !yamlRequest && c.Request.Method != http.MethodDelete {
 		preserveV8TURNSecrets(root, before)
+		preserveV8AllowanceSecrets(root, before)
 	}
 	// Revisions are owned by Home and must not become ordinary editable settings.
 	for _, field := range []string{"credentials/concurrency/lifecycle-config-revision", "credentials/concurrency/observation-barrier-revision", "plugins/auth-revision"} {
@@ -158,6 +177,7 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 		}
 	}
 	stripAPIKeysAuthIndexesFromRoot(root)
+	config.NormalizeCollectionNodeStyles(root)
 	data, err = yaml.Marshal(&doc)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
@@ -186,10 +206,64 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 	}
 	// Runtime-only ownership state is never sourced from an uploaded YAML document.
 	next.Home = h.cfg.Home
+	// WriteConfig may normalize the bytes, so report the version actually on
+	// disk. If it cannot be read back, omit the ETag instead of guessing one.
+	// Like Home, SourceHash keeps its runtime owner and is published by the
+	// reload, so it is not overwritten on next here.
+	if saved, errSaved := os.ReadFile(h.configFilePath); errSaved == nil {
+		c.Header("ETag", configV8ETag(config.ComputeSourceHash(saved)))
+	}
 	h.cfg = next
 	snapshot := h.reloadSnapshotConfigLocked()
 	h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), snapshot)
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "config-version": 8})
+}
+
+// configV8ETag renders a config source hash as a strong ETag.
+func configV8ETag(hash string) string {
+	return `"` + hash + `"`
+}
+
+// ifMatchSatisfied reports whether the optional If-Match header lines pass
+// the RFC 9110 strong comparison against currentHash. Repeated lines form
+// one list. An absent header always passes; a present but blank header
+// carries no tag and fails; the whole field "*" matches any current
+// version; weak and malformed entity tags never match.
+func ifMatchSatisfied(values []string, currentHash string) bool {
+	if len(values) == 0 {
+		return true
+	}
+	field := strings.TrimSpace(strings.Join(values, ","))
+	if field == "*" {
+		return true
+	}
+	for _, tag := range splitEntityTagList(field) {
+		tag = strings.TrimSpace(tag)
+		if len(tag) >= 2 && tag[0] == '"' && tag[len(tag)-1] == '"' && !strings.Contains(tag[1:len(tag)-1], `"`) && tag[1:len(tag)-1] == currentHash {
+			return true
+		}
+	}
+	return false
+}
+
+// splitEntityTagList splits an If-Match field value on list commas. A comma
+// inside a quoted entity tag is tag content, not a separator.
+func splitEntityTagList(field string) []string {
+	parts := []string{}
+	start := 0
+	quoted := false
+	for i := 0; i < len(field); i++ {
+		switch field[i] {
+		case '"':
+			quoted = !quoted
+		case ',':
+			if !quoted {
+				parts = append(parts, field[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(parts, field[start:])
 }
 
 var v8ICEServersPath = []string{"oauth", "providers", "codex", "live-media-relay", "ice-servers"}
@@ -198,6 +272,40 @@ var v8ICEServersPath = []string{"oauth", "providers", "codex", "live-media-relay
 // writes that JSON back, matching by endpoint rather than array position so a
 // changed URL cannot inherit credentials for a different server. Explicit empty
 // strings/null clear a secret; YAML writes retain full replacement semantics.
+var v8AllowancesPath = []string{"routing", "allowances"}
+
+// v8AllowanceSecrets are hidden from JSON reads, so JSON writes that omit them keep the stored values.
+var v8AllowanceSecrets = []string{"collector-key", "service-key", "service-url"}
+
+func preserveV8AllowanceSecrets(root, before *yaml.Node) {
+	previous := configV8Node(before, v8AllowancesPath)
+	if previous == nil || previous.Kind != yaml.MappingNode {
+		return
+	}
+	next := root
+	for _, part := range v8AllowancesPath {
+		if next.Kind != yaml.MappingNode {
+			return
+		}
+		child := configV8Node(next, []string{part})
+		if child == nil {
+			child = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			next.Content = append(next.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: part}, child)
+		}
+		next = child
+	}
+	if next.Kind != yaml.MappingNode {
+		return
+	}
+	for _, name := range v8AllowanceSecrets {
+		if configV8Node(next, []string{name}) == nil {
+			if secret := configV8Node(previous, []string{name}); secret != nil {
+				next.Content = append(next.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: name}, cloneConfigV8Node(secret))
+			}
+		}
+	}
+}
+
 func preserveV8TURNSecrets(root, before *yaml.Node) {
 	next := configV8Node(root, v8ICEServersPath)
 	previous := configV8Node(before, v8ICEServersPath)

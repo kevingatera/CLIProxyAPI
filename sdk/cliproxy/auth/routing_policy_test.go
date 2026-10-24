@@ -2,9 +2,13 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
-	"reflect"
+	"strings"
+	"sync"
 	"testing"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -12,288 +16,571 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
+type routingPolicyCall struct {
+	op      string
+	authID  string
+	model   string
+	payload string
+}
+
 type routingPolicyTestExecutor struct {
-	id string
-
-	execute func(*Auth) error
-	calls   []string
+	provider  string
+	mu        sync.Mutex
+	calls     []routingPolicyCall
+	errs      map[string]error
+	streamErr error
 }
 
-func (e *routingPolicyTestExecutor) Identifier() string { return e.id }
+func (e *routingPolicyTestExecutor) Identifier() string { return e.provider }
 
-func (e *routingPolicyTestExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	_ = ctx
-	_ = req
-	_ = opts
-	if auth != nil {
-		e.calls = append(e.calls, auth.ID)
-	}
-	if e.execute != nil {
-		if err := e.execute(auth); err != nil {
-			return cliproxyexecutor.Response{}, err
-		}
-	}
-	return cliproxyexecutor.Response{Payload: []byte("ok")}, nil
+func (e *routingPolicyTestExecutor) record(op string, auth *Auth, req cliproxyexecutor.Request) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.calls = append(e.calls, routingPolicyCall{op: op, authID: auth.ID, model: req.Model, payload: string(req.Payload)})
+	return e.errs[auth.ID]
 }
 
-func (e *routingPolicyTestExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	if _, err := e.Execute(ctx, auth, req, opts); err != nil {
+func (e *routingPolicyTestExecutor) snapshot() []routingPolicyCall {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]routingPolicyCall(nil), e.calls...)
+}
+
+func (e *routingPolicyTestExecutor) Execute(_ context.Context, auth *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if err := e.record("execute", auth, req); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	return cliproxyexecutor.Response{Payload: []byte("completion:" + auth.ID)}, nil
+}
+
+func (e *routingPolicyTestExecutor) CountTokens(_ context.Context, auth *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if err := e.record("count", auth, req); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	return cliproxyexecutor.Response{Payload: []byte(`{"input_tokens":1}`)}, nil
+}
+
+func (e *routingPolicyTestExecutor) ExecuteStream(_ context.Context, auth *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	if err := e.record("stream", auth, req); err != nil {
 		return nil, err
 	}
-	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
-	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("ok")}
+	chunks := make(chan cliproxyexecutor.StreamChunk, 2)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("chunk:" + auth.ID)}
+	if e.streamErr != nil {
+		chunks <- cliproxyexecutor.StreamChunk{Err: e.streamErr}
+	}
 	close(chunks)
 	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
 }
 
-func (e *routingPolicyTestExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
-	_ = ctx
+func (*routingPolicyTestExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
 	return auth, nil
 }
 
-func (e *routingPolicyTestExecutor) CountTokens(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	_ = ctx
-	_ = auth
-	_ = req
-	_ = opts
-	return cliproxyexecutor.Response{}, nil
-}
-
-func (e *routingPolicyTestExecutor) HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
-	_ = ctx
-	_ = auth
-	_ = req
+func (*routingPolicyTestExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
 	return nil, nil
 }
 
-func registerRoutingPolicyAuthModel(t *testing.T, provider, model string, authIDs ...string) {
+func newRoutingPolicyTestManager(t *testing.T, name string, authIDs []string, policy internalconfig.RoutingPolicy) (*Manager, *routingPolicyTestExecutor, string) {
 	t.Helper()
-	reg := registry.GetGlobalRegistry()
-	for _, authID := range authIDs {
-		reg.RegisterClient(authID, provider, []*registry.ModelInfo{{ID: model}})
+	provider := "routing-policy-" + name
+	model := provider + "-model"
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(0, 0, 0)
+	executor := &routingPolicyTestExecutor{provider: provider, errs: map[string]error{}}
+	manager.RegisterExecutor(executor)
+	limits := make(map[string]int, len(authIDs))
+	for _, id := range authIDs {
+		limits[provider+"-"+id] = 0
 	}
-	t.Cleanup(func() {
-		for _, authID := range authIDs {
-			reg.UnregisterClient(authID)
+	registerRetryRoundLocalAuths(t, manager, provider, model, limits)
+	for i := range policy.Defaults.Route {
+		policy.Defaults.Route[i].Provider = provider
+		for j, id := range policy.Defaults.Route[i].AuthOrder {
+			policy.Defaults.Route[i].AuthOrder[j] = provider + "-" + id
+		}
+	}
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{Policy: policy}})
+	return manager, executor, model
+}
+
+func routeIDs(calls []routingPolicyCall, provider string) []string {
+	out := make([]string, 0, len(calls))
+	for _, call := range calls {
+		out = append(out, call.op+":"+call.authID[len(provider)+1:])
+	}
+	return out
+}
+
+func assertRouteCalls(t *testing.T, executor *routingPolicyTestExecutor, want ...string) {
+	t.Helper()
+	got := routeIDs(executor.snapshot(), executor.provider)
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("calls = %v, want %v", got, want)
+	}
+}
+
+func drainStream(t *testing.T, result *cliproxyexecutor.StreamResult) error {
+	t.Helper()
+	var streamErr error
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+		}
+	}
+	return streamErr
+}
+
+func pinnedPolicy(authOrder []string, includeRemaining bool, fallbackOn ...string) internalconfig.RoutingPolicy {
+	return internalconfig.RoutingPolicy{
+		Enabled:  true,
+		Defaults: internalconfig.RoutingPolicyRule{Route: []internalconfig.RoutingPolicyRoute{{AuthOrder: authOrder, IncludeRemainingAuth: includeRemaining}}},
+		Fallback: internalconfig.RoutingFallbackPolicy{On: fallbackOn},
+	}
+}
+
+// A token-count request dispatches CountTokens on every candidate and never Execute.
+func TestRoutingPolicyCountTokensNeverExecutes(t *testing.T) {
+	manager, executor, model := newRoutingPolicyTestManager(t, "count", []string{"a", "b"}, pinnedPolicy([]string{"b", "a"}, false))
+	executor.errs[executor.provider+"-b"] = &Error{HTTPStatus: http.StatusTooManyRequests, Message: "limited"}
+
+	resp, err := manager.ExecuteCount(context.Background(), []string{executor.provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("ExecuteCount: %v", err)
+	}
+	if string(resp.Payload) != `{"input_tokens":1}` {
+		t.Fatalf("payload = %s, want token count", resp.Payload)
+	}
+	assertRouteCalls(t, executor, "count:b", "count:a")
+}
+
+// Pinned candidates run through the normal pipeline, so request-after-auth interceptors see the body.
+func TestRoutingPolicyCandidatesUseNormalPipeline(t *testing.T) {
+	manager, executor, model := newRoutingPolicyTestManager(t, "pipeline", []string{"a", "b"}, pinnedPolicy([]string{"b", "a"}, false))
+	intercepted := 0
+	opts := cliproxyexecutor.Options{
+		RequestAfterAuthInterceptor: func(_ context.Context, in cliproxyexecutor.RequestAfterAuthInterceptRequest) cliproxyexecutor.RequestAfterAuthInterceptResponse {
+			intercepted++
+			return cliproxyexecutor.RequestAfterAuthInterceptResponse{Body: []byte("intercepted")}
+		},
+	}
+
+	resp, err := manager.Execute(context.Background(), []string{executor.provider}, cliproxyexecutor.Request{Model: model, Payload: []byte("original")}, opts)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if string(resp.Payload) != "completion:"+executor.provider+"-b" {
+		t.Fatalf("payload = %s, want first pinned auth b", resp.Payload)
+	}
+	calls := executor.snapshot()
+	if intercepted != 1 || len(calls) != 1 || calls[0].payload != "intercepted" {
+		t.Fatalf("interceptor ran %d times, calls = %+v; want the pinned call to see the intercepted body", intercepted, calls)
+	}
+}
+
+// A failure the policy does not allow to fall back stops the plan.
+func TestRoutingPolicyStopsOnDisallowedFallback(t *testing.T) {
+	manager, executor, model := newRoutingPolicyTestManager(t, "stop", []string{"a", "b"}, pinnedPolicy([]string{"a", "b"}, false, "rate_limited"))
+	executor.errs[executor.provider+"-a"] = &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "down"}
+
+	_, err := manager.Execute(context.Background(), []string{executor.provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if statusCodeFromError(err) != http.StatusServiceUnavailable {
+		t.Fatalf("err = %v, want the 503 from auth a", err)
+	}
+	assertRouteCalls(t, executor, "execute:a")
+}
+
+// With include-remaining-auth false, omitted auths are never used on any operation,
+// even after every listed auth fails.
+func TestRoutingPolicyNeverUsesOmittedAuths(t *testing.T) {
+	ops := map[string]func(*Manager, string, string) error{
+		"execute": func(m *Manager, provider, model string) error {
+			_, err := m.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+			return err
+		},
+		"count": func(m *Manager, provider, model string) error {
+			_, err := m.ExecuteCount(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+			return err
+		},
+		"stream": func(m *Manager, provider, model string) error {
+			_, err := m.ExecuteStream(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
+			return err
+		},
+	}
+	for op, run := range ops {
+		t.Run(op, func(t *testing.T) {
+			manager, executor, model := newRoutingPolicyTestManager(t, "omit-"+op, []string{"a", "b", "c"}, pinnedPolicy([]string{"b"}, false))
+			executor.errs[executor.provider+"-b"] = &Error{HTTPStatus: http.StatusTooManyRequests, Message: "limited"}
+
+			if err := run(manager, executor.provider, model); statusCodeFromError(err) != http.StatusTooManyRequests {
+				t.Fatalf("err = %v, want 429 from b", err)
+			}
+			assertRouteCalls(t, executor, op+":b")
+		})
+	}
+}
+
+// include-remaining-auth tries the other auths after the listed ones, without retrying the listed auth.
+func TestRoutingPolicyIncludeRemainingAuthSkipsListed(t *testing.T) {
+	manager, executor, model := newRoutingPolicyTestManager(t, "remaining", []string{"a", "b"}, pinnedPolicy([]string{"b"}, true))
+	executor.errs[executor.provider+"-b"] = &Error{HTTPStatus: http.StatusTooManyRequests, Message: "limited"}
+
+	if _, err := manager.Execute(context.Background(), []string{executor.provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	assertRouteCalls(t, executor, "execute:b", "execute:a")
+}
+
+// Explicit order is honored for streams, and a stream that fails after it starts is traced as failed.
+func TestRoutingPolicyStreamOrderAndCompletionTrace(t *testing.T) {
+	manager, executor, model := newRoutingPolicyTestManager(t, "stream", []string{"a", "b", "c"}, pinnedPolicy([]string{"c", "a"}, false))
+	executor.errs[executor.provider+"-c"] = &Error{HTTPStatus: http.StatusBadGateway, Message: "bad gateway"}
+	executor.streamErr = &Error{HTTPStatus: http.StatusBadGateway, Message: "reset mid-stream"}
+
+	result, err := manager.ExecuteStream(context.Background(), []string{executor.provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
+	if err != nil {
+		t.Fatalf("ExecuteStream: %v", err)
+	}
+	if streamErr := drainStream(t, result); streamErr == nil {
+		t.Fatal("expected the mid-stream error to reach the client")
+	}
+	assertRouteCalls(t, executor, "stream:c", "stream:a")
+
+	traces := manager.ListRoutingTraces(10, "", "", false)
+	if len(traces) != 1 {
+		t.Fatalf("traces = %d, want 1", len(traces))
+	}
+	trace := traces[0]
+	if trace.FinalStatus != "failed" || len(trace.Attempts) != 2 || trace.Attempts[0].FallbackReason != "server_error" || !trace.Attempts[1].Success {
+		t.Fatalf("trace = %+v, want c server_error fallback, a started, final failed", trace)
+	}
+}
+
+// Traces are recorded only while the policy is enabled.
+func TestRoutingPolicyTracesOnlyWhenEnabled(t *testing.T) {
+	manager, executor, model := newRoutingPolicyTestManager(t, "trace-off", []string{"a"}, internalconfig.RoutingPolicy{})
+	if _, err := manager.Execute(context.Background(), []string{executor.provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if traces := manager.ListRoutingTraces(10, "", "", false); len(traces) != 0 {
+		t.Fatalf("disabled policy recorded %d traces", len(traces))
+	}
+
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{Policy: internalconfig.RoutingPolicy{Enabled: true}}})
+	if _, err := manager.Execute(context.Background(), []string{executor.provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	traces := manager.ListRoutingTraces(10, "", "", false)
+	if len(traces) != 1 || traces[0].FinalStatus != "success" {
+		t.Fatalf("enabled policy traces = %+v, want one success", traces)
+	}
+}
+
+// Fallback classification uses structured signals only; error text never matters.
+func TestClassifyRoutingFailureUsesStructuredSignals(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	cases := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want string
+	}{
+		{"quota text without status", context.Background(), errors.New("quota exhausted, cooldown"), ""},
+		{"bare eof text", context.Background(), errors.New("unexpected eof from upstream"), ""},
+		{"402", context.Background(), &Error{HTTPStatus: http.StatusPaymentRequired}, "exhausted"},
+		{"400 structured insufficient_quota", context.Background(), &Error{HTTPStatus: http.StatusBadRequest, Message: `{"error":{"type":"insufficient_quota","code":"insufficient_quota","message":"out of credit"}}`}, "exhausted"},
+		{"400 structured billing limit", context.Background(), &Error{HTTPStatus: http.StatusBadRequest, Message: `{"error":{"code":"billing_hard_limit_reached","message":"limit"}}`}, "exhausted"},
+		{"400 invalid request stays terminal", context.Background(), &Error{HTTPStatus: http.StatusBadRequest, Message: `{"error":{"type":"invalid_request_error","code":"invalid_value","message":"bad field"}}`}, ""},
+		{"400 credit text without code stays terminal", context.Background(), &Error{HTTPStatus: http.StatusBadRequest, Message: "Your credit balance is too low"}, ""},
+		{"model cooldown", context.Background(), newModelCooldownError("m", "p", 0), "exhausted"},
+		{"429", context.Background(), &Error{HTTPStatus: http.StatusTooManyRequests}, "rate_limited"},
+		{"503", context.Background(), &Error{HTTPStatus: http.StatusServiceUnavailable}, "server_error"},
+		{"401", context.Background(), &Error{HTTPStatus: http.StatusUnauthorized}, ""},
+		{"net error", context.Background(), &net.OpError{Op: "dial", Err: errors.New("refused")}, "transport_error"},
+		{"wrapped unexpected eof", context.Background(), fmt.Errorf("read body: %w", io.ErrUnexpectedEOF), "transport_error"},
+		{"unknown auth", context.Background(), &Error{Code: "auth_not_found", Message: "no auth available"}, "unavailable"},
+		{"request canceled", canceled, &Error{HTTPStatus: http.StatusServiceUnavailable}, ""},
+	}
+	for _, tc := range cases {
+		if got := classifyRoutingFailure(tc.ctx, tc.err); got != tc.want {
+			t.Errorf("%s: classify = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestRoutingTraceRingKeepsNewest(t *testing.T) {
+	var ring routingTraceRing
+	for i := 1; i <= 5; i++ {
+		ring.add(RoutingTrace{ID: fmt.Sprint(i)}, 3)
+	}
+	if len(ring.buf) != 3 {
+		t.Fatalf("buffer len = %d, want fixed capacity 3", len(ring.buf))
+	}
+	ids := func() string {
+		out := ""
+		for _, trace := range ring.orderedLocked() {
+			out += trace.ID
+		}
+		return out
+	}
+	if got := ids(); got != "345" {
+		t.Fatalf("ordered = %s, want 345", got)
+	}
+	ring.add(RoutingTrace{ID: "6"}, 2)
+	if got := ids(); got != "56" {
+		t.Fatalf("after shrink ordered = %s, want 56", got)
+	}
+	ring.add(RoutingTrace{ID: "7"}, 4)
+	if got := ids(); got != "567" {
+		t.Fatalf("after grow ordered = %s, want 567", got)
+	}
+}
+
+// The shared request retry credential budget spans the whole plan, not each route step.
+func TestRoutingPolicyRetryCredentialBudgetSpansPlan(t *testing.T) {
+	manager, executor, model := newRoutingPolicyTestManager(t, "budget", []string{"a", "b", "c"}, pinnedPolicy([]string{"a", "b"}, true))
+	manager.SetRetryConfig(0, 0, 2)
+	for _, id := range []string{"a", "b", "c"} {
+		executor.errs[executor.provider+"-"+id] = &Error{HTTPStatus: http.StatusInternalServerError, Message: "down"}
+	}
+
+	if _, err := manager.Execute(context.Background(), []string{executor.provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); statusCodeFromError(err) != http.StatusInternalServerError {
+		t.Fatalf("err = %v, want the 500 from the last attempted auth", err)
+	}
+	assertRouteCalls(t, executor, "execute:a", "execute:b")
+}
+
+// Invalid requests with no providers never reach the plan and leave no trace.
+func TestRoutingPolicyNoProvidersLeaveNoTrace(t *testing.T) {
+	manager, _, model := newRoutingPolicyTestManager(t, "no-providers", []string{"a"}, pinnedPolicy([]string{"a"}, false))
+	_, err := manager.ExecuteStream(context.Background(), nil, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
+	var authErr *Error
+	if !errors.As(err, &authErr) || authErr.Code != "provider_not_found" {
+		t.Fatalf("ExecuteStream err = %v, want provider_not_found", err)
+	}
+	if _, err := manager.Execute(context.Background(), nil, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); !errors.As(err, &authErr) || authErr.Code != "provider_not_found" {
+		t.Fatalf("Execute err = %v, want provider_not_found", err)
+	}
+	if traces := manager.ListRoutingTraces(10, "", "", false); len(traces) != 0 {
+		t.Fatalf("invalid requests recorded %d traces", len(traces))
+	}
+}
+
+// Pinned candidates run through the normal pipeline, so model aliases resolve to the upstream model.
+func TestRoutingPolicyCandidatesResolveModelAliases(t *testing.T) {
+	manager, executor, model := newRoutingPolicyTestManager(t, "alias", []string{"a", "b"}, pinnedPolicy([]string{"b"}, false))
+	alias := model + "-alias"
+	manager.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{
+		executor.provider: {{Name: model, Alias: alias, Fork: true}},
+	})
+	reg := registry.GetGlobalRegistry()
+	for _, id := range []string{"a", "b"} {
+		authID := executor.provider + "-" + id
+		reg.RegisterClient(authID, executor.provider, []*registry.ModelInfo{{ID: alias}, {ID: model}})
+		t.Cleanup(func() { reg.UnregisterClient(authID) })
+		manager.RefreshSchedulerEntry(authID)
+	}
+
+	if _, err := manager.Execute(context.Background(), []string{executor.provider}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	calls := executor.snapshot()
+	if len(calls) != 1 || calls[0].authID != executor.provider+"-b" || calls[0].model != model {
+		t.Fatalf("calls = %+v, want one pinned call to b with upstream model %s", calls, model)
+	}
+}
+
+// A configured route that the request does not offer must fail closed when
+// include-remaining-providers is false. It must not open the providers the policy omits.
+func TestRoutingPolicyUnofferedRouteFailsClosed(t *testing.T) {
+	manager, executor, model := newRoutingPolicyTestManager(t, "unoffered", []string{"a"}, pinnedPolicy([]string{"a"}, false))
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{Policy: internalconfig.RoutingPolicy{
+		Enabled: true,
+		Defaults: internalconfig.RoutingPolicyRule{Route: []internalconfig.RoutingPolicyRoute{
+			{Provider: "routing-policy-elsewhere", AuthOrder: []string{"x"}},
+		}},
+	}}})
+
+	if _, err := manager.Execute(context.Background(), []string{executor.provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err == nil {
+		t.Fatal("Execute error = nil, want fail-closed error")
+	}
+	assertRouteCalls(t, executor)
+}
+
+// creditsPolicyExecutor records every Antigravity call with whether it carried the credits flag.
+// Plain calls and, when failCredits is set, credits calls return 429.
+type creditsPolicyExecutor struct {
+	failCredits bool
+	mu          sync.Mutex
+	calls       []string
+}
+
+func (e *creditsPolicyExecutor) Identifier() string { return "antigravity" }
+
+func (e *creditsPolicyExecutor) record(ctx context.Context, auth *Auth) error {
+	credits := AntigravityCreditsRequested(ctx)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	label := auth.ID + ":plain"
+	if credits {
+		label = auth.ID + ":credits"
+	}
+	e.calls = append(e.calls, label)
+	if !credits || e.failCredits {
+		return &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}
+	}
+	return nil
+}
+
+func (e *creditsPolicyExecutor) snapshot() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.calls...)
+}
+
+func (e *creditsPolicyExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if err := e.record(ctx, auth); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	return cliproxyexecutor.Response{Payload: []byte("completion:" + auth.ID)}, nil
+}
+
+func (e *creditsPolicyExecutor) ExecuteStream(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	if err := e.record(ctx, auth); err != nil {
+		return nil, err
+	}
+	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("chunk:" + auth.ID)}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (*creditsPolicyExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (*creditsPolicyExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusNotImplemented, Message: "CountTokens not implemented"}
+}
+
+func (*creditsPolicyExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, &Error{HTTPStatus: http.StatusNotImplemented, Message: "HttpRequest not implemented"}
+}
+
+func newCreditsPolicyTestManager(t *testing.T, authIDs []string, policy internalconfig.RoutingPolicy, maxRetryCredentials int) (*Manager, *creditsPolicyExecutor) {
+	t.Helper()
+	const model = "claude-credits-policy"
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(0, 0, maxRetryCredentials)
+	executor := &creditsPolicyExecutor{}
+	manager.RegisterExecutor(executor)
+	limits := make(map[string]int, len(authIDs))
+	for _, id := range authIDs {
+		limits[id] = 0
+	}
+	registerRetryRoundLocalAuths(t, manager, "antigravity", model, limits)
+	manager.SetConfig(&internalconfig.Config{
+		QuotaExceeded: internalconfig.QuotaExceeded{AntigravityCredits: true},
+		Routing:       internalconfig.RoutingConfig{Policy: policy},
+	})
+	return manager, executor
+}
+
+func antigravityPinnedPolicy(authID string) internalconfig.RoutingPolicy {
+	policy := pinnedPolicy([]string{authID}, false)
+	policy.Defaults.Route[0].Provider = "antigravity"
+	return policy
+}
+
+// The credits fallback must not dispatch to an Antigravity auth the policy omits. The omitted
+// auth sorts first, so a fallback that ignores the policy would reach it before the allowed one.
+func TestRoutingPolicyCreditsFallbackHonoursAuthFilter(t *testing.T) {
+	const model = "claude-credits-policy"
+	t.Run("execute", func(t *testing.T) {
+		manager, executor := newCreditsPolicyTestManager(t, []string{"a-omitted", "b"}, antigravityPinnedPolicy("b"), 0)
+		if _, err := manager.Execute(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err != nil {
+			t.Fatalf("Execute error = %v, want credits success", err)
+		}
+		if got, want := fmt.Sprint(executor.snapshot()), "[b:plain b:credits]"; got != want {
+			t.Fatalf("calls = %s, want %s", got, want)
+		}
+	})
+	t.Run("stream", func(t *testing.T) {
+		manager, executor := newCreditsPolicyTestManager(t, []string{"a-omitted", "b"}, antigravityPinnedPolicy("b"), 0)
+		result, err := manager.ExecuteStream(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+		if err != nil {
+			t.Fatalf("ExecuteStream error = %v, want credits success", err)
+		}
+		if err := drainStream(t, result); err != nil {
+			t.Fatalf("stream error = %v", err)
+		}
+		if got, want := fmt.Sprint(executor.snapshot()), "[b:plain b:credits]"; got != want {
+			t.Fatalf("calls = %s, want %s", got, want)
 		}
 	})
 }
 
-func TestPreviewRouting_PolicyOrderAndAuthOrder(t *testing.T) {
-	t.Parallel()
-
-	model := "gpt-5.4-mini"
-	cfg := &internalconfig.Config{
-		Routing: internalconfig.RoutingConfig{
-			Policy: internalconfig.RoutingPolicy{
-				Enabled: true,
-				Defaults: internalconfig.RoutingPolicyRule{
-					Route: []internalconfig.RoutingPolicyRoute{
-						{Provider: "claude", AuthOrder: []string{"claude-2", "claude-1"}},
-						{Provider: "codex", IncludeRemainingAuth: true},
-					},
-					IncludeRemainingProviders: true,
-				},
-			},
-		},
+// The credits fallback is capped by max-retry-credentials instead of sweeping every candidate.
+func TestAntigravityCreditsFallbackStopsAtRetryBudget(t *testing.T) {
+	manager, executor := newCreditsPolicyTestManager(t, []string{"a", "b", "c"}, internalconfig.RoutingPolicy{}, 1)
+	executor.failCredits = true
+	if _, err := manager.Execute(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: "claude-credits-policy"}, cliproxyexecutor.Options{}); err == nil {
+		t.Fatal("Execute error = nil, want the quota error")
 	}
-	cfg.SanitizeRoutingPolicy()
-
-	m := NewManager(nil, &RoundRobinSelector{}, nil)
-	m.SetConfig(cfg)
-	m.RegisterExecutor(&routingPolicyTestExecutor{id: "claude"})
-	m.RegisterExecutor(&routingPolicyTestExecutor{id: "codex"})
-
-	for _, auth := range []*Auth{
-		{ID: "claude-1", Provider: "claude", Status: StatusActive},
-		{ID: "claude-2", Provider: "claude", Status: StatusActive},
-		{ID: "codex-a", Provider: "codex", Status: StatusActive},
-	} {
-		if _, err := m.Register(context.Background(), auth); err != nil {
-			t.Fatalf("register auth %s: %v", auth.ID, err)
+	credits := 0
+	for _, call := range executor.snapshot() {
+		if strings.HasSuffix(call, ":credits") {
+			credits++
 		}
 	}
-	registerRoutingPolicyAuthModel(t, "claude", model, "claude-1", "claude-2")
-	registerRoutingPolicyAuthModel(t, "codex", model, "codex-a")
-
-	preview := m.PreviewRouting(model, []string{"codex", "claude"}, cliproxyexecutor.Options{})
-	if !preview.PolicyEnabled {
-		t.Fatalf("preview policy-enabled = false, want true")
-	}
-	if len(preview.OrderedProviders) != 2 || preview.OrderedProviders[0] != "claude" || preview.OrderedProviders[1] != "codex" {
-		t.Fatalf("ordered providers = %v, want [claude codex]", preview.OrderedProviders)
-	}
-	if len(preview.ProviderDetails) != 2 {
-		t.Fatalf("provider details len = %d, want 2", len(preview.ProviderDetails))
-	}
-	if got := preview.ProviderDetails[0].AuthOrder; len(got) != 2 || got[0] != "claude-2" || got[1] != "claude-1" {
-		t.Fatalf("claude auth order = %v, want [claude-2 claude-1]", got)
+	if credits != 1 {
+		t.Fatalf("credits calls = %d, want 1 under max-retry-credentials 1: %v", credits, executor.snapshot())
 	}
 }
 
-func TestExecute_PolicyStopsOnAuthMismatchStyleErrors(t *testing.T) {
-	t.Parallel()
-
-	model := "gpt-5.4-mini"
-	cfg := &internalconfig.Config{
-		Routing: internalconfig.RoutingConfig{
-			Policy: internalconfig.RoutingPolicy{
-				Enabled: true,
-				Defaults: internalconfig.RoutingPolicyRule{
-					Route: []internalconfig.RoutingPolicyRoute{
-						{Provider: "codex", AuthOrder: []string{"auth-a", "auth-b"}},
-					},
-				},
-				Fallback: internalconfig.RoutingFallbackPolicy{
-					On: []string{"exhausted", "rate_limited", "server_error", "transport_error"},
-				},
-			},
-		},
-	}
-	cfg.SanitizeRoutingPolicy()
-
-	exec := &routingPolicyTestExecutor{
-		id: "codex",
-		execute: func(auth *Auth) error {
-			if auth != nil && auth.ID == "auth-a" {
-				return &Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"}
-			}
-			return nil
-		},
-	}
-	m := NewManager(nil, &RoundRobinSelector{}, nil)
-	m.SetConfig(cfg)
-	m.RegisterExecutor(exec)
-	for _, auth := range []*Auth{
-		{ID: "auth-a", Provider: "codex", Status: StatusActive},
-		{ID: "auth-b", Provider: "codex", Status: StatusActive},
-	} {
-		if _, err := m.Register(context.Background(), auth); err != nil {
-			t.Fatalf("register auth %s: %v", auth.ID, err)
+// The credits fallback shares the plain round's max-retry-credentials budget. With a budget of one,
+// b is the only credential the round tried, so the fallback may retry b's credits mode but must not
+// add a as a second credential.
+func TestAntigravityCreditsFallbackSpendsPlainRoundBudget(t *testing.T) {
+	const model = "claude-credits-policy"
+	policy := pinnedPolicy([]string{"b", "a"}, true)
+	policy.Defaults.Route[0].Provider = "antigravity"
+	const want = "[b:plain b:credits]"
+	t.Run("execute", func(t *testing.T) {
+		manager, executor := newCreditsPolicyTestManager(t, []string{"a", "b"}, policy, 1)
+		executor.failCredits = true
+		if _, err := manager.Execute(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err == nil {
+			t.Fatal("Execute error = nil, want the quota error")
 		}
-	}
-	registerRoutingPolicyAuthModel(t, "codex", model, "auth-a", "auth-b")
-
-	_, err := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if err == nil {
-		t.Fatalf("expected execute error")
-	}
-	if len(exec.calls) != 1 || exec.calls[0] != "auth-a" {
-		t.Fatalf("executor calls = %v, want only auth-a", exec.calls)
-	}
+		if got := fmt.Sprint(executor.snapshot()); got != want {
+			t.Fatalf("calls = %s, want %s", got, want)
+		}
+	})
+	t.Run("stream", func(t *testing.T) {
+		manager, executor := newCreditsPolicyTestManager(t, []string{"a", "b"}, policy, 1)
+		executor.failCredits = true
+		result, err := manager.ExecuteStream(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+		if err == nil {
+			err = drainStream(t, result)
+		}
+		if err == nil {
+			t.Fatal("ExecuteStream error = nil, want the quota error")
+		}
+		if got := fmt.Sprint(executor.snapshot()); got != want {
+			t.Fatalf("calls = %s, want %s", got, want)
+		}
+	})
 }
 
-func TestExecute_RoutingTraceIncludesFallbackAttempts(t *testing.T) {
-	t.Parallel()
+// A 400 that names an exhausted balance in its structured error must fail over to the next
+// route, while a plain invalid request on the same route stays terminal.
+func TestRoutingPolicyFailsOverOnStructuredCreditExhaustion(t *testing.T) {
+	manager, executor, model := newRoutingPolicyTestManager(t, "credit400", []string{"a", "b"}, pinnedPolicy([]string{"a"}, true))
+	executor.errs[executor.provider+"-a"] = &Error{HTTPStatus: http.StatusBadRequest, Message: `{"error":{"type":"insufficient_quota","code":"insufficient_quota","message":"out of credit"}}`}
 
-	model := "gpt-5.4-mini"
-	cfg := &internalconfig.Config{
-		Routing: internalconfig.RoutingConfig{
-			Policy: internalconfig.RoutingPolicy{
-				Enabled: true,
-				Defaults: internalconfig.RoutingPolicyRule{
-					Route: []internalconfig.RoutingPolicyRoute{
-						{Provider: "codex", AuthOrder: []string{"auth-a", "auth-b"}},
-					},
-				},
-				Fallback: internalconfig.RoutingFallbackPolicy{
-					On: []string{"exhausted", "rate_limited", "server_error", "transport_error"},
-				},
-				Observability: internalconfig.RoutingPolicyObservability{TraceLimit: 32},
-			},
-		},
+	if _, err := manager.Execute(context.Background(), []string{executor.provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err != nil {
+		t.Fatalf("Execute error = %v, want failover success", err)
 	}
-	cfg.SanitizeRoutingPolicy()
-
-	exec := &routingPolicyTestExecutor{
-		id: "codex",
-		execute: func(auth *Auth) error {
-			if auth != nil && auth.ID == "auth-a" {
-				return &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}
-			}
-			return nil
-		},
-	}
-	m := NewManager(nil, &RoundRobinSelector{}, nil)
-	m.SetConfig(cfg)
-	m.RegisterExecutor(exec)
-	for _, auth := range []*Auth{
-		{ID: "auth-a", Provider: "codex", Status: StatusActive},
-		{ID: "auth-b", Provider: "codex", Status: StatusActive},
-	} {
-		if _, err := m.Register(context.Background(), auth); err != nil {
-			t.Fatalf("register auth %s: %v", auth.ID, err)
-		}
-	}
-	registerRoutingPolicyAuthModel(t, "codex", model, "auth-a", "auth-b")
-
-	if _, err := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err != nil {
-		t.Fatalf("execute should succeed on fallback auth: %v", err)
-	}
-
-	traces := m.ListRoutingTraces(5, model, "codex", false)
-	if len(traces) == 0 {
-		t.Fatalf("expected at least one routing trace")
-	}
-	latest := traces[0]
-	if latest.FinalStatus != "success" {
-		t.Fatalf("final status = %q, want success", latest.FinalStatus)
-	}
-	if len(latest.Attempts) < 2 {
-		t.Fatalf("attempt count = %d, want >= 2", len(latest.Attempts))
-	}
-	firstAttempt := latest.Attempts[0]
-	if !firstAttempt.Fallback {
-		t.Fatalf("first attempt fallback = false, want true")
-	}
-	if firstAttempt.FallbackReason != "rate_limited" && firstAttempt.FallbackReason != "exhausted" {
-		t.Fatalf("first attempt fallback reason = %q, want rate_limited/exhausted", firstAttempt.FallbackReason)
-	}
-}
-
-func TestExecuteStream_RoutingPolicyAuthOrderAndFallback(t *testing.T) {
-	for _, failFirst := range []bool{false, true} {
-		t.Run(fmt.Sprint(failFirst), func(t *testing.T) {
-			model := "routing-stream-order-test"
-			cfg := &internalconfig.Config{Routing: internalconfig.RoutingConfig{Policy: internalconfig.RoutingPolicy{
-				Enabled:       true,
-				Defaults:      internalconfig.RoutingPolicyRule{Route: []internalconfig.RoutingPolicyRoute{{Provider: "claude", AuthOrder: []string{"z-oauth", "a-fallback"}}}},
-				Fallback:      internalconfig.RoutingFallbackPolicy{On: []string{"rate_limited"}},
-				Observability: internalconfig.RoutingPolicyObservability{TraceLimit: 32},
-			}}}
-			cfg.SanitizeRoutingPolicy()
-			exec := &routingPolicyTestExecutor{id: "claude", execute: func(a *Auth) error {
-				if failFirst && a.ID == "z-oauth" {
-					return &Error{HTTPStatus: 429, Message: "rate limited"}
-				}
-				return nil
-			}}
-			m := NewManager(nil, &RoundRobinSelector{}, nil)
-			m.SetConfig(cfg)
-			m.RegisterExecutor(exec)
-			for _, id := range []string{"a-fallback", "z-oauth"} {
-				if _, err := m.Register(context.Background(), &Auth{ID: id, Provider: "claude", Status: StatusActive}); err != nil {
-					t.Fatal(err)
-				}
-			}
-			registerRoutingPolicyAuthModel(t, "claude", model, "a-fallback", "z-oauth")
-			result, err := m.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
-			if err != nil {
-				t.Fatal(err)
-			}
-			for range result.Chunks {
-			}
-			want := []string{"z-oauth"}
-			if failFirst {
-				want = append(want, "a-fallback")
-			}
-			if !reflect.DeepEqual(exec.calls, want) {
-				t.Fatalf("calls %v want %v", exec.calls, want)
-			}
-			traces := m.ListRoutingTraces(1, model, "claude", false)
-			if len(traces) != 1 || len(traces[0].Attempts) != len(want) {
-				t.Fatalf("traces %#v", traces)
-			}
-		})
-	}
+	assertRouteCalls(t, executor, "execute:a", "execute:b")
 }

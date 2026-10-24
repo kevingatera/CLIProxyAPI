@@ -97,10 +97,12 @@ retain the corresponding business operation's fields.
 | `/observability/logs/errors/<name>` | GET | Download an error-log file. |
 | `/observability/logs/requests/<id>` | GET | Get a request log. |
 | `/observability/usage/api-keys` | GET | Get API-key usage. |
+| `/api-key-labels` | GET, PUT | Read or replace display labels for API keys. Reads return an `ETag`; writes accept `If-Match` and return 412 when stale. |
 | `/observability/usage/queue` | GET | Get queued usage events. |
 | `/credentials` | GET, POST, DELETE | List, upload, or delete credential files. |
 | `/credentials/configured-quota` | GET | List configured API-key account identifiers without returning keys. |
-| `/credentials/quota/native` | POST | Fetch provider-reported account allowance for an `auth_index`. |
+| `/credentials/quota` | POST | Fetch normalized quota for an `auth_index` through quota plugins, then built-in account adapters. |
+| `/credentials/quota/native` | POST | Deprecated alias of `/credentials/quota`, kept for one release. |
 | `/credentials/models` | GET | Get credential models. |
 | `/credentials/download` | GET | Download a credential file. |
 | `/credentials/status` | PATCH | Change credential status. |
@@ -108,6 +110,8 @@ retain the corresponding business operation's fields.
 | `/credentials/refresh` | POST | Refresh credentials. |
 | `/oauth/import?provider=vertex` | POST | Import a Vertex service account using a multipart `file` upload. |
 | `/oauth/auth-url?provider=<provider>` | GET | Start built-in or plugin OAuth. |
+| `/oauth/siwc/bind` | POST | Start SIWC binding to an existing file-backed Codex OAuth credential. |
+| `/oauth/siwc/status` | GET | Read local SIWC credential status (`off`, `valid`, or `invalid`). |
 | `/oauth/status?state=<state>` | GET | Get login status. |
 | `/oauth/session?state=<state>` | DELETE | Cancel a login session. |
 | `/oauth/callback` | GET, POST | Submit an OAuth callback. |
@@ -119,26 +123,29 @@ retain the corresponding business operation's fields.
 
 ## Configured account quota
 
-`POST /credentials/quota/native` accepts `{"auth_index":"<index>"}` from
-`GET /credentials/configured-quota`. Entries using the same provider and API
-key are grouped into one allowance card, with their routing labels in
-`connections`. Distinct credentials remain separate. Grouping does not modify
-the routing entries. It reads the configured key on the server
-and returns normalized `groups` and numeric `summary` metrics. It does not reset
+`POST /credentials/quota` accepts `{"auth_index":"<index>"}` and optional
+`plugin_id` or `provider`. It uses the same quota plugin dispatch as
+`/plugins/<id>/quota`. When no plugin handles the credential, built-in adapters
+read the provider account API with the configured key on the server. Both paths
+return the normalized `groups` and `summary` shape. The endpoint does not reset
 limits, change routing cooldowns, or infer allowances from proxy request counts.
-The management key is required for both endpoints.
 
-Native adapters cover OpenCode Go, Kimi Coding, MiniMax international Coding
+`GET /credentials/configured-quota` lists configured API-key accounts without
+returning keys. Entries using the same provider and API key are grouped into one
+allowance card, with their routing labels in `connections`. Grouping does not
+modify the routing entries.
+
+Built-in adapters cover OpenCode Go, Kimi Coding, MiniMax international Coding
 Plan, and CommandCode account billing. OpenCode's HTTP 403 exhausted-window
 response remains a valid quota report when all three allowance windows are
 present. Other 403 responses remain errors. An inactive MiniMax token plan is
 reported explicitly, rather than displayed as a zero balance. Unsupported
-providers return HTTP 501; upstream authentication and malformed reports return
-HTTP 502 with an explanation, without exposing upstream bodies or credentials.
+credentials return HTTP 501, a missing configured key returns HTTP 400, and
+upstream authentication or malformed reports return HTTP 502 without exposing
+upstream bodies or credentials.
 
 Clients should poll no more frequently than every five minutes and pause
-polling while hidden. OAuth and plugin quotas use their existing account APIs
-and `/plugins/<id>/quota`; configured account quota does not replace them.
+polling while hidden.
 
 ## OAuth
 
@@ -164,6 +171,89 @@ not mean credential exchange and persistence have completed.
 
 Import uses `POST /v8/management/oauth/import?provider=vertex`. The `provider`
 query parameter is required; Vertex is currently the supported import provider.
+
+### Sign in with ChatGPT (SIWC) binding
+
+SIWC is a second credential partition of an existing Codex credential, not a new
+provider. This flow is available only in standalone CPA with local file-backed
+Codex OAuth credentials. Home mode and non-file storage backends are not supported.
+
+Start a binding with management authentication:
+
+```http
+POST /v8/management/oauth/siwc/bind
+Authorization: Bearer <management-key>
+Content-Type: application/json
+
+{"name":"codex-example.json"}
+```
+
+`name` identifies an existing managed credential by its ID or file name; it is not
+an arbitrary filesystem path. The credential must contain nonempty outer Codex
+access and refresh tokens. A successful start returns:
+
+```json
+{
+  "status": "ok",
+  "url": "https://auth.openai.com/api/accounts/authorize?...",
+  "state": "<random-state>",
+  "flow": "siwc_bind",
+  "expires_in": 300
+}
+```
+
+Opening the returned URL starts authorization. Its redirect URI is fixed to
+`http://127.0.0.1:1455/auth/callback`. This endpoint does not start a listener on
+port 1455: for remote deployments, paste the complete URL from the browser address
+bar, even if the loopback page cannot be reached, and submit it to the server:
+
+```http
+POST /v8/management/oauth/callback
+Content-Type: application/json
+
+{"provider":"codex","redirect_url":"http://127.0.0.1:1455/auth/callback?state=<state>&code=<code>&client_id=<issued-client-id>"}
+```
+
+The v8 callback also accepts `state`, `code`, and `client_id` directly as POST JSON
+fields or GET query parameters. SIWC requires the **issued** `client_id` from the
+callback; the authorization URL's `dynamic_agent_client` is not a substitute.
+Error callbacks can supply `error` instead of `code` and `client_id`. Conflicting
+parameters are rejected. The target, PKCE verifier, device ID, and redirect URI
+are retained on the server and cannot be changed by a callback. Callback values
+are handed directly to the SIWC session rather than written to legacy callback
+files. Neither callbacks nor status responses return tokens.
+
+Poll `GET /oauth/status?state=<state>` until `ok` or `error`. `wait` means binding
+has not completed, including while tokens are being exchanged. Success means the
+new `siwc` partition and `use_siwc=true` have been saved and published to the auth
+manager. Other credential fields are retained. Rebinding explicitly replaces the
+SIWC partition and reuses a valid existing device ID.
+
+`DELETE /oauth/session?state=<state>` cancels a pending binding. Cancellation that
+wins the commit gate prevents saving a late token response; cancellation after
+commit returns `cancelled:false`. Duplicate callbacks and a second pending binding
+for the same credential return `409`. Missing targets return `404`; ineligible
+targets and incomplete callbacks return `400`. Deleting or replacing the target
+through the v8 credential API invalidates its pending binding. An old server
+returns `404` for the start endpoint; clients must not fall back to ordinary Codex
+login. Sessions are process-local, expire after five minutes, and do not survive
+restart; deployments with multiple independent instances require session affinity.
+
+Query local SIWC status for a Codex credential with `GET /v8/management/oauth/siwc/status?name=<name>` (or `?auth_index=<auth_index>`). The endpoint reads local credentials and runtime rejection state without triggering refresh or upstream verification requests, and returns `{"status": "off" | "valid" | "invalid"}`.
+
+For Codex entries, `GET /credentials` includes these non-secret summary fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `siwc_bind_supported` | boolean | This credential is eligible for the binding flow. Missing means unsupported. |
+| `use_siwc` | boolean | Requests are configured to use the nested SIWC credential. |
+| `siwc_status` | string | Local SIWC status: `off`, `valid`, or `invalid`. |
+| `siwc_bound` | boolean | SIWC access token, refresh token, and issued client ID are present; not a live validity check. |
+| `siwc_expires_at` | optional RFC3339 string | Stored SIWC expiration, when available. |
+
+The v0 callback and credential-list contracts are unchanged. SIWC activation,
+unbinding, and standalone SIWC credential creation are not separate management
+operations in this release.
 
 ## v0 compatibility
 

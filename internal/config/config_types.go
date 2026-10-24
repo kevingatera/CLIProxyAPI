@@ -16,6 +16,14 @@ type RequestArchiveConfig struct {
 	Enabled   bool   `yaml:"enabled" json:"enabled"`
 	Directory string `yaml:"directory,omitempty" json:"directory,omitempty"`
 	MaxSizeGB int    `yaml:"max-size-gb,omitempty" json:"max-size-gb,omitempty"`
+	// MaxAgeDays deletes completed archive files older than this many days. Zero keeps them until the size cap removes them.
+	MaxAgeDays int `yaml:"max-age-days,omitempty" json:"max-age-days,omitempty"`
+	// MaxCaptureMB bounds the transcript bytes held in memory for one request. Zero uses 32.
+	MaxCaptureMB int `yaml:"max-capture-mb,omitempty" json:"max-capture-mb,omitempty"`
+	// MaxConcurrentCaptures bounds streaming requests that buffer transcripts at once. Zero uses 16.
+	MaxConcurrentCaptures int `yaml:"max-concurrent-captures,omitempty" json:"max-concurrent-captures,omitempty"`
+	// MetadataOnly keeps URL, headers, status and timing, and omits all bodies and transcripts.
+	MetadataOnly bool `yaml:"metadata-only,omitempty" json:"metadata-only,omitempty"`
 }
 
 // RequestScopedErrorRule configures custom classification and handling for upstream errors.
@@ -122,6 +130,39 @@ type ClaudeConfig struct {
 	// ModelLevelCooling scopes Claude quota cooldowns to the requested model
 	// rather than cooling down the entire credential across all sibling models.
 	ModelLevelCooling bool `yaml:"model-level-cooling" json:"model-level-cooling"`
+	// ToolSearch enables Codex client tool_search on Claude Responses routes:
+	// Anthropic native tool search where the credential supports it, a pre-tool_search
+	// translation elsewhere, and per-credential search advertising in the Codex
+	// catalog. Default false keeps the translation that predates tool_search support.
+	ToolSearch bool `yaml:"tool-search" json:"tool-search"`
+	// SessionDatePinDays retains the cloaked currentDate pin per session for
+	// this many days, independently of continuity expiry and credential
+	// switches. A nil value (unset) defaults to 7 days; an explicit 0 keeps
+	// the continuity-scoped pin (1h lifetime).
+	SessionDatePinDays *int `yaml:"session-date-pin-days" json:"session-date-pin-days"`
+}
+
+// DefaultClaudeSessionDatePinDays is the session date pin retention applied
+// when session-date-pin-days is not configured.
+const DefaultClaudeSessionDatePinDays = 7
+
+// SessionDatePinRetention returns the configured session date pin retention.
+// An unset value defaults to 7 days; an explicit zero keeps the legacy
+// continuity-scoped behavior. Days are clamped so the duration cannot
+// overflow.
+func (c ClaudeConfig) SessionDatePinRetention() time.Duration {
+	days := DefaultClaudeSessionDatePinDays
+	if c.SessionDatePinDays != nil {
+		days = *c.SessionDatePinDays
+	}
+	if days <= 0 {
+		return 0
+	}
+	maxDays := int((time.Duration(math.MaxInt64) / (24 * time.Hour)))
+	if days > maxDays {
+		days = maxDays
+	}
+	return time.Duration(days) * 24 * time.Hour
 }
 
 // ClaudeHeaderDefaults configures the measured Claude Code software baseline.
@@ -129,16 +170,31 @@ type ClaudeConfig struct {
 // Claude Code, package, and runtime versions exactly match this baseline; unmeasured
 // versions use the configured values. Timeout remains a fallback. Stabilized profiles
 // also pin OS and Arch and never learn newer software versions automatically.
+// AnthropicBetaStrip and AnthropicBetaAppend are exact-name operator overrides applied
+// to the final Anthropic-Beta set; InjectDiagnostics and ClientRequestID tune the
+// first-party Claude Code CLI request shape.
 type ClaudeHeaderDefaults struct {
-	UserAgent              string `yaml:"user-agent" json:"user-agent"`
-	PackageVersion         string `yaml:"package-version" json:"package-version"`
-	RuntimeVersion         string `yaml:"runtime-version" json:"runtime-version"`
-	OS                     string `yaml:"os" json:"os"`
-	Arch                   string `yaml:"arch" json:"arch"`
-	Timeout                string `yaml:"timeout" json:"timeout"`
-	Timezone               string `yaml:"timezone" json:"timezone"`
-	StabilizeDeviceProfile *bool  `yaml:"stabilize-device-profile,omitempty" json:"stabilize-device-profile,omitempty"`
+	UserAgent              string   `yaml:"user-agent" json:"user-agent"`
+	PackageVersion         string   `yaml:"package-version" json:"package-version"`
+	RuntimeVersion         string   `yaml:"runtime-version" json:"runtime-version"`
+	OS                     string   `yaml:"os" json:"os"`
+	Arch                   string   `yaml:"arch" json:"arch"`
+	Timeout                string   `yaml:"timeout" json:"timeout"`
+	Timezone               string   `yaml:"timezone" json:"timezone"`
+	StabilizeDeviceProfile *bool    `yaml:"stabilize-device-profile,omitempty" json:"stabilize-device-profile,omitempty"`
+	AnthropicBetaStrip     []string `yaml:"anthropic-beta-strip,omitempty" json:"anthropic-beta-strip,omitempty"`
+	AnthropicBetaAppend    []string `yaml:"anthropic-beta-append,omitempty" json:"anthropic-beta-append,omitempty"`
+	InjectDiagnostics      *bool    `yaml:"inject-diagnostics,omitempty" json:"inject-diagnostics,omitempty"`
+	ClientRequestID        string   `yaml:"client-request-id,omitempty" json:"client-request-id,omitempty"`
 }
+
+// Supported ClaudeHeaderDefaults.ClientRequestID values. An empty value means
+// ClaudeClientRequestIDOn.
+const (
+	ClaudeClientRequestIDOn          = "on"
+	ClaudeClientRequestIDOff         = "off"
+	ClaudeClientRequestIDPassthrough = "passthrough"
+)
 
 // CodexHeaderDefaults configures fallback header values injected into Codex
 // model requests for OAuth/file-backed auth when the client omits them.
@@ -223,6 +279,23 @@ type CodexConfig struct {
 	// ResponseSteering enables full-duplex Codex WebSockets, bound to one
 	// upstream model/account/socket for their entire lifetime. Default is false.
 	ResponseSteering bool `yaml:"response-steering" json:"response-steering"`
+	// SignInWithChatGPTIdentifier configures the identifier (agent_name_hint and User-Agent prefix)
+	// for Codex Sign in with ChatGPT (SIWC) OAuth authorization and API requests.
+	// Defaults to "CLIProxyAPI".
+	SignInWithChatGPTIdentifier string `yaml:"signin-with-chatgpt-identifier,omitempty" json:"signin-with-chatgpt-identifier,omitempty"`
+}
+
+// DefaultSignInWithChatGPTIdentifier is the default identifier (agent_name_hint and User-Agent prefix)
+// used for Codex Sign in with ChatGPT (SIWC) OAuth authorization and API requests.
+const DefaultSignInWithChatGPTIdentifier = "CLIProxyAPI"
+
+// EffectiveSignInWithChatGPTIdentifier returns the configured Sign in with ChatGPT
+// identifier, or DefaultSignInWithChatGPTIdentifier when unset or blank.
+func (c CodexConfig) EffectiveSignInWithChatGPTIdentifier() string {
+	if v := strings.TrimSpace(c.SignInWithChatGPTIdentifier); v != "" {
+		return v
+	}
+	return DefaultSignInWithChatGPTIdentifier
 }
 
 // DefaultCodexStreamBootstrapTimeout is the default maximum duration to buffer bootstrap events.
@@ -362,7 +435,7 @@ type RoutingConfig struct {
 	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first", "quota-aware".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 
-	// Policy configures explicit provider/auth ordering and fallback rules.
+	// Policy configures explicit per-model provider and auth ordering with fallback rules.
 	Policy RoutingPolicy `yaml:"policy,omitempty" json:"policy,omitempty"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
@@ -382,6 +455,16 @@ type RoutingConfig struct {
 	// When false, subagents are distributed across the credential pool via the fallback selector.
 	// Default: true. Ignored when SessionAffinity is false.
 	SessionAffinitySubagents *bool `yaml:"session-affinity-subagents,omitempty" json:"session-affinity-subagents,omitempty"`
+
+	// SessionAffinityRebindOn controls which credential failures rebind an established session
+	// to the failover credential.
+	// Supported values:
+	//   - "any" (default): any credential-attributed failure unbinds and rebinds on failover.
+	//   - "quota": transient errors (408, 5xx, empty stream, buffer limit) fail over for that
+	//     request only while keeping the session bound to its original credential; quota and
+	//     auth errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
+	// Ignored when SessionAffinity is false.
+	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
 }
 
 // AllowancesConfig separates the read-only collector credential from management access.
@@ -400,21 +483,27 @@ type RoutingPolicy struct {
 	Observability  RoutingPolicyObservability   `yaml:"observability,omitempty" json:"observability,omitempty"`
 }
 
+// RoutingPolicyRule lists providers in the order they are tried for a model.
 type RoutingPolicyRule struct {
 	Route                     []RoutingPolicyRoute `yaml:"route,omitempty" json:"route,omitempty"`
 	IncludeRemainingProviders bool                 `yaml:"include-remaining-providers,omitempty" json:"include-remaining-providers,omitempty"`
 }
 
+// RoutingPolicyRoute pins auth order within one provider.
+// With a non-empty AuthOrder and IncludeRemainingAuth false, other auths of the provider are never used.
 type RoutingPolicyRoute struct {
 	Provider             string   `yaml:"provider,omitempty" json:"provider,omitempty"`
 	AuthOrder            []string `yaml:"auth-order,omitempty" json:"auth-order,omitempty"`
 	IncludeRemainingAuth bool     `yaml:"include-remaining-auth,omitempty" json:"include-remaining-auth,omitempty"`
 }
 
+// RoutingFallbackPolicy lists the failure classes that move a request to the next route step.
+// Supported values: exhausted, rate_limited, server_error, transport_error.
 type RoutingFallbackPolicy struct {
 	On []string `yaml:"on,omitempty" json:"on,omitempty"`
 }
 
+// RoutingPolicyObservability configures the in-memory routing trace buffer.
 type RoutingPolicyObservability struct {
 	TraceLimit int `yaml:"trace-limit,omitempty" json:"trace-limit,omitempty"`
 }
@@ -424,6 +513,9 @@ type RoutingPolicyObservability struct {
 // When Fork is true, the alias is added as an additional model in listings while
 // keeping the original model ID available.
 type OAuthModelAlias struct {
+	// OpenAPI overrides Vertex endpoint selection for this model.
+	OpenAPI *bool `yaml:"openapi,omitempty" json:"openapi,omitempty"`
+
 	Name  string `yaml:"name" json:"name"`
 	Alias string `yaml:"alias" json:"alias"`
 	Fork  bool   `yaml:"fork,omitempty" json:"fork,omitempty"`
@@ -436,6 +528,9 @@ type OAuthModelAlias struct {
 
 // OAuthModelSetting defines provider/channel model settings (such as context window overrides) for OAuth credentials.
 type OAuthModelSetting struct {
+	// OpenAPI overrides Vertex endpoint selection for this model.
+	OpenAPI *bool `yaml:"openapi,omitempty" json:"openapi,omitempty"`
+
 	Name  string `yaml:"name" json:"name"`
 	Alias string `yaml:"alias,omitempty" json:"alias,omitempty"`
 
@@ -535,11 +630,11 @@ type PayloadModelRule struct {
 // CloakConfig configures request cloaking for non-Claude-Code clients.
 // Cloaking disguises API requests to appear as originating from the official Claude Code CLI.
 type CloakConfig struct {
-	// Mode controls cloaking behavior: "auto" (default), "always", or "never".
+	// Mode controls cloaking behavior: "auto" (default), "always", "never", or "uncloak".
 	// Supplying this CloakConfig explicitly enables cloaking for an unprofiled API key.
 	// - "auto": cloak unless strong request signals identify a verified native entrypoint
 	// - "always": cloak every unconfirmed client; confirmed native Claude Code remains passthrough
-	// - "never": never apply cloaking
+	// - "never" / "uncloak": never apply cloaking; on non-CLI API keys, also strip incoming Claude Code identity and billing attribution
 	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
 
 	// StrictMode controls how caller system prompts are handled when cloaking.
@@ -591,6 +686,11 @@ type ClaudeKey struct {
 
 	// RebuildMidSystemMessage moves Claude messages with role "system" into the top-level system field.
 	RebuildMidSystemMessage bool `yaml:"rebuild-mid-system-message,omitempty" json:"rebuild-mid-system-message,omitempty"`
+
+	// NativeToolSearch trusts a custom base URL with Anthropic native tool search
+	// (defer_loading tools and tool_reference results) for Codex tool_search.
+	// Official api.anthropic.com credentials use native tool search without it.
+	NativeToolSearch bool `yaml:"native-tool-search,omitempty" json:"native-tool-search,omitempty"`
 
 	// DisableCooling overrides the global cooling policy for this credential when set.
 	// True disables auth/model cooldowns; false explicitly enables them.

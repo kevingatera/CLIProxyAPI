@@ -52,11 +52,11 @@ creates a private timestamped backup, and preserves the rest of the document.
    time until reset. Scores are grouped into 5% bands to reduce trivial switches.
 6. Use stable credential ordering for ties. Retry a different eligible route for
    capacity, rate-limit, server and transport failures before streaming begins.
-   An invalid request is terminal; recognized insufficient-credit errors can fail
-   over even when a provider returns HTTP 400.
+   An invalid request is terminal. Credit exhaustion fails over only when the
+   provider returns HTTP 402; message text is never inspected.
 
 Native account reports refresh in the background every five minutes. Selection
-never performs network calls. Reports expire after ten minutes, and a passed
+never performs network calls. Reports expire after ten minutes or at an earlier expiry the source declares, and a passed
 reset makes that bucket unknown until refreshed. Reports are account-wide,
 not per-model token grants. Model token burn is a bounded ten-minute observation;
 it is shown separately because tokens cannot be converted to provider allowance

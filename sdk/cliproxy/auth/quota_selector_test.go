@@ -3,507 +3,701 @@ package auth
 import (
 	"context"
 	"errors"
+	"net/http"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
-// TestParseCodexUsage_KeyShapes exercises both the snake_case and camelCase
-// key shapes the codex wham/usage endpoint may emit. The parser must accept
-// either variant and surface identical token limits / window reset times.
-func TestParseCodexUsage_KeyShapes(t *testing.T) {
-	t.Parallel()
+type quotaTestClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
 
-	// Fixed "now" so reset_at (epoch seconds) comparisons are deterministic.
-	now := time.Unix(1_700_000_000, 0)
-	primaryReset := now.Add(5 * time.Hour).Unix()
-	secondaryReset := now.Add(7 * 24 * time.Hour).Unix()
+func (c *quotaTestClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
 
-	cases := []struct {
-		name string
-		body string
-	}{
-		{
-			name: "snake_case",
-			body: `{
-				"rate_limit": {
-					"allowed": true,
-					"limit_reached": false,
-					"primary_window": {
-						"used_percent": 40,
-						"reset_after_seconds": 18000,
-						"reset_at": ` + itoa(primaryReset) + `,
-						"limit_window_seconds": 18000
-					},
-					"secondary_window": {
-						"used_percent": 10,
-						"reset_after_seconds": 604800,
-						"reset_at": ` + itoa(secondaryReset) + `,
-						"limit_window_seconds": 604800
-					}
-				}
-			}`,
-		},
-		{
-			name: "camelCase",
-			body: `{
-				"rate_limit": {
-					"allowed": true,
-					"limitReached": false,
-					"primaryWindow": {
-						"usedPercent": "40",
-						"resetAfterSeconds": 18000,
-						"resetAt": ` + itoa(primaryReset) + `,
-						"limitWindowSeconds": 18000
-					},
-					"secondaryWindow": {
-						"usedPercent": "10",
-						"resetAfterSeconds": 604800,
-						"resetAt": ` + itoa(secondaryReset) + `,
-						"limitWindowSeconds": 604800
-					}
-				}
-			}`,
-		},
+func (c *quotaTestClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+
+type quotaFetchFunc func(context.Context, codexUsageCredential) (http.Header, error)
+
+// newQuotaTestSelector returns a selector driven by clock. Probe results are
+// stored through a real Manager (see newQuotaTestManager).
+func newQuotaTestSelector(clock *quotaTestClock, fetch quotaFetchFunc) *QuotaAwareSelector {
+	s := NewQuotaAwareSelector()
+	s.now = clock.Now
+	s.fetch = fetch
+	s.manualRefresh = true
+	return s
+}
+
+// newQuotaTestManager wires s to a manager that holds auths by pointer, so a probe
+// write-back is visible to the auths the test passes to Pick.
+func newQuotaTestManager(s *QuotaAwareSelector, auths []*Auth) *Manager {
+	m := NewManager(nil, s, nil)
+	m.mu.Lock()
+	for _, a := range auths {
+		m.auths[a.ID] = a
 	}
+	m.mu.Unlock()
+	return m
+}
 
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			snap, err := parseCodexUsage([]byte(tc.body))
-			if err != nil {
-				t.Fatalf("parseCodexUsage error: %v", err)
-			}
-			if !snap.allowed {
-				t.Fatalf("allowed = false, want true")
-			}
-			if snap.limitReached {
-				t.Fatalf("limitReached = true, want false")
-			}
-
-			pw := snap.primaryWindow
-			if !pw.hasUsedPercent || pw.usedPercent != 40 {
-				t.Fatalf("primary usedPercent = %v (has=%v), want 40", pw.usedPercent, pw.hasUsedPercent)
-			}
-			if !pw.hasReset {
-				t.Fatalf("primary window missing reset")
-			}
-			if got, want := pw.resetAt.Unix(), primaryReset; got != want {
-				t.Fatalf("primary resetAt = %d, want %d", got, want)
-			}
-			if !pw.hasLimitWindow || pw.limitWindow != 5*time.Hour {
-				t.Fatalf("primary limitWindow = %v (has=%v), want 5h", pw.limitWindow, pw.hasLimitWindow)
-			}
-
-			sw := snap.secondaryWindow
-			if !sw.hasUsedPercent || sw.usedPercent != 10 {
-				t.Fatalf("secondary usedPercent = %v (has=%v), want 10", sw.usedPercent, sw.hasUsedPercent)
-			}
-			if got, want := sw.resetAt.Unix(), secondaryReset; got != want {
-				t.Fatalf("secondary resetAt = %d, want %d", got, want)
-			}
+func quotaTestAuths(ids ...string) []*Auth {
+	auths := make([]*Auth, 0, len(ids))
+	for _, id := range ids {
+		auths = append(auths, &Auth{
+			ID:       id,
+			Provider: "codex",
+			Metadata: map[string]any{"access_token": "tok-" + id, "account_id": "acct-" + id},
 		})
 	}
+	return auths
 }
 
-// TestParseCodexUsage_DefaultsAllowed verifies the parser defaults
-// rate_limit.allowed to true when the field is absent.
-func TestParseCodexUsage_DefaultsAllowed(t *testing.T) {
-	t.Parallel()
-
-	snap, err := parseCodexUsage([]byte(`{"rate_limit": {}}`))
-	if err != nil {
-		t.Fatalf("parseCodexUsage error: %v", err)
-	}
-	if !snap.allowed {
-		t.Fatalf("allowed defaulted to false, want true when absent")
-	}
-	if snap.limitReached {
-		t.Fatalf("limitReached = true, want false when absent")
+// usageSignals builds a passive observation as Codex sends it for the primary
+// window: used percent plus an absolute reset time.
+func usageSignals(usedPercent float64, resetAt time.Time) map[string]string {
+	return map[string]string{
+		codexSignalAllowed:                  "true",
+		codexSignalPrimary + "Used-Percent": strconv.FormatFloat(usedPercent, 'f', -1, 64),
+		codexSignalPrimary + "Reset-At":     strconv.FormatInt(resetAt.Unix(), 10),
 	}
 }
 
-// TestParseCodexWindow_EmptyNode verifies a null/absent window is flagged
-// observedEmpty so callers can distinguish "no telemetry" from "0% used".
-func TestParseCodexWindow_EmptyNode(t *testing.T) {
-	t.Parallel()
-
-	// primary_window is explicitly null; secondary_window is entirely absent.
-	body := []byte(`{"rate_limit": {"primary_window": null}}`)
-	snap, err := parseCodexUsage(body)
-	if err != nil {
-		t.Fatalf("parseCodexUsage error: %v", err)
-	}
-	if !snap.primaryWindow.observedEmpty {
-		t.Fatalf("expected primary window observedEmpty for null node")
-	}
-	// parseCodexUsage falls back from snake_case to camelCase when a window has
-	// no reset; an absent secondary_window therefore also resolves observedEmpty.
-	if !snap.secondaryWindow.observedEmpty {
-		t.Fatalf("expected secondary window observedEmpty when absent")
-	}
+func observed(a *Auth, observedAt time.Time, signals map[string]string) *Auth {
+	a.Quota = QuotaState{ObservedAt: observedAt, Signals: signals}
+	return a
 }
 
-// TestCodexScore covers the scoring function's three regimes:
-//   - more remaining quota scores higher than less remaining;
-//   - the 0.05 soft-penalize threshold kicks in below 5% remaining;
-//   - an exhausted window reports exhausted=true with a low (0) score.
-func TestCodexScore(t *testing.T) {
-	t.Parallel()
-
-	now := time.Unix(1_700_000_000, 0)
-	future := now.Add(5 * time.Hour)
-
-	mkWindow := func(usedPercent float64, reset time.Time) codexUsageSnapshot {
-		return codexUsageSnapshot{
-			allowed: true,
-			primaryWindow: codexUsageWindow{
-				usedPercent:    usedPercent,
-				resetAt:        reset,
-				hasUsedPercent: true,
-				hasReset:       true,
-			},
-		}
+func headerOf(signals map[string]string) http.Header {
+	h := make(http.Header, len(signals))
+	for k, v := range signals {
+		h.Set(k, v)
 	}
-
-	t.Run("more remaining scores higher", func(t *testing.T) {
-		t.Parallel()
-		moreRemaining := mkWindow(10, future) // 90% remaining
-		lessRemaining := mkWindow(80, future) // 20% remaining
-		sHi, exh, _ := codexScore(&moreRemaining, now)
-		sLo, exhLo, _ := codexScore(&lessRemaining, now)
-		if exh || exhLo {
-			t.Fatalf("unexpected exhausted: hi=%v lo=%v", exh, exhLo)
-		}
-		if sHi <= sLo {
-			t.Fatalf("expected more-remaining score > less-remaining: hi=%v lo=%v", sHi, sLo)
-		}
-	})
-
-	t.Run("soft penalize below 5 percent remaining", func(t *testing.T) {
-		t.Parallel()
-		// 2% remaining falls in the <0.05 soft-penalize band, so the score is
-		// scaled down by remaining/0.05 = 0.4 relative to its raw rate.
-		lowRemaining := mkWindow(98, future) // 2% remaining
-		scoreLow, exh, _ := codexScore(&lowRemaining, now)
-		if exh {
-			t.Fatalf("unexpected exhausted for 2%% remaining")
-		}
-		if scoreLow <= 0 {
-			t.Fatalf("soft-penalized score should still be positive, got %v", scoreLow)
-		}
-		// Compare against a window just above the 5% threshold (4% remaining).
-		aboveThreshold := mkWindow(96, future) // 4% remaining, NOT penalized
-		scoreAbove, _, _ := codexScore(&aboveThreshold, now)
-		// The penalized 2% case should score lower than the unpenalized 4% case
-		// despite both being near the floor; this exercises the soft-penalize math.
-		if scoreLow >= scoreAbove {
-			t.Fatalf("expected soft-penalized (2%%) score < 4%% remaining score: low=%v above=%v", scoreLow, scoreAbove)
-		}
-	})
-
-	t.Run("exhausted window returns blocked score", func(t *testing.T) {
-		t.Parallel()
-		exhausted := mkWindow(100, future) // 0% remaining, resets in the future
-		score, exh, next := codexScore(&exhausted, now)
-		if !exh {
-			t.Fatalf("expected exhausted=true for 100%% used window")
-		}
-		if score != 0 {
-			t.Fatalf("expected score 0 for exhausted window, got %v", score)
-		}
-		if !next.Equal(future) {
-			t.Fatalf("expected next reset = future, got %v", next)
-		}
-	})
+	return h
 }
 
-// TestCodexScore_NotAllowed verifies that when upstream reports
-// allowed=false / limit_reached=true, the snapshot is treated as exhausted
-// with the earliest reset time.
-func TestCodexScore_NotAllowed(t *testing.T) {
-	t.Parallel()
-
-	now := time.Unix(1_700_000_000, 0)
-	reset := now.Add(1 * time.Hour)
-	snap := &codexUsageSnapshot{
-		allowed:      false,
-		limitReached: true,
-		primaryWindow: codexUsageWindow{
-			resetAt:  reset,
-			hasReset: true,
-		},
-	}
-	score, exh, next := codexScore(snap, now)
-	if !exh {
-		t.Fatalf("expected exhausted=true when not allowed")
-	}
-	if score != 0 {
-		t.Fatalf("expected score 0 when not allowed, got %v", score)
-	}
-	if !next.Equal(reset) {
-		t.Fatalf("expected next reset = %v, got %v", reset, next)
-	}
-}
-
-// TestStrconvParseHelpers confirms the stdlib-backed helpers keep the
-// fallback-on-error behavior expected by callers (error -> skip value).
-func TestStrconvParseHelpers(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name    string
-		floatIn string
-		intIn   string
-		wantF   float64
-		wantI   int64
-	}{
-		{name: "plain", floatIn: "40", intIn: "18000", wantF: 40, wantI: 18000},
-		{name: "fractional", floatIn: "12.5", intIn: "12", wantF: 12.5, wantI: 12},
-		{name: "negative", floatIn: "-3.5", intIn: "-3", wantF: -3.5, wantI: -3},
-		{name: "whitespace", floatIn: "  7 ", intIn: " 7 ", wantF: 7, wantI: 7},
-	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			gotF, errF := strconvParseFloat(tc.floatIn)
-			if errF != nil {
-				t.Fatalf("strconvParseFloat(%q) error: %v", tc.floatIn, errF)
-			}
-			if gotF != tc.wantF {
-				t.Fatalf("strconvParseFloat(%q) = %v, want %v", tc.floatIn, gotF, tc.wantF)
-			}
-			gotI, errI := strconvParseInt(tc.intIn)
-			if errI != nil {
-				t.Fatalf("strconvParseInt(%q) error: %v", tc.intIn, errI)
-			}
-			if gotI != tc.wantI {
-				t.Fatalf("strconvParseInt(%q) = %v, want %v", tc.intIn, gotI, tc.wantI)
-			}
-		})
-	}
-
-	if _, err := strconvParseFloat("not-a-number"); err == nil {
-		t.Fatalf("strconvParseFloat expected error for invalid input")
-	}
-	if _, err := strconvParseInt(""); err == nil {
-		t.Fatalf("strconvParseInt expected error for empty input")
-	}
-}
-
-// TestQuotaAwarePick_ShortlistThreshold verifies the 95%-of-best shortlisting
-// logic in Pick. A candidate scoring >= 0.95 * best must remain selectable;
-// a candidate strictly below the threshold must never be picked. Because the
-// shortlist is round-robin resolved, we run many iterations and assert the
-// sub-threshold auth is never returned while the eligible ones are.
-func TestQuotaAwarePick_ShortlistThreshold(t *testing.T) {
-	t.Parallel()
-
-	now := time.Unix(1_700_000_000, 0)
-	future := now.Add(5 * time.Hour)
-
-	// best scores ~ remaining/hours with 10% used (high). Within-95% scores
-	// with 12% used. Below-95% scores with 80% used.
-	mkSnap := func(used float64) *codexUsageSnapshot {
-		return &codexUsageSnapshot{
-			allowed: true,
-			primaryWindow: codexUsageWindow{
-				usedPercent:    used,
-				resetAt:        future,
-				hasUsedPercent: true,
-				hasReset:       true,
-			},
-		}
-	}
-
-	auths := []*Auth{
-		{ID: "best", Provider: "codex", Status: StatusActive, Index: "best"},
-		{ID: "near", Provider: "codex", Status: StatusActive, Index: "near"},
-		{ID: "low", Provider: "codex", Status: StatusActive, Index: "low"},
-	}
-	byIndex := map[string]*codexUsageSnapshot{
-		"best": mkSnap(10), // 90% remaining -> best score
-		"near": mkSnap(12), // ~88% remaining -> within 95% of best
-		"low":  mkSnap(80), // 20% remaining -> well below 95% of best
-	}
-
-	// Confirm the score relationship holds before exercising Pick.
-	sBest, _, _ := codexScore(byIndex["best"], now)
-	sLow, _, _ := codexScore(byIndex["low"], now)
-	if sLow >= sBest*0.95 {
-		t.Fatalf("test fixture invalid: low score %v must be < 0.95*best %v", sLow, sBest)
-	}
-
-	sel := NewQuotaAwareSelector()
-	sel.now = func() time.Time { return now }
-	sel.fetchCodexUsage = func(ctx context.Context, a *Auth) (*codexUsageSnapshot, error) {
-		if a == nil {
-			return nil, errors.New("nil auth")
-		}
-		snap, ok := byIndex[a.Index]
-		if !ok {
-			return nil, errors.New("no fixture for auth " + a.Index)
-		}
-		clone := *snap
-		return &clone, nil
-	}
-
-	seen := map[string]int{}
-	const iterations = 60
-	for i := 0; i < iterations; i++ {
-		picked, err := sel.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, cloneAuths(auths))
+func pickCounts(t *testing.T, s *QuotaAwareSelector, auths []*Auth, n int) map[string]int {
+	t.Helper()
+	counts := make(map[string]int)
+	for i := 0; i < n; i++ {
+		picked, err := s.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, auths)
 		if err != nil {
-			t.Fatalf("Pick iteration %d error: %v", i, err)
+			t.Fatalf("Pick() error = %v", err)
 		}
-		if picked == nil || picked.ID == "" {
-			t.Fatalf("Pick iteration %d returned nil/empty auth", i)
-		}
-		if picked.ID == "low" {
-			t.Fatalf("Pick returned below-threshold auth %q on iteration %d; it must be excluded from the shortlist", picked.ID, i)
-		}
-		seen[picked.ID]++
+		counts[picked.ID]++
+	}
+	return counts
+}
+
+// Selection is a read of passive observations; probes happen only in refreshDue.
+func TestQuotaAwarePickNeverFetches(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	var calls atomic.Int32
+	release := make(chan struct{})
+	s := newQuotaTestSelector(clock, func(ctx context.Context, _ codexUsageCredential) (http.Header, error) {
+		calls.Add(1)
+		<-release
+		return headerOf(usageSignals(10, clock.Now().Add(time.Hour))), nil
+	})
+	auths := quotaTestAuths("a", "b", "c")
+	newQuotaTestManager(s, auths)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, auths); err != nil {
+				t.Errorf("Pick() error = %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("Pick made %d usage calls, want 0", got)
 	}
 
-	// Both within-threshold auths must be reachable via round-robin.
-	if seen["best"] == 0 || seen["near"] == 0 {
-		t.Fatalf("expected both best and near to be picked at least once, got %v", seen)
+	// Concurrent refresh passes probe each credential once.
+	s.refreshDue(context.Background())
+	s.refreshDue(context.Background())
+	close(release)
+	s.wg.Wait()
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("usage calls = %d, want 3", got)
+	}
+	for _, a := range auths {
+		if a.Quota.ObservedAt.IsZero() {
+			t.Fatalf("auth %s has no observation after its probe", a.ID)
+		}
+	}
+	// Probe results are fresh observations, so no further probes are due.
+	s.refreshDue(context.Background())
+	s.wg.Wait()
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("fresh observations were probed again: calls = %d", got)
 	}
 }
 
-// TestQuotaAwarePick_AllExhaustedReturnsCooldown verifies that when every
-// candidate window is exhausted, Pick returns a cooldown error whose reset
-// duration matches the earliest reset of the exhausted windows.
-func TestQuotaAwarePick_AllExhaustedReturnsCooldown(t *testing.T) {
-	t.Parallel()
+func TestQuotaAwareRefreshIsBounded(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	var calls atomic.Int32
+	release := make(chan struct{})
+	s := newQuotaTestSelector(clock, func(ctx context.Context, _ codexUsageCredential) (http.Header, error) {
+		calls.Add(1)
+		<-release
+		return headerOf(usageSignals(10, clock.Now().Add(time.Hour))), nil
+	})
+	auths := quotaTestAuths("a", "b", "c", "d", "e", "f")
+	newQuotaTestManager(s, auths)
+	pickCounts(t, s, auths, 1)
+	s.refreshDue(context.Background())
+	s.refreshDue(context.Background())
+	if got := calls.Load(); got > quotaMaxConcurrent {
+		t.Fatalf("in-flight probes = %d, want at most %d", got, quotaMaxConcurrent)
+	}
+	close(release)
+	s.wg.Wait()
+	s.refreshDue(context.Background())
+	s.wg.Wait()
+	if got := calls.Load(); got != 6 {
+		t.Fatalf("usage calls = %d, want 6 after slots free up", got)
+	}
+}
 
-	now := time.Unix(1_700_000_000, 0)
-	earliest := now.Add(1 * time.Hour)
-	later := now.Add(2 * time.Hour)
+// Unknown credentials share the shortlist with the best known ones.
+func TestQuotaAwareUnknownIsNeitherStarvedNorPreferred(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	s := newQuotaTestSelector(clock, nil)
+	now := clock.Now()
+	auths := []*Auth{
+		observed(quotaTestAuths("best")[0], now, usageSignals(10, now.Add(time.Hour))),
+		observed(quotaTestAuths("low")[0], now, usageSignals(90, now.Add(time.Hour))),
+		quotaTestAuths("new")[0], // no observation
+	}
 
-	mkExhausted := func(reset time.Time) *codexUsageSnapshot {
-		return &codexUsageSnapshot{
-			allowed: true,
-			primaryWindow: codexUsageWindow{
-				usedPercent:    100,
-				resetAt:        reset,
-				hasUsedPercent: true,
-				hasReset:       true,
-			},
+	counts := pickCounts(t, s, auths, 10)
+	if counts["new"] != 5 || counts["best"] != 5 {
+		t.Fatalf("picks = %v, want best and new to alternate", counts)
+	}
+	if counts["low"] != 0 {
+		t.Fatalf("picks = %v, want the low scorer outside the shortlist", counts)
+	}
+}
+
+// An exhausted credential is never reintroduced.
+func TestQuotaAwareNeverPicksExhausted(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	s := newQuotaTestSelector(clock, nil)
+	now := clock.Now()
+	auths := []*Auth{
+		// A successful observation with no usable windows cannot be scored.
+		observed(quotaTestAuths("blank")[0], now, map[string]string{codexSignalAllowed: "true"}),
+		observed(quotaTestAuths("spent")[0], now, usageSignals(100, now.Add(time.Hour))),
+	}
+
+	counts := pickCounts(t, s, auths, 10)
+	if counts["spent"] != 0 || counts["blank"] != 10 {
+		t.Fatalf("picks = %v, want only blank", counts)
+	}
+}
+
+func TestQuotaAwareAllExhaustedReturnsCooldown(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	s := newQuotaTestSelector(clock, nil)
+	now := clock.Now()
+	auths := []*Auth{
+		observed(quotaTestAuths("a")[0], now, usageSignals(100, now.Add(2*time.Hour))),
+		observed(quotaTestAuths("b")[0], now, map[string]string{
+			codexSignalAllowed:              "false",
+			codexSignalLimitReached:         "true",
+			codexSignalPrimary + "Reset-At": strconv.FormatInt(now.Add(time.Hour).Unix(), 10),
+		}),
+	}
+
+	picked, err := s.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, auths)
+	if picked != nil {
+		t.Fatalf("picked %s, want no auth", picked.ID)
+	}
+	var cooldown *modelCooldownError
+	if !errors.As(err, &cooldown) {
+		t.Fatalf("error = %T %v, want modelCooldownError", err, err)
+	}
+	if cooldown.resetIn != time.Hour {
+		t.Fatalf("resetIn = %v, want the earliest reset", cooldown.resetIn)
+	}
+}
+
+func TestQuotaAwareSingletonHonorsExhaustion(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	s := newQuotaTestSelector(clock, nil)
+	now := clock.Now()
+	auths := []*Auth{observed(quotaTestAuths("only")[0], now, usageSignals(100, now.Add(time.Hour)))}
+
+	if picked, err := s.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, auths); err == nil {
+		t.Fatalf("picked %s, want an error for an exhausted singleton", picked.ID)
+	}
+}
+
+// Failed probes back off, and an observation older than quotaMaxStaleness stops counting.
+func TestQuotaAwareStaleObservationExpiresAfterFailedRefreshes(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	var calls atomic.Int32
+	s := newQuotaTestSelector(clock, func(context.Context, codexUsageCredential) (http.Header, error) {
+		calls.Add(1)
+		return nil, errors.New("upstream down")
+	})
+	now := clock.Now()
+	auths := []*Auth{
+		observed(quotaTestAuths("a")[0], now, usageSignals(100, now.Add(24*time.Hour))),
+		observed(quotaTestAuths("b")[0], now, usageSignals(10, now.Add(24*time.Hour))),
+	}
+	newQuotaTestManager(s, auths)
+
+	clock.Advance(quotaRefreshInterval)
+	pickCounts(t, s, auths, 1) // marks both credentials for a probe
+	s.refreshDue(context.Background())
+	s.wg.Wait()
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("usage calls = %d, want 2", got)
+	}
+	// Inside the backoff window nothing is retried.
+	clock.Advance(quotaRefreshBackoff - time.Second)
+	pickCounts(t, s, auths, 1)
+	s.refreshDue(context.Background())
+	s.wg.Wait()
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("retried during backoff: calls = %d", got)
+	}
+	clock.Advance(time.Second)
+	pickCounts(t, s, auths, 1)
+	s.refreshDue(context.Background())
+	s.wg.Wait()
+	if got := calls.Load(); got != 4 {
+		t.Fatalf("usage calls = %d, want a retry after backoff", got)
+	}
+
+	// Still fresh enough: the exhausted observation holds.
+	if counts := pickCounts(t, s, auths, 4); counts["a"] != 0 {
+		t.Fatalf("picks = %v, want a excluded while its observation is fresh", counts)
+	}
+	// Past the staleness bound both become unknown and share the shortlist.
+	clock.Advance(quotaMaxStaleness)
+	if counts := pickCounts(t, s, auths, 4); counts["a"] != 2 || counts["b"] != 2 {
+		t.Fatalf("picks = %v, want stale observations treated as unknown", counts)
+	}
+}
+
+func TestQuotaAwarePassedResetIsUnknown(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	s := newQuotaTestSelector(clock, nil)
+	now := clock.Now()
+	auths := []*Auth{observed(quotaTestAuths("a")[0], now, usageSignals(100, now.Add(time.Minute)))}
+	clock.Advance(2 * time.Minute)
+
+	picked, err := s.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, auths)
+	if err != nil || picked.ID != "a" {
+		t.Fatalf("Pick() = %v, %v; want a once its window reset", picked, err)
+	}
+}
+
+// Fresh passive observations are used without any probe.
+func TestQuotaAwareReadsPassiveObservationWithoutProbe(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	var calls atomic.Int32
+	s := newQuotaTestSelector(clock, func(context.Context, codexUsageCredential) (http.Header, error) {
+		calls.Add(1)
+		return nil, errors.New("should not be called")
+	})
+	now := clock.Now()
+	auths := []*Auth{
+		observed(quotaTestAuths("light")[0], now, usageSignals(10, now.Add(time.Hour))),
+		observed(quotaTestAuths("heavy")[0], now, usageSignals(60, now.Add(time.Hour))),
+	}
+	newQuotaTestManager(s, auths)
+
+	counts := pickCounts(t, s, auths, 5)
+	if counts["light"] != 5 {
+		t.Fatalf("picks = %v, want the lower-usage credential every time", counts)
+	}
+	s.refreshDue(context.Background())
+	s.wg.Wait()
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("fresh observations triggered %d probes", got)
+	}
+}
+
+func TestQuotaAwareStopCancelsBackgroundProbe(t *testing.T) {
+	started := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	s := NewQuotaAwareSelector()
+	s.fetch = func(ctx context.Context, _ codexUsageCredential) (http.Header, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		done <- ctx.Err()
+		return nil, ctx.Err()
+	}
+	if _, err := s.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, quotaTestAuths("a")); err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	<-started
+	s.Stop()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("probe ended with %v, want context.Canceled", err)
+	}
+	s.wg.Wait()
+}
+
+func TestSessionAffinityStopStopsQuotaSelector(t *testing.T) {
+	quota := NewQuotaAwareSelector()
+	affinity := NewSessionAffinitySelector(quota)
+	affinity.Stop()
+	quota.mu.Lock()
+	stopped := quota.stopped
+	quota.mu.Unlock()
+	if !stopped {
+		t.Fatal("session affinity Stop did not stop the wrapped quota selector")
+	}
+}
+
+// The Manager wires the probe observer into the selector, including behind session affinity.
+func TestManagerBindsQuotaObserver(t *testing.T) {
+	quota := NewQuotaAwareSelector()
+	m := NewManager(nil, NewSessionAffinitySelector(quota), nil)
+	if quota.observe == nil {
+		t.Fatal("NewManager did not bind the quota observer through session affinity")
+	}
+	next := NewQuotaAwareSelector()
+	m.SetSelector(next)
+	if next.observe == nil {
+		t.Fatal("SetSelector did not bind the quota observer")
+	}
+	quota.Stop()
+	next.Stop()
+}
+
+func TestQuotaAwareNonCodexUsesRoundRobin(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	s := newQuotaTestSelector(clock, nil)
+	auths := []*Auth{{ID: "x", Provider: "claude"}, {ID: "y", Provider: "claude"}}
+	seen := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		picked, err := s.Pick(context.Background(), "claude", "sonnet", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() error = %v", err)
+		}
+		seen[picked.ID] = true
+	}
+	if len(seen) != 2 {
+		t.Fatalf("picks = %v, want round-robin", seen)
+	}
+	if len(s.entries) != 0 {
+		t.Fatalf("tracked %d non-codex auths", len(s.entries))
+	}
+}
+
+// A probe must not replace a newer observation from a live response.
+func TestObserveQuotaProbeKeepsNewerObservation(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	s := newQuotaTestSelector(clock, nil)
+	now := clock.Now()
+	auths := []*Auth{observed(quotaTestAuths("a")[0], now.Add(time.Second), usageSignals(10, now.Add(time.Hour)))}
+	m := newQuotaTestManager(s, auths)
+
+	m.observeQuotaProbe("a", headerOf(usageSignals(90, now.Add(time.Hour))), now)
+	if got := auths[0].Quota.Signals[codexSignalPrimary+"Used-Percent"]; got != "10" {
+		t.Fatalf("probe overwrote a newer observation: used = %s", got)
+	}
+	m.observeQuotaProbe("a", headerOf(usageSignals(90, now.Add(time.Hour))), now.Add(2*time.Second))
+	if got := auths[0].Quota.Signals[codexSignalPrimary+"Used-Percent"]; got != "90" {
+		t.Fatalf("newer probe not stored: used = %s", got)
+	}
+}
+
+func TestParseCodexUsageConvertsPayloadToObservation(t *testing.T) {
+	body := []byte(`{"rate_limit":{"allowed":true,"limit_reached":false,
+		"primary_window":{"used_percent":"42.5","reset_after_seconds":600},
+		"secondaryWindow":{"usedPercent":7,"resetAt":1800086400}}}`)
+	headers, err := parseCodexUsage(body)
+	if err != nil {
+		t.Fatalf("parseCodexUsage() error = %v", err)
+	}
+	want := map[string]string{
+		codexSignalAllowed:                         "true",
+		codexSignalLimitReached:                    "false",
+		codexSignalPrimary + "Used-Percent":        "42.5",
+		codexSignalPrimary + "Reset-After-Seconds": "600",
+		codexSignalSecondary + "Used-Percent":      "7",
+		codexSignalSecondary + "Reset-At":          "1800086400",
+	}
+	for name, value := range want {
+		if got := headers.Get(name); got != value {
+			t.Fatalf("%s = %q, want %q", name, got, value)
 		}
 	}
-
-	auths := []*Auth{
-		{ID: "a", Provider: "codex", Status: StatusActive, Index: "a"},
-		{ID: "b", Provider: "codex", Status: StatusActive, Index: "b"},
+	if _, err := parseCodexUsage([]byte(`[]`)); err == nil {
+		t.Fatal("want an error for a non-object payload")
 	}
-	byIndex := map[string]*codexUsageSnapshot{
-		"a": mkExhausted(later),
-		"b": mkExhausted(earliest),
+	if _, err := parseCodexUsage([]byte(`{"rate_limit":{"allowed":true}}`)); err == nil {
+		t.Fatal("want an error when no window carries usage")
 	}
+}
 
-	sel := NewQuotaAwareSelector()
-	sel.now = func() time.Time { return now }
-	sel.fetchCodexUsage = func(ctx context.Context, a *Auth) (*codexUsageSnapshot, error) {
-		snap := byIndex[a.Index]
-		clone := *snap
-		return &clone, nil
+// A relative reset is anchored to the observation, not to the moment it is read.
+func TestQuotaSnapshotResetAnchorsToObservation(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	q := QuotaState{ObservedAt: now, Signals: map[string]string{
+		codexSignalPrimary + "Used-Percent":        "50",
+		codexSignalPrimary + "Reset-After-Seconds": "600",
+	}}
+	snap := codexSnapshotOf(q, now.Add(4*time.Minute))
+	if snap == nil {
+		t.Fatal("snapshot is nil for a fresh observation")
 	}
+	if !snap.primaryWindow.resetAt.Equal(now.Add(10 * time.Minute)) {
+		t.Fatalf("reset = %v, want observation+10m", snap.primaryWindow.resetAt)
+	}
+}
 
-	_, err := sel.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, cloneAuths(auths))
+// A passed primary reset must not hide a live exhausted secondary window.
+func TestQuotaAwareLiveExhaustionSurvivesPassedReset(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	s := newQuotaTestSelector(clock, nil)
+	now := clock.Now()
+	auths := []*Auth{observed(quotaTestAuths("a")[0], now, map[string]string{
+		codexSignalAllowed:                    "true",
+		codexSignalPrimary + "Used-Percent":   "50",
+		codexSignalPrimary + "Reset-At":       strconv.FormatInt(now.Add(time.Minute).Unix(), 10),
+		codexSignalSecondary + "Used-Percent": "100",
+		codexSignalSecondary + "Reset-At":     strconv.FormatInt(now.Add(time.Hour).Unix(), 10),
+	})}
+	clock.Advance(2 * time.Minute)
+
+	if picked, err := s.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, auths); err == nil {
+		t.Fatalf("Pick() = %v; a weekly window at 100%% must stay exhausted after the primary reset passed", picked.ID)
+	}
+}
+
+// Probes must use the host proxy-url when the auth has no proxy override, as
+// the executors do, and an auth override must still win.
+func TestQuotaAwareProbesUseHostProxyWithoutAuthOverride(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	probed := make(chan codexUsageCredential, 2)
+	s := newQuotaTestSelector(clock, func(_ context.Context, cred codexUsageCredential) (http.Header, error) {
+		probed <- cred
+		return nil, errors.New("probe skipped")
+	})
+	s.hostProxyURL = "http://host-proxy.example:3128"
+	override := quotaTestAuths("b")[0]
+	override.ProxyURL = "http://auth-proxy.example:8080"
+	auths := append(quotaTestAuths("a"), override)
+	if _, err := s.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, auths); err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	s.refreshDue(context.Background())
+
+	got := map[string]string{}
+	for range auths {
+		select {
+		case cred := <-probed:
+			got[cred.accountID] = cred.proxyURL
+		case <-time.After(10 * time.Second):
+			t.Fatal("probe did not start")
+		}
+	}
+	if got["acct-a"] != "http://host-proxy.example:3128" {
+		t.Fatalf("auth without override probed via %q, want host proxy", got["acct-a"])
+	}
+	if got["acct-b"] != "http://auth-proxy.example:8080" {
+		t.Fatalf("auth with override probed via %q, want its own proxy", got["acct-b"])
+	}
+}
+
+// Sole-window reset: flags from the same window expire with it, so the credential is unknown.
+func TestQuotaAwareExpiredFlagsBecomeUnknown(t *testing.T) {
+	for _, flags := range []map[string]string{
+		{codexSignalAllowed: "false"},
+		{codexSignalLimitReached: "true"},
+	} {
+		clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+		s := newQuotaTestSelector(clock, nil)
+		now := clock.Now()
+		signals := usageSignals(100, now.Add(time.Minute))
+		for k, v := range flags {
+			signals[k] = v
+		}
+		auths := []*Auth{observed(quotaTestAuths("a")[0], now, signals)}
+		clock.Advance(2 * time.Minute)
+
+		picked, err := s.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, auths)
+		if err != nil || picked.ID != "a" {
+			t.Fatalf("flags %v: Pick() = %v, %v; want a once its window reset", flags, picked, err)
+		}
+	}
+}
+
+// A passed window's flag must not hide a live exhausted window, and a live
+// window at a known usage level does not justify keeping the expired flag.
+func TestQuotaAwareExpiredFlagKeepsLiveExhaustion(t *testing.T) {
+	clock := &quotaTestClock{now: time.Unix(1_800_000_000, 0)}
+	s := newQuotaTestSelector(clock, nil)
+	now := clock.Now()
+	spent := map[string]string{
+		codexSignalAllowed:                    "false",
+		codexSignalLimitReached:               "true",
+		codexSignalPrimary + "Used-Percent":   "50",
+		codexSignalPrimary + "Reset-At":       strconv.FormatInt(now.Add(time.Minute).Unix(), 10),
+		codexSignalSecondary + "Used-Percent": "100",
+		codexSignalSecondary + "Reset-At":     strconv.FormatInt(now.Add(time.Hour).Unix(), 10),
+	}
+	steady := map[string]string{
+		codexSignalAllowed:                    "false",
+		codexSignalPrimary + "Used-Percent":   "50",
+		codexSignalPrimary + "Reset-At":       strconv.FormatInt(now.Add(time.Minute).Unix(), 10),
+		codexSignalSecondary + "Used-Percent": "50",
+		codexSignalSecondary + "Reset-At":     strconv.FormatInt(now.Add(time.Hour).Unix(), 10),
+	}
+	spentAuths := []*Auth{observed(quotaTestAuths("spent")[0], now, spent)}
+	steadyAuths := []*Auth{observed(quotaTestAuths("steady")[0], now, steady)}
+	clock.Advance(2 * time.Minute)
+
+	if picked, err := s.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, spentAuths); err == nil {
+		t.Fatalf("Pick() = %v; a live exhausted secondary window must keep the credential out", picked.ID)
+	}
+	if picked, err := s.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, steadyAuths); err != nil || picked.ID != "steady" {
+		t.Fatalf("Pick() = %v, %v; want the expired flag dropped when no live window is exhausted", picked, err)
+	}
+}
+
+// quotaTestExecutor counts calls for a provider identifier.
+type quotaTestExecutor struct {
+	id    string
+	calls atomic.Int32
+}
+
+func (e *quotaTestExecutor) Identifier() string { return e.id }
+
+func (e *quotaTestExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.calls.Add(1)
+	return cliproxyexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+}
+
+func (e *quotaTestExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, errors.New("stream not supported")
+}
+
+func (e *quotaTestExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *quotaTestExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, errors.New("not supported")
+}
+
+func (e *quotaTestExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not supported")
+}
+
+func quotaCodexAuth(id string, quota QuotaState) *Auth {
+	return &Auth{
+		ID:       id,
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"access_token": "tok-" + id, "account_id": "acct-" + id},
+		Quota:    quota,
+	}
+}
+
+// quotaExecuteManager returns a manager that selects with s and serves the auths
+// under model. Probes stay manual, so no network call can happen in these tests.
+func quotaExecuteManager(t *testing.T, s *QuotaAwareSelector, model string, executors []*quotaTestExecutor, auths []*Auth) *Manager {
+	t.Helper()
+	m := NewManager(nil, s, nil)
+	for _, e := range executors {
+		m.RegisterExecutor(e)
+	}
+	for _, a := range auths {
+		if _, err := m.Register(context.Background(), a); err != nil {
+			t.Fatalf("Register(%s): %v", a.ID, err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(a.ID, a.Provider, []*registry.ModelInfo{{ID: model}})
+		id := a.ID
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+	}
+	return m
+}
+
+// Execute always selects with provider "mixed". A freshly exhausted Codex singleton
+// must be rejected there, not served by round-robin.
+func TestManagerExecuteRejectsExhaustedCodexSingleton(t *testing.T) {
+	const model = "quota-test-singleton"
+	now := time.Now()
+	s := NewQuotaAwareSelector()
+	s.manualRefresh = true
+	codex := &quotaTestExecutor{id: "codex"}
+	m := quotaExecuteManager(t, s, model, []*quotaTestExecutor{codex}, []*Auth{
+		quotaCodexAuth("codex-spent", QuotaState{ObservedAt: now, Signals: usageSignals(100, now.Add(time.Hour))}),
+	})
+
+	_, err := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
 	if err == nil {
-		t.Fatalf("expected cooldown error when all windows exhausted, got nil")
+		t.Fatal("Execute served an exhausted Codex credential")
 	}
-	cd, ok := err.(*modelCooldownError)
-	if !ok {
-		t.Fatalf("expected *modelCooldownError, got %T (%v)", err, err)
-	}
-	// The reset should be derived from the earliest (1h) window.
-	if cd.resetIn <= 0 || cd.resetIn > time.Hour+time.Second {
-		t.Fatalf("resetIn = %v, want ~1h (earliest reset)", cd.resetIn)
+	if got := codex.calls.Load(); got != 0 {
+		t.Fatalf("exhausted credential reached the executor %d times", got)
 	}
 }
 
-// TestQuotaAwarePick_FetchErrorFallsBackToRoundRobin ensures that when quota
-// telemetry is unavailable for every auth, Pick still degrades to round-robin
-// selection rather than failing.
-func TestQuotaAwarePick_FetchErrorFallsBackToRoundRobin(t *testing.T) {
-	t.Parallel()
+// In a mixed pool, an exhausted Codex credential is skipped and the other provider serves.
+func TestManagerExecuteSkipsExhaustedCodexInMixedPool(t *testing.T) {
+	const model = "quota-test-mixed"
+	now := time.Now()
+	s := NewQuotaAwareSelector()
+	s.manualRefresh = true
+	codex := &quotaTestExecutor{id: "codex"}
+	other := &quotaTestExecutor{id: "quota-test-other"}
+	m := quotaExecuteManager(t, s, model, []*quotaTestExecutor{codex, other}, []*Auth{
+		quotaCodexAuth("a-codex-spent", QuotaState{ObservedAt: now, Signals: usageSignals(100, now.Add(time.Hour))}),
+		{ID: "b-other", Provider: "quota-test-other", Status: StatusActive},
+	})
 
-	auths := []*Auth{
-		{ID: "x", Provider: "codex", Status: StatusActive, Index: "x"},
-		{ID: "y", Provider: "codex", Status: StatusActive, Index: "y"},
-	}
-	sel := NewQuotaAwareSelector()
-	sel.fetchCodexUsage = func(ctx context.Context, a *Auth) (*codexUsageSnapshot, error) {
-		return nil, errors.New("upstream unavailable")
-	}
-
-	picked, err := sel.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, cloneAuths(auths))
+	resp, err := m.Execute(context.Background(), []string{"codex", "quota-test-other"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
 	if err != nil {
-		t.Fatalf("Pick returned error when telemetry unavailable: %v", err)
+		t.Fatalf("Execute() error = %v", err)
 	}
-	if picked == nil || (picked.ID != "x" && picked.ID != "y") {
-		t.Fatalf("Pick returned unexpected auth: %+v", picked)
+	if string(resp.Payload) != `{"ok":true}` {
+		t.Fatalf("payload = %s", resp.Payload)
 	}
-}
-
-// TestQuotaAwarePick_NonCodexDelegatesToRoundRobin confirms non-codex
-// providers skip quota scoring entirely and delegate to the round-robin
-// selector.
-func TestQuotaAwarePick_NonCodexDelegatesToRoundRobin(t *testing.T) {
-	t.Parallel()
-
-	auths := []*Auth{
-		{ID: "claude-1", Provider: "claude", Status: StatusActive, Index: "claude-1"},
-	}
-	sel := NewQuotaAwareSelector()
-	// A panicking fetcher proves it is never invoked for non-codex providers.
-	sel.fetchCodexUsage = func(ctx context.Context, a *Auth) (*codexUsageSnapshot, error) {
-		t.Fatalf("fetchCodexUsage must not be called for non-codex provider")
-		return nil, nil
-	}
-
-	picked, err := sel.Pick(context.Background(), "claude", "claude-sonnet", cliproxyexecutor.Options{}, cloneAuths(auths))
-	if err != nil {
-		t.Fatalf("Pick error for non-codex: %v", err)
-	}
-	if picked == nil || picked.ID != "claude-1" {
-		t.Fatalf("Pick returned unexpected auth: %+v", picked)
+	if codex.calls.Load() != 0 || other.calls.Load() != 1 {
+		t.Fatalf("calls codex=%d other=%d, want 0 and 1", codex.calls.Load(), other.calls.Load())
 	}
 }
 
-// itoa formats an int64 as a decimal string for embedding in JSON fixtures.
-// (Avoids pulling strconv into the test's import block noise.)
-func itoa(n int64) string {
-	if n == 0 {
-		return "0"
-	}
-	negative := n < 0
-	if negative {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if negative {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
-}
+// A Codex credential with no observation is still served through Execute (not starved).
+func TestManagerExecuteServesUnobservedCodexSingleton(t *testing.T) {
+	const model = "quota-test-unobserved"
+	s := NewQuotaAwareSelector()
+	s.manualRefresh = true
+	codex := &quotaTestExecutor{id: "codex"}
+	m := quotaExecuteManager(t, s, model, []*quotaTestExecutor{codex}, []*Auth{quotaCodexAuth("codex-new", QuotaState{})})
 
-// cloneAuths returns a shallow copy of the slice so concurrent/iterated Pick
-// calls do not mutate the caller's fixture slice.
-func cloneAuths(in []*Auth) []*Auth {
-	out := make([]*Auth, len(in))
-	copy(out, in)
-	return out
+	if _, err := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := codex.calls.Load(); got != 1 {
+		t.Fatalf("executor calls = %d, want 1", got)
+	}
 }

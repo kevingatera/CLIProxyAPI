@@ -56,6 +56,9 @@ type FileTokenStore struct {
 	mu      sync.Mutex
 	dirLock sync.RWMutex
 	baseDir string
+
+	// codexIndex maps Codex identities to credential files. Guarded by mu.
+	codexIndex codexIdentityIndex
 }
 
 // NewFileTokenStore creates a token store that saves credentials to disk through the
@@ -81,13 +84,6 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		return "", fmt.Errorf("auth filestore: %w", errWeight)
 	}
 
-	// Dedup by account_id: if this is a codex auth whose account already exists
-	// under a different filename (e.g. email alias or plan-type changed between
-	// logins), reuse the existing filename so we overwrite in place instead of
-	// minting a duplicate file. account_id is the true identity; the derived
-	// filename is not. See AGENTS.md "duplicate auth" note.
-	s.dedupByAccountID(auth)
-
 	path, err := s.resolveAuthPath(auth)
 	if err != nil {
 		return "", err
@@ -105,8 +101,11 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		}
 	}
 
+	// Identity lookup and the write share one lock, so concurrent logins cannot both miss.
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	path = s.redirectCodexDuplicateLocked(auth, path)
 
 	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
@@ -117,49 +116,57 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		SetMetadata(map[string]any)
 	}
 
-	switch {
-	case auth.Storage != nil:
-		if auth.Metadata == nil {
-			auth.Metadata = make(map[string]any)
+	if handled, errCodex := cliproxyauth.PersistCodexAuthFile(ctx, path, auth); handled {
+		if errCodex != nil {
+			return "", errCodex
 		}
-		auth.Metadata["disabled"] = auth.Disabled
-		if setter, ok := auth.Storage.(metadataSetter); ok {
-			setter.SetMetadata(auth.Metadata)
-		}
-		if err = auth.Storage.SaveTokenToFile(path); err != nil {
-			return "", err
-		}
-	case auth.Metadata != nil:
-		auth.Metadata["disabled"] = auth.Disabled
-		raw, errMarshal := json.Marshal(auth.Metadata)
-		if errMarshal != nil {
-			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
-		}
-		if existing, errRead := os.ReadFile(path); errRead == nil {
-			if jsonEqual(existing, raw) {
-				break
+	} else {
+		switch {
+		case auth.Storage != nil:
+			if auth.Metadata == nil {
+				auth.Metadata = make(map[string]any)
 			}
-			file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
-			if errOpen != nil {
-				return "", fmt.Errorf("auth filestore: open existing failed: %w", errOpen)
+			auth.Metadata["disabled"] = auth.Disabled
+			if setter, ok := auth.Storage.(metadataSetter); ok {
+				setter.SetMetadata(auth.Metadata)
 			}
-			if _, errWrite := file.Write(raw); errWrite != nil {
-				_ = file.Close()
-				return "", fmt.Errorf("auth filestore: write existing failed: %w", errWrite)
+			if err = auth.Storage.SaveTokenToFile(path); err != nil {
+				return "", err
 			}
-			if errClose := file.Close(); errClose != nil {
-				return "", fmt.Errorf("auth filestore: close existing failed: %w", errClose)
+		case auth.Metadata != nil:
+			auth.Metadata["disabled"] = auth.Disabled
+			raw, errMarshal := json.Marshal(auth.Metadata)
+			if errMarshal != nil {
+				return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
 			}
-			break
-		} else if !os.IsNotExist(errRead) {
-			return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
+			if existing, errRead := os.ReadFile(path); errRead == nil {
+				if jsonEqual(existing, raw) {
+					break
+				}
+				file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
+				if errOpen != nil {
+					return "", fmt.Errorf("auth filestore: open existing failed: %w", errOpen)
+				}
+				if _, errWrite := file.Write(raw); errWrite != nil {
+					_ = file.Close()
+					return "", fmt.Errorf("auth filestore: write existing failed: %w", errWrite)
+				}
+				if errClose := file.Close(); errClose != nil {
+					return "", fmt.Errorf("auth filestore: close existing failed: %w", errClose)
+				}
+			} else if os.IsNotExist(errRead) {
+				if errWrite := os.WriteFile(path, raw, 0o600); errWrite != nil {
+					return "", fmt.Errorf("auth filestore: write file failed: %w", errWrite)
+				}
+			} else {
+				return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
+			}
+		default:
+			return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
 		}
-		if errWrite := os.WriteFile(path, raw, 0o600); errWrite != nil {
-			return "", fmt.Errorf("auth filestore: write file failed: %w", errWrite)
-		}
-	default:
-		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
 	}
+
+	s.indexSavedCodexLocked(auth, path)
 
 	if auth.Attributes == nil {
 		auth.Attributes = make(map[string]string)
@@ -217,9 +224,12 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("auth filestore: delete failed: %w", err)
 	}
+	s.forgetCodexFileLocked(path)
 	return nil
 }
 
@@ -450,108 +460,6 @@ func (s *FileTokenStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error
 		return "", fmt.Errorf("auth filestore: directory not configured")
 	}
 	return filepath.Join(dir, auth.ID), nil
-}
-
-// dedupByAccountID rewrites auth.FileName/auth.ID in place when an existing
-// auth file for the same (provider, account_id) is already on disk under a
-// different filename. This makes a re-login of the same account overwrite the
-// existing file instead of creating a duplicate. It is a no-op when account_id
-// is unknown or no existing match is found. Provider-scoped: only dedups within
-// the same provider to avoid merging distinct accounts that happen to share an
-// identifier across providers.
-func (s *FileTokenStore) dedupByAccountID(auth *cliproxyauth.Auth) {
-	if auth == nil {
-		return
-	}
-	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
-	if provider == "" {
-		return
-	}
-	accountID := strings.TrimSpace(authAccountID(auth.Metadata))
-	if accountID == "" {
-		// Cannot dedup against an unknown identity; fall back to current behavior.
-		return
-	}
-
-	dir := s.baseDirSnapshot()
-	if dir == "" {
-		return
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	existingName := s.findExistingFileNameByAccountID(dir, provider, accountID)
-	if existingName == "" {
-		return
-	}
-	currentName := strings.TrimSpace(auth.FileName)
-	if currentName == "" {
-		currentName = strings.TrimSpace(auth.ID)
-	}
-	if existingName == currentName {
-		return
-	}
-	// Overwrite the existing file in place; the about-to-be-written duplicate is
-	// never created. Retire the stale name the new login would have used.
-	auth.FileName = existingName
-	auth.ID = existingName
-	if auth.Attributes != nil {
-		delete(auth.Attributes, "path")
-	}
-}
-
-// findExistingFileNameByAccountID scans dir for auth files whose provider and
-// account_id match. Returns the matching filename (basename) or "". Caller must
-// hold s.mu. Only the small account_id/type fields are parsed per file.
-func (s *FileTokenStore) findExistingFileNameByAccountID(dir, provider, accountID string) string {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return ""
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		name := e.Name()
-		if !strings.HasSuffix(strings.ToLower(name), ".json") {
-			continue
-		}
-		raw, errRead := os.ReadFile(filepath.Join(dir, name))
-		if errRead != nil {
-			continue
-		}
-		var probe struct {
-			Type      string `json:"type"`
-			AccountID string `json:"account_id"`
-		}
-		if errJSON := json.Unmarshal(raw, &probe); errJSON != nil {
-			continue
-		}
-		if strings.ToLower(strings.TrimSpace(probe.Type)) != provider {
-			continue
-		}
-		if strings.TrimSpace(probe.AccountID) == accountID {
-			return name
-		}
-	}
-	return ""
-}
-
-// authAccountID extracts the canonical account identifier from a codex auth's
-// metadata, tolerating the two key variants written by different login paths.
-func authAccountID(metadata map[string]any) string {
-	if metadata == nil {
-		return ""
-	}
-	for _, key := range []string{"account_id", "chatgpt_account_id"} {
-		if v, ok := metadata[key]; ok {
-			if s, okStr := v.(string); okStr && strings.TrimSpace(s) != "" {
-				return strings.TrimSpace(s)
-			}
-		}
-	}
-	return ""
 }
 
 func (s *FileTokenStore) labelFor(metadata map[string]any) string {

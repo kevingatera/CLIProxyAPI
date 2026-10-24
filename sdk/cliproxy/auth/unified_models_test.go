@@ -3,6 +3,8 @@ package auth
 import (
 	"context"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,8 +46,8 @@ func setupUnified(t *testing.T) (*Manager, *unifiedTestExecutor, *unifiedTestExe
 	}}}}}}
 	m := NewManager(nil, nil, nil)
 	m.SetConfig(cfg)
-	goExec := &unifiedTestExecutor{routingPolicyTestExecutor: routingPolicyTestExecutor{id: "unified-go"}}
-	paidExec := &unifiedTestExecutor{routingPolicyTestExecutor: routingPolicyTestExecutor{id: "unified-paid"}}
+	goExec := &unifiedTestExecutor{routingPolicyTestExecutor: routingPolicyTestExecutor{provider: "unified-go"}}
+	paidExec := &unifiedTestExecutor{routingPolicyTestExecutor: routingPolicyTestExecutor{provider: "unified-paid"}}
 	m.RegisterExecutor(goExec)
 	m.RegisterExecutor(paidExec)
 	for _, a := range []*Auth{{ID: "unified-go-auth", Provider: "unified-go", Status: StatusActive}, {ID: "unified-paid-auth", Provider: "unified-paid", Status: StatusActive}} {
@@ -173,12 +175,14 @@ func TestUnifiedCreditExhaustionAndBudgetFailure(t *testing.T) {
 			t.Fatal("zero-credit route eligible")
 		}
 	}
-	plan := routingExecutionPlan{Strategy: "unified-adaptive", PolicyEnabled: true}
-	if ok, _ := m.shouldFallbackAfterExecutionError(&Error{HTTPStatus: 400, Message: "insufficient credits"}, plan); !ok {
-		t.Fatal("known provider budget error did not fall back")
+	// Budget exhaustion is classified by HTTP 402 only; message text is never matched.
+	plan := &routingPlan{fallbackOn: routingFallbackTriggers(config.RoutingFallbackPolicy{})}
+	ctx := context.Background()
+	if !plan.allowsFallback(classifyRoutingFailure(ctx, &Error{HTTPStatus: http.StatusPaymentRequired, Message: "insufficient credits"})) {
+		t.Fatal("HTTP 402 budget error did not fall back")
 	}
-	if ok, _ := m.shouldFallbackAfterExecutionError(&Error{HTTPStatus: 400, Message: "invalid input"}, plan); ok {
-		t.Fatal("invalid input must not fall back")
+	if plan.allowsFallback(classifyRoutingFailure(ctx, &Error{HTTPStatus: http.StatusBadRequest, Message: "insufficient credits"})) {
+		t.Fatal("HTTP 400 with credit text must not fall back")
 	}
 }
 
@@ -222,5 +226,186 @@ func TestUnifiedPriorityWithinIncludedPlans(t *testing.T) {
 	routes = m.UnifiedRoutes("cliproxy/unified-test", now)
 	if routes[0].Provider != "unified-paid" || routes[1].Eligible {
 		t.Fatalf("exhaustion ignored: %+v", routes)
+	}
+}
+
+// A report whose source declares an earlier expiry must stop being fresh at that expiry,
+// even inside the ten-minute local window.
+func TestUnifiedQuotaObservationHonorsEarlierExpiry(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	now := time.Now()
+	report := reportUnified(0.5, now.Add(time.Hour))
+	m.ObserveUnifiedQuotaUntil("short", report, now, now.Add(time.Minute))
+	if !m.unifiedQuotaFresh("short", now.Add(30*time.Second)) {
+		t.Fatal("report rejected before its declared expiry")
+	}
+	if m.unifiedQuotaFresh("short", now.Add(2*time.Minute)) {
+		t.Fatal("report outlived its declared expiry")
+	}
+	m.ObserveUnifiedQuota("local", report, now)
+	if !m.unifiedQuotaFresh("local", now.Add(5*time.Minute)) {
+		t.Fatal("report without an expiry rejected inside the freshness window")
+	}
+}
+
+// A service snapshot that covers only some credentials must not stop the native refresh
+// for the rest.
+func TestUnifiedRefreshFetchesCredentialsTheServiceDidNotCover(t *testing.T) {
+	m, _, _, _ := setupUnified(t)
+	now := time.Now()
+	var mu sync.Mutex
+	fetched := map[string]int{}
+	m.SetUnifiedQuotaFetcher(func(_ context.Context, a *Auth) (pluginapi.QuotaFetchResponse, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		fetched[a.ID]++
+		return reportUnified(0.5, now.Add(time.Hour)), nil
+	})
+	covered := make(chan struct{}, 1)
+	m.SetUnifiedAllowanceRefresher(func(context.Context) {
+		m.ObserveUnifiedQuotaUntil("unified-go-auth", reportUnified(0.9, now.Add(time.Hour)), now, now.Add(time.Hour))
+		select {
+		case covered <- struct{}{}:
+		default:
+		}
+	})
+	m.refreshUnifiedQuotas(context.Background())
+	// Native fetches run detached, so wait for the uncovered credential's report to land.
+	waitUnifiedCondition(t, "uncovered paid report", func() bool { return m.unifiedQuotaFresh("unified-paid-auth", time.Now()) })
+	mu.Lock()
+	uncovered := fetched["unified-paid-auth"]
+	mu.Unlock()
+	if uncovered != 1 {
+		t.Fatalf("paid fetches=%d; the uncovered credential should be fetched once", uncovered)
+	}
+	// The allowance read runs beside native fetches, so wait for it before judging coverage.
+	<-covered
+	mu.Lock()
+	fetched = map[string]int{}
+	mu.Unlock()
+	m.refreshUnifiedQuotas(context.Background())
+	mu.Lock()
+	defer mu.Unlock()
+	if len(fetched) != 0 {
+		t.Fatalf("fetches=%v after coverage; both credentials are fresh and should not be fetched", fetched)
+	}
+}
+
+// A stalled allowance service must not hold back native quota fetches, and a second cycle
+// must not start another service call while the first is still blocked.
+func TestUnifiedRefreshNotBlockedByStalledAllowanceService(t *testing.T) {
+	m, _, _, _ := setupUnified(t)
+	now := time.Now()
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var refreshCalls atomic.Int32
+	m.SetUnifiedAllowanceRefresher(func(context.Context) {
+		refreshCalls.Add(1)
+		<-release
+	})
+	fetched := make(chan string, 4)
+	m.SetUnifiedQuotaFetcher(func(_ context.Context, a *Auth) (pluginapi.QuotaFetchResponse, error) {
+		fetched <- a.ID
+		return reportUnified(0.5, now.Add(time.Hour)), nil
+	})
+
+	done := make(chan struct{})
+	go func() {
+		m.refreshUnifiedQuotas(context.Background())
+		m.refreshUnifiedQuotas(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("refresh cycle blocked on the allowance service")
+	}
+	// The service never answers, so both credentials are uncovered and fetched natively.
+	got := map[string]bool{<-fetched: true, <-fetched: true}
+	if !got["unified-go-auth"] || !got["unified-paid-auth"] {
+		t.Fatalf("native fetches = %v, want both credentials", got)
+	}
+	// The refresher runs in its own goroutine, so a fetch landing does not mean it has started yet.
+	waitUnifiedCondition(t, "allowance refresh call", func() bool { return refreshCalls.Load() > 0 })
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("allowance refresh calls = %d, want 1 while the first call is stalled", got)
+	}
+}
+
+// An older service snapshot must not readmit a credential that a newer native report marked exhausted.
+func TestUnifiedObservationRejectsOlderSnapshot(t *testing.T) {
+	m, _, _, _ := setupUnified(t)
+	now := time.Now()
+	reset := now.Add(time.Hour)
+	m.ObserveUnifiedQuota("unified-go-auth", reportUnified(0, reset), now)
+	m.ObserveUnifiedQuotaUntil("unified-go-auth", reportUnified(1, reset), now.Add(-time.Minute), reset)
+	for _, route := range m.UnifiedRoutes("cliproxy/unified-test", now) {
+		if route.Provider == "unified-go" && route.Eligible {
+			t.Fatalf("older snapshot readmitted an exhausted credential: %+v", route)
+		}
+	}
+}
+
+// waitUnifiedCondition polls for a background fetch to land, since refresh ticks no longer join them.
+func waitUnifiedCondition(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// One stalled native fetch must not hold back later refresh ticks. The stalled credential stays
+// single-flight while the other credential is refetched on the second tick.
+func TestUnifiedRefreshContinuesPastStalledFetch(t *testing.T) {
+	m, _, _, _ := setupUnified(t)
+	now := time.Now()
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var mu sync.Mutex
+	calls := map[string]int{}
+	count := func(id string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls[id]
+	}
+	m.SetUnifiedQuotaFetcher(func(_ context.Context, a *Auth) (pluginapi.QuotaFetchResponse, error) {
+		mu.Lock()
+		calls[a.ID]++
+		mu.Unlock()
+		if a.ID == "unified-go-auth" {
+			<-release
+		}
+		return reportUnified(0.5, now.Add(time.Hour)), nil
+	})
+	tick := func() {
+		done := make(chan struct{})
+		go func() {
+			m.refreshUnifiedQuotas(context.Background())
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("refresh tick blocked on a stalled fetch")
+		}
+	}
+	tick()
+	waitUnifiedCondition(t, "paid report", func() bool { return m.unifiedQuotaFresh("unified-paid-auth", time.Now()) })
+
+	// Age the paid report past the freshness window so the second tick has work to do.
+	m.unifiedMu.Lock()
+	snap := m.unifiedQuota["unified-paid-auth"]
+	snap.At = snap.At.Add(-11 * time.Minute)
+	m.unifiedQuota["unified-paid-auth"] = snap
+	m.unifiedMu.Unlock()
+
+	tick()
+	waitUnifiedCondition(t, "second paid fetch", func() bool { return count("unified-paid-auth") == 2 })
+	if got := count("unified-go-auth"); got != 1 {
+		t.Fatalf("stalled credential fetches = %d, want 1 while its first call is in flight", got)
 	}
 }

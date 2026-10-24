@@ -104,6 +104,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	}
 
 	cfg.NormalizePluginsConfig()
+	cfg.NormalizeClaudeConfig()
 	if errResolvePluginsDir := cfg.ResolvePluginsDir(); errResolvePluginsDir != nil && cfg.Plugins.Enabled {
 		return nil, errResolvePluginsDir
 	}
@@ -126,5 +127,9 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.SanitizeOAuthRequestScopedErrors()
 	cfg.SanitizePayloadRules()
 
+	// Management writes parse through here; reject what file loading would reject at restart.
+	if errValidate := cfg.Routing.UnifiedModels.Validate(); errValidate != nil {
+		return nil, errValidate
+	}
 	return &cfg, nil
 }

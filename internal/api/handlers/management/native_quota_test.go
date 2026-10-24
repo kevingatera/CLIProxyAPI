@@ -1,11 +1,26 @@
 package management
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"io"
+	"math"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 func TestOpenCodeQuotaExhaustedReport(t *testing.T) {
@@ -84,5 +99,266 @@ func TestConfiguredQuotaCredentialsShareAccountAcrossProtocols(t *testing.T) {
 	out, _ := json.Marshal(files)
 	if strings.Contains(string(out), "secret") {
 		t.Fatal("credential leaked")
+	}
+}
+
+// fixtureTransport serves fixture responses by URL and records each request.
+// Captured response provenance and the remaining synthetic cases are documented in testdata/native_quota/README.md.
+type fixtureTransport struct {
+	t         *testing.T
+	responses map[string]fixtureResponse
+	requested []string
+}
+
+type fixtureResponse struct {
+	status int
+	file   string
+}
+
+func (f *fixtureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	f.requested = append(f.requested, req.URL.String())
+	if got := req.Header.Get("Authorization"); got != "Bearer test-key" {
+		f.t.Errorf("%s: Authorization=%q", req.URL, got)
+	}
+	resp, ok := f.responses[req.URL.String()]
+	if !ok {
+		f.t.Errorf("unexpected provider request %s", req.URL)
+		return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(`{}`)), Header: http.Header{}, Request: req}, nil
+	}
+	body, err := os.ReadFile(filepath.Join("testdata", "native_quota", resp.file))
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return &http.Response{StatusCode: resp.status, Body: io.NopCloser(bytes.NewReader(body)), Header: http.Header{}, Request: req}, nil
+}
+
+func TestNativeQuotaHTTPAdapters(t *testing.T) {
+	for _, tc := range []struct {
+		provider  string
+		responses map[string]fixtureResponse
+		wantURLs  []string
+		check     func(*testing.T, pluginapi.QuotaFetchResponse)
+		wantErr   string
+	}{
+		{
+			provider:  "opencode-go",
+			responses: map[string]fixtureResponse{"https://opencode.ai/zen/go/v1/usage": {http.StatusOK, "opencode-go-usage.json"}},
+			check: func(t *testing.T, r pluginapi.QuotaFetchResponse) {
+				b := r.Groups[0].Buckets
+				if len(b) != 3 || b[0].RemainingFraction != 1 || math.Abs(b[1].RemainingFraction-.67) > 1e-12 || math.Abs(b[2].RemainingFraction-.71) > 1e-12 || b[1].ResetTime != "2026-10-26T00:00:00.000Z" {
+					t.Fatalf("buckets=%+v", b)
+				}
+			},
+		},
+		{
+			provider:  "kimi",
+			responses: map[string]fixtureResponse{"https://api.kimi.com/coding/v1/usages": {http.StatusOK, "kimi-usages.json"}},
+			check: func(t *testing.T, r pluginapi.QuotaFetchResponse) {
+				b := r.Groups[0].Buckets
+				if len(b) != 2 || b[0].RemainingFraction != 1 || b[1].RemainingFraction != 1 || b[0].ResetTime != "2026-10-24T03:15:14Z" {
+					t.Fatalf("buckets=%+v", b)
+				}
+			},
+		},
+		{
+			provider:  "minimax",
+			responses: map[string]fixtureResponse{"https://www.minimax.io/v1/token_plan/remains": {http.StatusOK, "minimax-token-plan-remains.json"}},
+			check: func(t *testing.T, r pluginapi.QuotaFetchResponse) {
+				if b := r.Groups[0].Buckets; len(b) != 1 || b[0].RemainingFraction != .25 {
+					t.Fatalf("buckets=%+v", b)
+				}
+			},
+		},
+		{
+			provider:  "minimax",
+			responses: map[string]fixtureResponse{"https://www.minimax.io/v1/token_plan/remains": {http.StatusOK, "minimax-token-plan-inactive.json"}},
+			wantErr:   "no active token plan",
+		},
+		{
+			provider: "commandcode",
+			responses: map[string]fixtureResponse{
+				"https://api.commandcode.ai/alpha/whoami?limits=1": {http.StatusOK, "commandcode-whoami.json"},
+				"https://api.commandcode.ai/alpha/billing/credits": {http.StatusOK, "commandcode-billing-credits.json"},
+			},
+			wantURLs: []string{"https://api.commandcode.ai/alpha/whoami?limits=1", "https://api.commandcode.ai/alpha/billing/credits"},
+			check: func(t *testing.T, r pluginapi.QuotaFetchResponse) {
+				if len(r.Summary) != 3 || r.Summary[0].Value != 120.0212633812 || r.Summary[1].Value != 0.085519748 || len(r.Groups[0].Buckets) != 2 {
+					t.Fatalf("report=%+v", r)
+				}
+				b := r.Groups[0].Buckets
+				if math.Abs(b[0].RemainingFraction-(1-0.086885916/45)) > 1e-12 || math.Abs(b[1].RemainingFraction-(1-26.545168398/90)) > 1e-12 || b[0].ResetTime == "" || b[1].ResetTime == "" {
+					t.Fatalf("buckets=%+v", b)
+				}
+				out, _ := json.Marshal(r)
+				if strings.Contains(string(out), "REDACTED") {
+					t.Fatal("account identity leaked into quota report")
+				}
+			},
+		},
+		{
+			provider:  "commandcode",
+			responses: map[string]fixtureResponse{"https://api.commandcode.ai/alpha/whoami?limits=1": {http.StatusUnauthorized, "commandcode-whoami.json"}},
+			wantErr:   "HTTP 401",
+		},
+	} {
+		t.Run(tc.provider+"/"+tc.wantErr, func(t *testing.T) {
+			transport := &fixtureTransport{t: t, responses: tc.responses}
+			report, err := fetchNativeQuotaReport(context.Background(), &http.Client{Transport: transport}, tc.provider, "test-key")
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err=%v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantURLs != nil && !slices.Equal(transport.requested, tc.wantURLs) {
+				t.Fatalf("requested=%v", transport.requested)
+			}
+			tc.check(t, report)
+		})
+	}
+}
+
+func TestFetchCredentialQuotaV8Dispatch(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	register := func(id, provider, baseURL, key string) string {
+		a := &coreauth.Auth{ID: id, Provider: provider, Attributes: map[string]string{"api_key": key, "base_url": baseURL, "source": "config:" + id}}
+		index := a.EnsureIndex()
+		if _, err := manager.Register(context.Background(), a); err != nil {
+			t.Fatal(err)
+		}
+		return index
+	}
+	pluginBacked := register("plugin-backed", "opencode-go", "https://opencode.ai/zen/go/v1", "k")
+	unsupported := register("unsupported", "openai-compatibility", "https://relay.example/v1", "k")
+	missingKey := register("missing-key", "openai-compatibility", "https://opencode.ai/zen/go/v1", "")
+
+	host := pluginhost.New()
+	host.RegisterPluginForTest("opencode-plugin", pluginapi.Plugin{Capabilities: pluginapi.Capabilities{QuotaProvider: &mockQuotaProvider{identifier: "opencode-go"}}})
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.SetPluginHost(host)
+
+	for _, tc := range []struct {
+		body   string
+		status int
+	}{
+		{`{}`, http.StatusBadRequest},
+		{`{"auth_index":"missing"}`, http.StatusNotFound},
+		{`{"auth_index":"` + pluginBacked + `"}`, http.StatusOK},
+		{`{"auth_index":"` + unsupported + `"}`, http.StatusNotImplemented},
+		{`{"auth_index":"` + missingKey + `"}`, http.StatusBadRequest},
+	} {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v8/management/credentials/quota", strings.NewReader(tc.body))
+		c.Request.Header.Set("Content-Type", "application/json")
+		h.FetchCredentialQuotaV8(c)
+		if rec.Code != tc.status {
+			t.Fatalf("%s: status=%d body=%s", tc.body, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestFetchCredentialQuotaV8PrefersPluginReport(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	a := &coreauth.Auth{ID: "opencode", Provider: "opencode-go", Attributes: map[string]string{"api_key": "k", "base_url": "https://opencode.ai/zen/go/v1", "source": "config:opencode"}}
+	index := a.EnsureIndex()
+	if _, err := manager.Register(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	host := pluginhost.New()
+	host.RegisterPluginForTest("opencode-plugin", pluginapi.Plugin{Capabilities: pluginapi.Capabilities{QuotaProvider: &mockQuotaProvider{
+		identifier: "opencode-go",
+		fetchFn: func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+			calls++
+			return pluginapi.QuotaFetchResponse{Subscription: &pluginapi.QuotaSubscription{TierID: "plugin-tier"}}, nil
+		},
+	}}})
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.SetPluginHost(host)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v8/management/credentials/quota", strings.NewReader(`{"auth_index":"`+index+`"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.FetchCredentialQuotaV8(c)
+	if rec.Code != http.StatusOK || calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", rec.Code, calls, rec.Body.String())
+	}
+	var report pluginapi.QuotaFetchResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Subscription == nil || report.Subscription.TierID != "plugin-tier" {
+		t.Fatalf("report=%+v; the plugin report must be served without the built-in adapter", report)
+	}
+}
+
+// Config reloads swap h.cfg while native fetches read the proxy transport. Both proxies point at
+// closed local ports, so the fetch fails without network access; the race detector checks the locking.
+func TestNativeQuotaFetchReadsConfigSnapshotUnderReload(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	a := &coreauth.Auth{ID: "native", Provider: "openai-compatibility", Attributes: map[string]string{"api_key": "k", "base_url": "https://opencode.ai/zen/go/v1", "source": "config:native"}}
+	index := a.EnsureIndex()
+	if _, err := manager.Register(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir, SDKConfig: config.SDKConfig{ProxyURL: "http://127.0.0.1:1"}}, manager)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			h.SetConfig(&config.Config{AuthDir: authDir, SDKConfig: config.SDKConfig{ProxyURL: "http://127.0.0.1:" + strconv.Itoa(1+i%2)}})
+		}
+	}()
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
+
+	for i := 0; i < 20; i++ {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v8/management/credentials/quota", strings.NewReader(`{"auth_index":"`+index+`"}`))
+		c.Request.Header.Set("Content-Type", "application/json")
+		h.FetchCredentialQuotaV8(c)
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("iteration %d: status=%d body=%s", i, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// Background refresh must reach plugin-only quota providers, which have no built-in adapter.
+func TestUnifiedQuotaFetchUsesPluginForPluginOnlyCredential(t *testing.T) {
+	host := pluginhost.New()
+	host.RegisterPluginForTest("workbuddy-plugin", pluginapi.Plugin{
+		Metadata:     pluginapi.Metadata{Name: "WorkBuddy Plugin"},
+		Capabilities: pluginapi.Capabilities{QuotaProvider: &mockQuotaProvider{identifier: "workbuddy"}},
+	})
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
+	h.SetPluginHost(host)
+
+	report, err := h.unifiedQuotaFetch(context.Background(), &coreauth.Auth{
+		ID:         "workbuddy-1",
+		Provider:   "workbuddy",
+		Attributes: map[string]string{"api_key": "test-key"},
+	})
+	if err != nil {
+		t.Fatalf("unifiedQuotaFetch error = %v, want the plugin report", err)
+	}
+	if len(report.Groups) == 0 {
+		t.Fatalf("report = %+v, want plugin groups", report)
 	}
 }

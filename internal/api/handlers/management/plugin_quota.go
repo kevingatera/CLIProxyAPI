@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
@@ -74,41 +76,14 @@ func (h *Handler) FetchCredentialQuota(c *gin.Context) {
 		return
 	}
 
-	h.mu.Lock()
-	host := h.pluginHost
-	h.mu.Unlock()
-
-	pluginID := strings.TrimSpace(body.PluginID)
-	provider := strings.TrimSpace(body.Provider)
-	if provider == "" {
-		provider = auth.Provider
-	}
-
-	if host != nil {
-		req := pluginapi.QuotaFetchRequest{
-			AuthIndex:  auth.Index,
-			AuthID:     auth.ID,
-			Provider:   provider,
-			Metadata:   auth.Metadata,
-			Attributes: auth.Attributes,
-		}
-		var quotaResp pluginapi.QuotaFetchResponse
-		var handled bool
-		var errFetch error
-		if pluginID != "" {
-			quotaResp, handled, errFetch = host.FetchQuotaByPlugin(c.Request.Context(), pluginID, req)
-		} else {
-			quotaResp, handled, errFetch = host.FetchQuota(c.Request.Context(), req)
-		}
-		if handled {
-			if errFetch != nil {
-				log.WithError(errFetch).Warnf("failed to fetch quota for credential %s", auth.Index)
-				c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to fetch quota: %v", errFetch)})
-				return
-			}
-			c.JSON(http.StatusOK, quotaResp)
+	if quotaResp, handled, errFetch := h.fetchPluginQuota(c.Request.Context(), auth, body.PluginID, body.Provider); handled {
+		if errFetch != nil {
+			log.WithError(errFetch).Warnf("failed to fetch quota for credential %s", auth.Index)
+			c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to fetch quota: %v", errFetch)})
 			return
 		}
+		c.JSON(http.StatusOK, quotaResp)
+		return
 	}
 
 	// Fallback to declarative quota probe if configured in metadata
@@ -129,6 +104,32 @@ func (h *Handler) FetchCredentialQuota(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusNotImplemented, gin.H{"error": "no quota provider available for credential"})
+}
+
+// fetchPluginQuota is the normalized plugin quota dispatch shared by the v0 and v8 routes.
+func (h *Handler) fetchPluginQuota(ctx context.Context, auth *coreauth.Auth, pluginID, provider string) (pluginapi.QuotaFetchResponse, bool, error) {
+	h.mu.Lock()
+	host := h.pluginHost
+	h.mu.Unlock()
+	if host == nil || auth == nil {
+		return pluginapi.QuotaFetchResponse{}, false, nil
+	}
+	pluginID = strings.TrimSpace(pluginID)
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		provider = auth.Provider
+	}
+	req := pluginapi.QuotaFetchRequest{
+		AuthIndex:  auth.Index,
+		AuthID:     auth.ID,
+		Provider:   provider,
+		Metadata:   auth.Metadata,
+		Attributes: auth.Attributes,
+	}
+	if pluginID != "" {
+		return host.FetchQuotaByPlugin(ctx, pluginID, req)
+	}
+	return host.FetchQuota(ctx, req)
 }
 
 // ResetCredentialQuota resets quota or usage for a credential.
@@ -252,7 +253,7 @@ func (h *Handler) FetchPluginQuota(c *gin.Context) {
 	pluginID := strings.TrimSpace(c.Param("id"))
 	var body credentialQuotaRequest
 	if errBind := c.ShouldBindJSON(&body); errBind != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		c.JSON(clienterror.HTTPStatusFromErrorOr(errBind, http.StatusBadRequest), gin.H{"error": "invalid request body"})
 		return
 	}
 	authIndex := body.resolveAuthIndex()
@@ -306,7 +307,12 @@ func (h *Handler) ResetPluginQuota(c *gin.Context) {
 	}
 	if authIndex == "" {
 		var body credentialQuotaRequest
-		_ = c.ShouldBindJSON(&body)
+		if errBind := c.ShouldBindJSON(&body); errBind != nil {
+			if status := clienterror.HTTPStatusFromError(errBind); status == http.StatusRequestEntityTooLarge {
+				c.JSON(status, gin.H{"error": errBind.Error()})
+				return
+			}
+		}
 		authIndex = body.resolveAuthIndex()
 	}
 	if authIndex == "" {

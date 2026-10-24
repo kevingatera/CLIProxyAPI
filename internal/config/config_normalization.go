@@ -5,97 +5,8 @@ import (
 	"strings"
 
 	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
+	log "github.com/sirupsen/logrus"
 )
-
-// SanitizeRoutingPolicy normalizes routing policy fields and drops invalid entries.
-func (cfg *Config) SanitizeRoutingPolicy() {
-	if cfg == nil {
-		return
-	}
-	normalizeTrigger := func(trigger string) (string, bool) {
-		switch strings.ToLower(strings.TrimSpace(trigger)) {
-		case "exhausted", "quota", "quota_exhausted":
-			return "exhausted", true
-		case "rate_limited", "ratelimited", "rate-limited", "429":
-			return "rate_limited", true
-		case "server_error", "server", "5xx":
-			return "server_error", true
-		case "transport_error", "transport", "network", "timeout":
-			return "transport_error", true
-		default:
-			return "", false
-		}
-	}
-	canonicalizeRule := func(rule RoutingPolicyRule) RoutingPolicyRule {
-		out := RoutingPolicyRule{IncludeRemainingProviders: rule.IncludeRemainingProviders}
-		seenProviders := make(map[string]struct{}, len(rule.Route))
-		for _, route := range rule.Route {
-			provider := strings.ToLower(strings.TrimSpace(route.Provider))
-			if provider == "" {
-				continue
-			}
-			if _, exists := seenProviders[provider]; exists {
-				continue
-			}
-			seenProviders[provider] = struct{}{}
-			seenAuthIDs := make(map[string]struct{}, len(route.AuthOrder))
-			authOrder := make([]string, 0, len(route.AuthOrder))
-			for _, authID := range route.AuthOrder {
-				authID = strings.TrimSpace(authID)
-				if authID == "" {
-					continue
-				}
-				if _, exists := seenAuthIDs[authID]; exists {
-					continue
-				}
-				seenAuthIDs[authID] = struct{}{}
-				authOrder = append(authOrder, authID)
-			}
-			out.Route = append(out.Route, RoutingPolicyRoute{
-				Provider: provider, AuthOrder: authOrder, IncludeRemainingAuth: route.IncludeRemainingAuth,
-			})
-		}
-		return out
-	}
-	cfg.Routing.Policy.Defaults = canonicalizeRule(cfg.Routing.Policy.Defaults)
-	if len(cfg.Routing.Policy.ModelOverrides) > 0 {
-		overrides := make(map[string]RoutingPolicyRule, len(cfg.Routing.Policy.ModelOverrides))
-		for modelID, rule := range cfg.Routing.Policy.ModelOverrides {
-			if modelID = strings.TrimSpace(modelID); modelID != "" {
-				overrides[modelID] = canonicalizeRule(rule)
-			}
-		}
-		cfg.Routing.Policy.ModelOverrides = overrides
-	}
-	seenTriggers := make(map[string]struct{}, len(cfg.Routing.Policy.Fallback.On))
-	triggers := make([]string, 0, len(cfg.Routing.Policy.Fallback.On))
-	for _, trigger := range cfg.Routing.Policy.Fallback.On {
-		normalized, ok := normalizeTrigger(trigger)
-		if !ok {
-			continue
-		}
-		if _, exists := seenTriggers[normalized]; exists {
-			continue
-		}
-		seenTriggers[normalized] = struct{}{}
-		triggers = append(triggers, normalized)
-	}
-	// Only inject default fallback triggers when the policy is enabled; doing
-	// it unconditionally would materialize values in saved configs even for a
-	// disabled policy and break config round-trip stability.
-	if len(triggers) == 0 && cfg.Routing.Policy.Enabled {
-		triggers = []string{"exhausted", "rate_limited", "server_error", "transport_error"}
-	}
-	if len(triggers) > 0 {
-		cfg.Routing.Policy.Fallback.On = triggers
-	}
-	if cfg.Routing.Policy.Observability.TraceLimit < 0 {
-		cfg.Routing.Policy.Observability.TraceLimit = 0
-	}
-	if cfg.Routing.Policy.Observability.TraceLimit > 2000 {
-		cfg.Routing.Policy.Observability.TraceLimit = 2000
-	}
-}
 
 // NormalizePluginsConfig applies default plugin configuration values.
 func (cfg *Config) NormalizePluginsConfig() {
@@ -123,6 +34,17 @@ func (cfg *Config) NormalizePluginsConfig() {
 	}
 }
 
+// NormalizeClaudeConfig applies default Claude provider configuration values.
+func (cfg *Config) NormalizeClaudeConfig() {
+	if cfg == nil {
+		return
+	}
+	if cfg.Claude.SessionDatePinDays == nil {
+		days := DefaultClaudeSessionDatePinDays
+		cfg.Claude.SessionDatePinDays = &days
+	}
+}
+
 // SanitizeCodexHeaderDefaults trims surrounding whitespace from the
 // configured Codex header fallback values.
 func (cfg *Config) SanitizeCodexHeaderDefaults() {
@@ -131,14 +53,26 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 	}
 	cfg.CodexHeaderDefaults.UserAgent = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
 	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
+	cfg.Codex.SignInWithChatGPTIdentifier = strings.TrimSpace(cfg.Codex.SignInWithChatGPTIdentifier)
 }
 
 // SanitizeClaudeHeaderDefaults trims surrounding whitespace from the
-// configured Claude fingerprint baseline values.
+// configured Claude fingerprint baseline values, normalizes the beta override
+// lists, and resets an unknown client-request-id mode to the default.
 func (cfg *Config) SanitizeClaudeHeaderDefaults() {
 	if cfg == nil {
 		return
 	}
+	cfg.ClaudeHeaderDefaults.AnthropicBetaStrip = normalizeClaudeBetaNames(cfg.ClaudeHeaderDefaults.AnthropicBetaStrip)
+	cfg.ClaudeHeaderDefaults.AnthropicBetaAppend = normalizeClaudeBetaNames(cfg.ClaudeHeaderDefaults.AnthropicBetaAppend)
+	mode := strings.ToLower(strings.TrimSpace(cfg.ClaudeHeaderDefaults.ClientRequestID))
+	switch mode {
+	case "", ClaudeClientRequestIDOn, ClaudeClientRequestIDOff, ClaudeClientRequestIDPassthrough:
+	default:
+		log.Warnf("unrecognized claude header-defaults client-request-id %q (supported: on, off, passthrough); falling back to on", cfg.ClaudeHeaderDefaults.ClientRequestID)
+		mode = ""
+	}
+	cfg.ClaudeHeaderDefaults.ClientRequestID = mode
 	cfg.ClaudeHeaderDefaults.UserAgent = strings.TrimSpace(cfg.ClaudeHeaderDefaults.UserAgent)
 	cfg.ClaudeHeaderDefaults.PackageVersion = strings.TrimSpace(cfg.ClaudeHeaderDefaults.PackageVersion)
 	cfg.ClaudeHeaderDefaults.RuntimeVersion = strings.TrimSpace(cfg.ClaudeHeaderDefaults.RuntimeVersion)
@@ -146,6 +80,31 @@ func (cfg *Config) SanitizeClaudeHeaderDefaults() {
 	cfg.ClaudeHeaderDefaults.Arch = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Arch)
 	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
 	cfg.ClaudeHeaderDefaults.Timezone = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timezone)
+}
+
+// normalizeClaudeBetaNames trims beta names and drops empty and duplicate
+// entries while keeping the configured order.
+func normalizeClaudeBetaNames(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.
@@ -177,7 +136,13 @@ func (cfg *Config) SanitizeOAuthModelAlias() {
 				continue
 			}
 			seenAlias[aliasKey] = struct{}{}
+			var openAPI *bool
+			if entry.OpenAPI != nil {
+				value := *entry.OpenAPI
+				openAPI = &value
+			}
 			clean = append(clean, OAuthModelAlias{
+				OpenAPI:      openAPI,
 				Name:         name,
 				Alias:        alias,
 				Fork:         entry.Fork,
@@ -219,7 +184,13 @@ func (cfg *Config) SanitizeOAuthSettings() {
 				continue
 			}
 			seen[key] = struct{}{}
+			var openAPI *bool
+			if entry.OpenAPI != nil {
+				value := *entry.OpenAPI
+				openAPI = &value
+			}
 			reversed = append(reversed, OAuthModelSetting{
+				OpenAPI:          openAPI,
 				Name:             name,
 				Alias:            alias,
 				MaxContextLength: entry.MaxContextLength,

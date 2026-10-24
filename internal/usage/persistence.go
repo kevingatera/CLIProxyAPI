@@ -3,7 +3,7 @@ package usage
 import (
 	"encoding/json"
 	"errors"
-	"io"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,163 +13,225 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// snapshotVersion is the current on-disk and export format. Version 1 files
+// (written by earlier builds, with raw keys) are migrated on load.
+const snapshotVersion = 2
+
+// renameFile is swapped in tests to simulate a failed commit.
+var renameFile = os.Rename
+
+// errSnapshotNotLoaded is returned by Flush when the existing file did not load.
+// Writing over it would destroy data this process never read.
+var errSnapshotNotLoaded = errors.New("usage snapshot was not loaded; refusing to overwrite it")
+
 type persistedSnapshot struct {
 	Version int                `json:"version"`
 	SavedAt time.Time          `json:"saved_at"`
 	Usage   StatisticsSnapshot `json:"usage"`
 }
 
-// Persistence periodically persists in-memory usage statistics to disk.
+// EncodeSnapshot serializes a snapshot in the current container format.
+func EncodeSnapshot(snapshot StatisticsSnapshot) ([]byte, error) {
+	return json.Marshal(persistedSnapshot{
+		Version: snapshotVersion,
+		SavedAt: time.Now().UTC(),
+		Usage:   snapshot,
+	})
+}
+
+// DecodeSnapshot parses a versioned container (v1 or v2) or a bare legacy snapshot.
+// It normalizes raw key material to fingerprints. needsRewrite reports that the
+// input was not in the current format or held raw keys, so the caller should
+// write it back.
+func DecodeSnapshot(data []byte) (snapshot StatisticsSnapshot, needsRewrite bool, err error) {
+	var probe struct {
+		Version *int            `json:"version"`
+		Usage   json.RawMessage `json:"usage"`
+	}
+	if err = json.Unmarshal(data, &probe); err != nil {
+		return StatisticsSnapshot{}, false, fmt.Errorf("decode usage snapshot: %w", err)
+	}
+
+	if probe.Usage == nil {
+		// Bare snapshot from before the versioned container existed.
+		if err = json.Unmarshal(data, &snapshot); err != nil {
+			return StatisticsSnapshot{}, false, fmt.Errorf("decode legacy usage snapshot: %w", err)
+		}
+		snapshot, _ = normalizeSnapshot(snapshot)
+		return snapshot, true, nil
+	}
+
+	version := 0
+	if probe.Version != nil {
+		version = *probe.Version
+	}
+	if version < 0 || version > snapshotVersion {
+		return StatisticsSnapshot{}, false, fmt.Errorf("unsupported usage snapshot version %d", version)
+	}
+	if err = json.Unmarshal(probe.Usage, &snapshot); err != nil {
+		return StatisticsSnapshot{}, false, fmt.Errorf("decode usage snapshot body: %w", err)
+	}
+	snapshot, changed := normalizeSnapshot(snapshot)
+	return snapshot, changed || version != snapshotVersion, nil
+}
+
+// Persistence periodically writes the usage aggregate to disk.
 // It is safe to Start/Stop multiple times.
 type Persistence struct {
-	mu sync.Mutex
+	mu      sync.Mutex
+	writeMu sync.Mutex
 
 	stats    *RequestStatistics
 	path     string
 	interval time.Duration
 
+	// blocked is set when Load failed. A blocked Persistence never writes the file.
+	blocked bool
+
 	stop chan struct{}
 	done chan struct{}
 }
 
+// PersistenceConfig configures a Persistence.
 type PersistenceConfig struct {
 	Stats    *RequestStatistics
 	Path     string
 	Interval time.Duration
 }
 
+// NewPersistence returns a Persistence for cfg. Call Load before Start.
 func NewPersistence(cfg PersistenceConfig) *Persistence {
 	return &Persistence{
 		stats:    cfg.Stats,
-		path:     cfg.Path,
+		path:     strings.TrimSpace(cfg.Path),
 		interval: cfg.Interval,
 	}
 }
 
-// Load reads the persisted snapshot from disk (if present) and merges it into stats.
+// Load merges the snapshot at path into the aggregate. A missing file is not an error.
+// Legacy or raw-key snapshots are migrated once. The migration is committed to disk
+// before the aggregate changes, so a failed Load leaves both untouched and the
+// next Load can retry. A failed Load blocks Flush.
 func (p *Persistence) Load() error {
-	if p == nil || p.stats == nil {
+	if p == nil || p.stats == nil || p.path == "" {
 		return nil
 	}
-	path := strings.TrimSpace(p.path)
-	if path == "" {
-		return nil
-	}
+	err := p.load()
+	p.mu.Lock()
+	p.blocked = err != nil
+	p.mu.Unlock()
+	return err
+}
 
-	data, err := os.ReadFile(path)
+func (p *Persistence) load() error {
+	data, err := os.ReadFile(p.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
-		return err
+		return fmt.Errorf("read usage snapshot %s: %w", p.path, err)
 	}
-
-	var container persistedSnapshot
-	if err := json.Unmarshal(data, &container); err == nil && (container.Version == 1 || container.Version == 0) {
-		p.stats.MergeSnapshot(container.Usage)
-		return nil
-	}
-
-	var snapshot StatisticsSnapshot
-	if err := json.Unmarshal(data, &snapshot); err != nil {
-		return err
-	}
-	p.stats.MergeSnapshot(snapshot)
-	return nil
-}
-
-// Flush writes the current snapshot to disk immediately.
-func (p *Persistence) Flush() error {
-	if p == nil || p.stats == nil {
-		return nil
-	}
-	path := strings.TrimSpace(p.path)
-	if path == "" {
-		return nil
-	}
-
-	snapshot := p.stats.Snapshot()
-	payload := persistedSnapshot{
-		Version: 1,
-		SavedAt: time.Now().UTC(),
-		Usage:   snapshot,
-	}
-	data, err := json.MarshalIndent(payload, "", "  ")
+	snapshot, needsRewrite, err := DecodeSnapshot(data)
 	if err != nil {
-		return err
+		return fmt.Errorf("load usage snapshot %s: %w", p.path, err)
 	}
-
-	dir := filepath.Dir(path)
-	if dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
+	if needsRewrite {
+		encoded, err := EncodeSnapshot(snapshot)
+		if err != nil {
+			return fmt.Errorf("encode migrated usage snapshot: %w", err)
 		}
+		if err := writeFileAtomic(p.path, encoded, 0o600); err != nil {
+			return fmt.Errorf("migrate usage snapshot %s: %w", p.path, err)
+		}
+		log.Info("usage: migrated persisted snapshot to the fingerprinted format")
 	}
-
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	// Fast path: same-directory rename is atomic on POSIX. On a cross-device
-	// link error (EXDEV) fall back to a copy so we never destroy the last-good
-	// snapshot by removing the destination before the rename succeeds.
-	if err := os.Rename(tmp, path); err != nil {
-		return copyFile(tmp, path, 0o600)
+	if _, err := p.stats.restoreSnapshot(p.path, snapshot); err != nil {
+		return fmt.Errorf("load usage snapshot %s: %w", p.path, err)
 	}
 	return nil
 }
 
-// copyFile copies src to dst using io.Copy. It is used as the cross-device
-// fallback when os.Rename fails with EXDEV. The temporary src is always removed
-// before returning. The destination is truncated and recreated so a partial
-// write does not leave the last-good snapshot half-overwritten.
-func copyFile(src, dst string, perm os.FileMode) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
+// Flush writes the current aggregate to disk atomically.
+func (p *Persistence) Flush() error {
+	if p == nil || p.stats == nil || p.path == "" {
+		return nil
 	}
-	defer in.Close()
+	p.mu.Lock()
+	blocked := p.blocked
+	p.mu.Unlock()
+	if blocked {
+		return errSnapshotNotLoaded
+	}
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	data, err := EncodeSnapshot(p.stats.Snapshot())
 	if err != nil {
-		return err
+		return fmt.Errorf("encode usage snapshot: %w", err)
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		_ = os.Remove(dst)
-		return err
+	return writeFileAtomic(p.path, data, 0o600)
+}
+
+// WriteFileAtomic replaces path with data through a same-directory temp file, fsync,
+// and rename. On failure path is unchanged and no temp file is left behind.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	return writeFileAtomic(path, data, perm)
+}
+
+// writeFileAtomic writes data to a unique temp file in the target directory, fsyncs it,
+// and renames it over path. On any failure the destination is left unchanged.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create usage snapshot dir: %w", err)
 	}
-	if err := out.Close(); err != nil {
-		_ = os.Remove(dst)
-		return err
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("create usage snapshot temp file: %w", err)
 	}
-	_ = os.Remove(src)
+	tmpName := tmp.Name()
+
+	_, err = tmp.Write(data)
+	if err == nil {
+		err = tmp.Chmod(perm)
+	}
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = renameFile(tmpName, path)
+	}
+	if err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("write usage snapshot: %w", err)
+	}
+	if d, errOpen := os.Open(dir); errOpen == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 	return nil
 }
 
 // Start begins periodic flushing in a background goroutine.
 func (p *Persistence) Start() {
-	if p == nil || p.stats == nil {
+	if p == nil || p.stats == nil || p.path == "" {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.stop != nil {
-		return
-	}
-	if strings.TrimSpace(p.path) == "" {
+	if p.stop != nil || p.blocked {
 		return
 	}
 	if p.interval <= 0 {
 		p.interval = 60 * time.Second
 	}
-
 	p.stop = make(chan struct{})
 	p.done = make(chan struct{})
-	interval := p.interval
-	stop := p.stop
-	done := p.done
+	interval, stop, done := p.interval, p.stop, p.done
 
 	go func() {
 		defer close(done)
@@ -182,7 +244,9 @@ func (p *Persistence) Start() {
 					log.WithError(err).Warn("usage: failed to persist snapshot")
 				}
 			case <-stop:
-				_ = p.Flush()
+				if err := p.Flush(); err != nil {
+					log.WithError(err).Warn("usage: failed to persist snapshot on shutdown")
+				}
 				return
 			}
 		}
@@ -195,10 +259,8 @@ func (p *Persistence) Stop() {
 		return
 	}
 	p.mu.Lock()
-	stop := p.stop
-	done := p.done
-	p.stop = nil
-	p.done = nil
+	stop, done := p.stop, p.done
+	p.stop, p.done = nil, nil
 	p.mu.Unlock()
 
 	if stop == nil {

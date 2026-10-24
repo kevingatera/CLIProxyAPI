@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
@@ -48,6 +50,34 @@ func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 	}
 	if detail.TokenBreakdown.Input.UncachedTokens != 6 || detail.TokenBreakdown.Output.NonReasoningTokens != 1 {
 		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
+func TestParseOpenAIUsageFlatReasoningDialect(t *testing.T) {
+	// SGLang-style usage: reasoning_tokens flat on the usage object.
+	data := []byte(`{"usage":{"prompt_tokens":241114,"total_tokens":242270,"completion_tokens":1156,"prompt_tokens_details":{"cached_tokens":240896},"reasoning_tokens":530}}`)
+	detail := ParseOpenAIUsage(data)
+
+	if detail.ReasoningTokens != 530 {
+		t.Fatalf("reasoning tokens = %d, want 530", detail.ReasoningTokens)
+	}
+	if detail.InputTokens != 241114 || detail.OutputTokens != 1156 || detail.TotalTokens != 242270 {
+		t.Fatalf("token counts = %+v", detail)
+	}
+	if detail.CachedTokens != 240896 || detail.CacheReadTokens != 240896 {
+		t.Fatalf("cached tokens = %d/%d", detail.CachedTokens, detail.CacheReadTokens)
+	}
+	if !detail.TokenBreakdown.Valid() {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+
+	// Streaming variant must behave the same.
+	streamDetail, ok := ParseOpenAIStreamUsage([]byte(`data: {"id":"x","object":"chat.completion.chunk","usage":{"prompt_tokens":10,"completion_tokens":6,"total_tokens":16,"reasoning_tokens":4}}`))
+	if !ok {
+		t.Fatalf("ParseOpenAIStreamUsage reported no usage")
+	}
+	if streamDetail.ReasoningTokens != 4 {
+		t.Fatalf("stream reasoning tokens = %d, want 4", streamDetail.ReasoningTokens)
 	}
 }
 
@@ -1267,4 +1297,73 @@ func TestUsageReporter_ExplicitTraceIDPrecedenceOverLogRequestID(t *testing.T) {
 	if record.TraceID != "explicit-trace-1" {
 		t.Fatalf("record.TraceID = %q, want explicit-trace-1", record.TraceID)
 	}
+}
+
+func TestUsageReporter_DistinguishesNativeKey(t *testing.T) {
+	t.Run("native_key_via_gin", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(w)
+		ginCtx.Set("userApiKey", "sk-native-key")
+		ginCtx.Set("accessProvider", "config-inline")
+
+		ctx := context.WithValue(context.Background(), "gin", ginCtx)
+		reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+		if !reporter.IsNativeKey() {
+			t.Fatalf("reporter.IsNativeKey() = false, want true")
+		}
+		if reporter.AccessProvider() != "config-inline" {
+			t.Fatalf("reporter.AccessProvider() = %q, want %q", reporter.AccessProvider(), "config-inline")
+		}
+
+		record := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+		if !record.IsNativeKey {
+			t.Fatalf("record.IsNativeKey = false, want true")
+		}
+		if record.AccessProvider != "config-inline" {
+			t.Fatalf("record.AccessProvider = %q, want %q", record.AccessProvider, "config-inline")
+		}
+	})
+
+	t.Run("plugin_key_via_gin", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(w)
+		ginCtx.Set("userApiKey", "plugin-principal")
+		ginCtx.Set("accessProvider", "custom-auth-plugin")
+
+		ctx := context.WithValue(context.Background(), "gin", ginCtx)
+		reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+		if reporter.IsNativeKey() {
+			t.Fatalf("reporter.IsNativeKey() = true, want false")
+		}
+		if reporter.AccessProvider() != "custom-auth-plugin" {
+			t.Fatalf("reporter.AccessProvider() = %q, want %q", reporter.AccessProvider(), "custom-auth-plugin")
+		}
+
+		record := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+		if record.IsNativeKey {
+			t.Fatalf("record.IsNativeKey = true, want false")
+		}
+		if record.AccessProvider != "custom-auth-plugin" {
+			t.Fatalf("record.AccessProvider = %q, want %q", record.AccessProvider, "custom-auth-plugin")
+		}
+	})
+
+	t.Run("native_key_via_context", func(t *testing.T) {
+		ctx := usage.WithAccessProvider(context.Background(), "config-api-key")
+		reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+		if !reporter.IsNativeKey() {
+			t.Fatalf("reporter.IsNativeKey() = false, want true")
+		}
+		if reporter.AccessProvider() != "config-api-key" {
+			t.Fatalf("reporter.AccessProvider() = %q, want %q", reporter.AccessProvider(), "config-api-key")
+		}
+
+		record := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+		if !record.IsNativeKey {
+			t.Fatalf("record.IsNativeKey = false, want true")
+		}
+		if record.AccessProvider != "config-api-key" {
+			t.Fatalf("record.AccessProvider = %q, want %q", record.AccessProvider, "config-api-key")
+		}
+	})
 }

@@ -1672,15 +1672,31 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 		t.Fatalf("missing key status = %d, want %d body=%s", missingKeyRR.Code, http.StatusUnauthorized, missingKeyRR.Body.String())
 	}
 
-	// Upstream removed the legacy redisqueue /usage route, but this fork serves
-	// usage statistics at /usage (the management UI depends on it), so an
-	// authenticated request returns 200 instead of upstream's 404.
-	usageStatsReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage?count=2", nil)
-	usageStatsReq.Header.Set("Authorization", "Bearer test-management-key")
-	usageStatsRR := httptest.NewRecorder()
-	server.engine.ServeHTTP(usageStatsRR, usageStatsReq)
-	if usageStatsRR.Code != http.StatusOK {
-		t.Fatalf("usage statistics status = %d, want %d body=%s", usageStatsRR.Code, http.StatusOK, usageStatsRR.Body.String())
+	// Upstream removed the legacy usage snapshot route. This fork restores the read for the
+	// management UI, so it requires management auth and returns fingerprinted identities.
+	legacyNoKeyReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage", nil)
+	legacyNoKeyRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(legacyNoKeyRR, legacyNoKeyReq)
+	if legacyNoKeyRR.Code != http.StatusUnauthorized {
+		t.Fatalf("usage without key status = %d, want %d body=%s", legacyNoKeyRR.Code, http.StatusUnauthorized, legacyNoKeyRR.Body.String())
+	}
+
+	legacyReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage", nil)
+	legacyReq.Header.Set("Authorization", "Bearer test-management-key")
+	legacyRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(legacyRR, legacyReq)
+	if legacyRR.Code != http.StatusOK {
+		t.Fatalf("usage status = %d, want %d body=%s", legacyRR.Code, http.StatusOK, legacyRR.Body.String())
+	}
+	var usagePayload struct {
+		Usage          map[string]json.RawMessage `json:"usage"`
+		FailedRequests *int64                     `json:"failed_requests"`
+	}
+	if errUnmarshal := json.Unmarshal(legacyRR.Body.Bytes(), &usagePayload); errUnmarshal != nil {
+		t.Fatalf("unmarshal usage response: %v body=%s", errUnmarshal, legacyRR.Body.String())
+	}
+	if usagePayload.Usage == nil || usagePayload.FailedRequests == nil {
+		t.Fatalf("usage response lacks usage or failed_requests: %s", legacyRR.Body.String())
 	}
 
 	authReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)
@@ -1723,6 +1739,7 @@ func TestManagementPluginsRouteRegistered(t *testing.T) {
 	server.cfg.Plugins.Configs = map[string]proxyconfig.PluginInstanceConfig{
 		"sample": {Enabled: &enabled, Priority: 4},
 	}
+	server.mgmt.SetConfig(server.cfg)
 	if errWrite := os.WriteFile(server.configFilePath, []byte("{}\n"), 0o600); errWrite != nil {
 		t.Fatalf("failed to write config file: %v", errWrite)
 	}
@@ -3596,6 +3613,97 @@ func TestModelsWithClientVersionHomeApplyPatchRouting(t *testing.T) {
 	engine.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"object":"list"`) || strings.Contains(recorder.Body.String(), "apply_patch_tool_type") {
 		t.Fatalf("ordinary Home catalog changed: %s", recorder.Body.String())
+	}
+}
+
+func TestModelsWithClientVersionHomeSearchToolRouting(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		toolSearch bool
+		want       map[string]bool
+	}{
+		{
+			// Home routing evidence decides search support exactly as local routes do:
+			// pure Codex template routes, or pure Claude routes whose every credential
+			// supports native tool search. A Home without tool_search fails closed.
+			name:       "tool search on",
+			toolSearch: true,
+			want: map[string]bool{
+				"home-claude-only":        true,
+				"gpt-5.5":                 true,
+				"home-claude-mixed":       false,
+				"home-claude-third-party": false,
+				"home-claude-old-home":    false,
+				"team/gpt-5.5":            false,
+			},
+		},
+		{
+			// Off keeps the catalog that predates tool_search: Home routes are not
+			// consulted, so template models keep their search flag and Claude
+			// models never advertise it.
+			name: "tool search off",
+			want: map[string]bool{
+				"home-claude-only":        false,
+				"gpt-5.5":                 true,
+				"home-claude-mixed":       false,
+				"home-claude-third-party": false,
+				"home-claude-old-home":    false,
+				"team/gpt-5.5":            true,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newTestServer(t)
+			server.cfg.Home.Enabled = true
+			setClaudeToolSearchForTest(t, tc.toolSearch)
+			engine := gin.New()
+			engine.GET("/v1/models", server.unifiedModelsHandler(nil, nil))
+			client := newHomeCatalogClient(t, `{
+				"claude":[
+					{"id":"home-claude-only","native_capabilities":{"tool_search":true}},
+					{"id":"home-claude-mixed","native_capabilities":{"tool_search":true}},
+					{"id":"home-claude-third-party","native_capabilities":{"tool_search":false}},
+					{"id":"home-claude-old-home"}
+				],
+				"codex":[{"id":"gpt-5.5"}],
+				"home-custom":[{"id":"home-claude-mixed"},{"id":"team/gpt-5.5"}]
+			}`)
+			previousHome := home.Current()
+			home.SetCurrent(client)
+			t.Cleanup(func() { home.SetCurrent(previousHome) })
+
+			request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.153.4", nil)
+			request.Header.Set("Authorization", "Bearer test-key")
+			recorder := httptest.NewRecorder()
+			engine.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+			}
+			var response struct {
+				Models []map[string]any `json:"models"`
+			}
+			if errUnmarshal := json.Unmarshal(recorder.Body.Bytes(), &response); errUnmarshal != nil {
+				t.Fatalf("decode Home catalog: %v", errUnmarshal)
+			}
+			want := make(map[string]bool, len(tc.want))
+			for slug, wantSearch := range tc.want {
+				want[slug] = wantSearch
+			}
+			for _, entry := range response.Models {
+				slug, _ := entry["slug"].(string)
+				wantSearch, ok := want[slug]
+				if !ok {
+					continue
+				}
+				delete(want, slug)
+				if got, _ := entry["supports_search_tool"].(bool); got != wantSearch {
+					t.Errorf("%s supports_search_tool = %v, want %v", slug, got, wantSearch)
+				}
+			}
+			if len(want) != 0 {
+				t.Fatalf("missing Home catalog entries: %v", want)
+			}
+		})
 	}
 }
 

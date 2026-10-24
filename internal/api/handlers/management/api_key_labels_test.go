@@ -12,127 +12,149 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func setupAPIKeyLabelsHandler(t *testing.T) *Handler {
+const apiKeyLabelsTestPath = "/v8/management/api-key-labels"
+
+// setupAPIKeyLabelsHandler points the stable store at a temp config directory
+// and the legacy log directory at another temp directory.
+func setupAPIKeyLabelsHandler(t *testing.T) (*Handler, string) {
 	t.Helper()
-	dir := t.TempDir()
-	// ResolveLogDirectory falls back to a cwd-relative "logs" dir when cfg is
-	// nil; clean that up so the test does not leak artifacts into the repo.
-	t.Cleanup(func() {
-		_ = os.RemoveAll("logs")
-	})
+	t.Setenv("WRITABLE_PATH", "")
+	t.Setenv("writable_path", "")
+	configDir := t.TempDir()
 	return &Handler{
-		configFilePath: filepath.Join(dir, "config.yaml"),
-	}
+		configFilePath: filepath.Join(configDir, "config.yaml"),
+		logDir:         t.TempDir(),
+	}, configDir
 }
 
 func newAPIKeyLabelsRouter(h *Handler) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.GET("/v0/management/api-key-labels", h.GetAPIKeyLabels)
-	r.PUT("/v0/management/api-key-labels", h.PutAPIKeyLabels)
+	r.GET(apiKeyLabelsTestPath, h.GetAPIKeyLabels)
+	r.PUT(apiKeyLabelsTestPath, h.PutAPIKeyLabels)
 	return r
 }
 
+func doAPIKeyLabels(r *gin.Engine, method, body string, ifMatch ...string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, apiKeyLabelsTestPath, bytes.NewReader([]byte(body)))
+	for _, v := range ifMatch {
+		req.Header.Add("If-Match", v)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func decodeAPIKeyLabels(t *testing.T, w *httptest.ResponseRecorder) map[string]string {
+	t.Helper()
+	var out struct {
+		Labels map[string]string `json:"api-key-labels"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, w.Body.String())
+	}
+	return out.Labels
+}
+
 func TestAPIKeyLabelsRoundTrip(t *testing.T) {
-	h := setupAPIKeyLabelsHandler(t)
+	h, _ := setupAPIKeyLabelsHandler(t)
 	router := newAPIKeyLabelsRouter(h)
 
-	// Initial get returns empty map (not 404).
-	req := httptest.NewRequest(http.MethodGet, "/v0/management/api-key-labels", nil)
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-	if w.Code != 200 {
+	w := doAPIKeyLabels(router, http.MethodGet, "")
+	if w.Code != http.StatusOK {
 		t.Fatalf("initial GET status = %d, want 200", w.Code)
 	}
-	var initial struct {
-		Labels map[string]string `json:"api-key-labels"`
+	if got := decodeAPIKeyLabels(t, w); len(got) != 0 {
+		t.Fatalf("initial labels = %v, want empty", got)
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &initial); err != nil {
-		t.Fatalf("unmarshal initial: %v", err)
-	}
-	if len(initial.Labels) != 0 {
-		t.Fatalf("initial labels = %v, want empty", initial.Labels)
+	if w.Header().Get("ETag") == "" {
+		t.Fatal("GET missing ETag")
 	}
 
-	// Put some labels.
-	body := []byte(`{"api-key-labels":{"abc123":"Cline","def456":"Cursor"}}`)
-	req = httptest.NewRequest(http.MethodPut, "/v0/management/api-key-labels", bytes.NewReader(body))
-	w = httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-	if w.Code != 200 {
+	w = doAPIKeyLabels(router, http.MethodPut, `{"api-key-labels":{"abc123":"Cline","def456":"Cursor"}}`)
+	if w.Code != http.StatusOK {
 		t.Fatalf("PUT status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
-
-	// Get returns the persisted labels.
-	req = httptest.NewRequest(http.MethodGet, "/v0/management/api-key-labels", nil)
-	w = httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-	if w.Code != 200 {
-		t.Fatalf("second GET status = %d, want 200", w.Code)
-	}
-	var after struct {
-		Labels map[string]string `json:"api-key-labels"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &after); err != nil {
-		t.Fatalf("unmarshal after: %v", err)
-	}
-	if got := after.Labels["abc123"]; got != "Cline" {
-		t.Fatalf("label abc123 = %q, want %q", got, "Cline")
-	}
-	if got := after.Labels["def456"]; got != "Cursor" {
-		t.Fatalf("label def456 = %q, want %q", got, "Cursor")
+	got := decodeAPIKeyLabels(t, doAPIKeyLabels(router, http.MethodGet, ""))
+	if got["abc123"] != "Cline" || got["def456"] != "Cursor" {
+		t.Fatalf("labels = %v", got)
 	}
 }
 
-func TestAPIKeyLabelsDropsEmptyFingerprint(t *testing.T) {
-	h := setupAPIKeyLabelsHandler(t)
+func TestAPIKeyLabelsDropsEmptyFingerprintAndAcceptsBareMap(t *testing.T) {
+	h, _ := setupAPIKeyLabelsHandler(t)
 	router := newAPIKeyLabelsRouter(h)
 
-	body := []byte(`{"api-key-labels":{"":"dropped","valid":"Kept"}}`)
-	req := httptest.NewRequest(http.MethodPut, "/v0/management/api-key-labels", bytes.NewReader(body))
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-	if w.Code != 200 {
+	w := doAPIKeyLabels(router, http.MethodPut, `{"":"dropped","valid":"Kept"}`)
+	if w.Code != http.StatusOK {
 		t.Fatalf("PUT status = %d, want 200", w.Code)
 	}
-
-	var after struct {
-		Labels map[string]string `json:"api-key-labels"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &after); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if _, exists := after.Labels[""]; exists {
-		t.Fatalf("empty-fingerprint label should have been dropped")
-	}
-	if got := after.Labels["valid"]; got != "Kept" {
-		t.Fatalf("label valid = %q, want %q", got, "Kept")
+	got := decodeAPIKeyLabels(t, w)
+	if _, ok := got[""]; ok || got["valid"] != "Kept" {
+		t.Fatalf("labels = %v", got)
 	}
 }
 
-func TestAPIKeyLabelsAcceptsBareMap(t *testing.T) {
-	h := setupAPIKeyLabelsHandler(t)
+func TestAPIKeyLabelsRejectsStaleIfMatch(t *testing.T) {
+	h, _ := setupAPIKeyLabelsHandler(t)
 	router := newAPIKeyLabelsRouter(h)
 
-	// Bare map without the envelope wrapper.
-	body := []byte(`{"abc123":"Cline"}`)
-	req := httptest.NewRequest(http.MethodPut, "/v0/management/api-key-labels", bytes.NewReader(body))
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-	if w.Code != 200 {
-		t.Fatalf("PUT status = %d, want 200; body=%s", w.Code, w.Body.String())
+	first := doAPIKeyLabels(router, http.MethodGet, "").Header().Get("ETag")
+	if w := doAPIKeyLabels(router, http.MethodPut, `{"a":"One"}`, first); w.Code != http.StatusOK {
+		t.Fatalf("matching If-Match status = %d, want 200", w.Code)
 	}
 
-	req = httptest.NewRequest(http.MethodGet, "/v0/management/api-key-labels", nil)
-	w = httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-	var after struct {
-		Labels map[string]string `json:"api-key-labels"`
+	// Second tab still holds the first revision.
+	stale := doAPIKeyLabels(router, http.MethodPut, `{"b":"Two"}`, first)
+	if stale.Code != http.StatusPreconditionFailed {
+		t.Fatalf("stale If-Match status = %d, want 412", stale.Code)
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &after); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	current := stale.Header().Get("ETag")
+	if current == "" || current == first {
+		t.Fatalf("412 ETag = %q, want current revision", current)
 	}
-	if got := after.Labels["abc123"]; got != "Cline" {
-		t.Fatalf("label abc123 = %q, want %q", got, "Cline")
+	if got := decodeAPIKeyLabels(t, doAPIKeyLabels(router, http.MethodGet, "")); got["b"] != "" || got["a"] != "One" {
+		t.Fatalf("stale write changed labels: %v", got)
+	}
+
+	if w := doAPIKeyLabels(router, http.MethodPut, `{"b":"Two"}`, current); w.Code != http.StatusOK {
+		t.Fatalf("current If-Match status = %d, want 200", w.Code)
+	}
+	if w := doAPIKeyLabels(router, http.MethodPut, `{"c":"Three"}`, "*"); w.Code != http.StatusOK {
+		t.Fatalf("wildcard If-Match status = %d, want 200", w.Code)
+	}
+	if w := doAPIKeyLabels(router, http.MethodPut, `{"d":"Four"}`); w.Code != http.StatusOK {
+		t.Fatalf("unconditional PUT status = %d, want 200", w.Code)
+	}
+}
+
+func TestAPIKeyLabelsStoreOutsideLogDirAndMigrates(t *testing.T) {
+	h, configDir := setupAPIKeyLabelsHandler(t)
+	legacy := filepath.Join(h.logDir, apiKeyLabelsFileName)
+	if err := os.WriteFile(legacy, []byte(`{"api-key-labels":{"abc":"Legacy"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	router := newAPIKeyLabelsRouter(h)
+
+	if got := decodeAPIKeyLabels(t, doAPIKeyLabels(router, http.MethodGet, "")); got["abc"] != "Legacy" {
+		t.Fatalf("migrated labels = %v, want abc=Legacy", got)
+	}
+	stable := filepath.Join(configDir, apiKeyLabelsFileName)
+	if _, err := os.Stat(stable); err != nil {
+		t.Fatalf("stable store not written: %v", err)
+	}
+	if _, err := os.Stat(legacy); err != nil {
+		t.Fatalf("legacy file should remain for rollback: %v", err)
+	}
+
+	// Once the stable file exists it wins, even if the legacy file changes.
+	if err := os.WriteFile(legacy, []byte(`{"abc":"Stale"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if w := doAPIKeyLabels(router, http.MethodPut, `{"abc":"Current"}`); w.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d", w.Code)
+	}
+	if got := decodeAPIKeyLabels(t, doAPIKeyLabels(router, http.MethodGet, "")); got["abc"] != "Current" {
+		t.Fatalf("labels = %v, want stable value", got)
 	}
 }

@@ -34,6 +34,32 @@ var requestFaultTypes = map[string]struct{}{
 	"invalid_prompt":        {},
 }
 
+// creditExhaustionCodes are the structured codes providers return when an account's
+// balance is spent. They are matched on the JSON error code or type only.
+var creditExhaustionCodes = map[string]struct{}{
+	"insufficient_quota":         {},
+	"billing_hard_limit_reached": {},
+}
+
+// IsCreditExhaustedBody reports a 400 whose structured error code or type names an exhausted
+// balance. Such a 400 is not a request fault: another account may still have credit.
+// Credit text without a structured code is not matched, so it keeps the request-fault class.
+func IsCreditExhaustedBody(status int, err error) bool {
+	if status != http.StatusBadRequest || err == nil {
+		return false
+	}
+	body := strings.TrimSpace(err.Error())
+	if body == "" || !json.Valid([]byte(body)) {
+		return false
+	}
+	for _, path := range []string{"error.code", "code", "error.type", "type"} {
+		if _, ok := creditExhaustionCodes[strings.ToLower(strings.TrimSpace(gjson.Get(body, path).String()))]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // HTTPStatusFromError extracts an HTTP status from err.
 // Explicit StatusCode() values win. Otherwise context.Canceled maps to 499
 // and context.DeadlineExceeded maps to 504. Returns 0 when unknown.
@@ -49,6 +75,10 @@ func HTTPStatusFromError(err error) int {
 		if code := sc.StatusCode(); code > 0 {
 			return code
 		}
+	}
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		return http.StatusRequestEntityTooLarge
 	}
 	if errors.Is(err, context.Canceled) {
 		return StatusClientClosedRequest
@@ -92,6 +122,11 @@ func IsRequestFault(status int, err error) bool {
 	if status == http.StatusUnauthorized && hasAuthenticationErrorBody(err) {
 		return false
 	}
+	// Claude's missing thread state is tied to the stale continuation ID rather
+	// than the selected credential. Let the client replay the full conversation.
+	if IsClaudeThreadNotFound(status, err) {
+		return true
+	}
 	// Model not found indicates a credential-model capability mismatch rather than
 	// a caller request error. Preserve rotation and cooldown for the model.
 	if hasModelNotFoundErrorBody(err) {
@@ -127,6 +162,33 @@ func IsItemNotPersisted(message string) bool {
 	return strings.Contains(lower, "item with id") &&
 		strings.Contains(lower, "not found") &&
 		strings.Contains(lower, "items are not persisted when `store` is set to false")
+}
+
+// IsClaudeThreadNotFound reports the Claude 404 response for a stale
+// previous_message_id continuation from either a structured JSON response
+// or a plain-text error message.
+func IsClaudeThreadNotFound(status int, err error) bool {
+	if status != http.StatusNotFound || err == nil {
+		return false
+	}
+	body := strings.TrimSpace(err.Error())
+	type responseBodyProvider interface {
+		ResponseBody() []byte
+	}
+	var responseBody responseBodyProvider
+	if errors.As(err, &responseBody) && responseBody != nil && len(responseBody.ResponseBody()) > 0 {
+		body = strings.TrimSpace(string(responseBody.ResponseBody()))
+	}
+	if body == "" {
+		return false
+	}
+	if json.Valid([]byte(body)) {
+		return strings.EqualFold(strings.TrimSpace(gjson.Get(body, "error.type").String()), "not_found_error") &&
+			strings.Contains(strings.ToLower(gjson.Get(body, "error.message").String()), "thread state") &&
+			strings.Contains(strings.ToLower(gjson.Get(body, "error.message").String()), "previous_message_id")
+	}
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "thread state") && strings.Contains(lower, "previous_message_id")
 }
 
 func hasModelNotFoundErrorBody(err error) bool {

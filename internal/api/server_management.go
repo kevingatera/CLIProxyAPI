@@ -64,9 +64,6 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/usage-statistics-enabled", s.mgmt.GetUsageStatisticsEnabled)
 		mgmt.PUT("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
 		mgmt.PATCH("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
-		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
-		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
-		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
 
 		mgmt.GET("/proxy-url", s.mgmt.GetProxyURL)
 		mgmt.PUT("/proxy-url", s.mgmt.PutProxyURL)
@@ -92,9 +89,12 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)
 		mgmt.PATCH("/api-keys", s.mgmt.PatchAPIKeys)
 		mgmt.DELETE("/api-keys", s.mgmt.DeleteAPIKeys)
+		// Compatibility alias for one release; /v8/management/api-key-labels is the contract.
 		mgmt.GET("/api-key-labels", s.mgmt.GetAPIKeyLabels)
 		mgmt.PUT("/api-key-labels", s.mgmt.PutAPIKeyLabels)
 		mgmt.GET("/api-key-usage", s.mgmt.GetAPIKeyUsage)
+		// Restored for the management UI; see GetUsageStatistics.
+		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
 		mgmt.GET("/usage-queue", s.mgmt.GetUsageQueue)
 
 		mgmt.GET("/gemini-api-key", s.mgmt.GetGeminiKeys)
@@ -171,6 +171,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/oauth-excluded-models", s.mgmt.PutOAuthExcludedModels)
 		mgmt.PATCH("/oauth-excluded-models", s.mgmt.PatchOAuthExcludedModels)
 		mgmt.DELETE("/oauth-excluded-models", s.mgmt.DeleteOAuthExcludedModels)
+		// Deprecated one-release compatibility for global-excluded-models; the v8
+		// contract is routing.excluded-models under /v8/management/config.
 		mgmt.GET("/global-excluded-models", s.mgmt.GetGlobalExcludedModels)
 		mgmt.PUT("/global-excluded-models", s.mgmt.PutGlobalExcludedModels)
 		mgmt.PATCH("/global-excluded-models", s.mgmt.PatchGlobalExcludedModels)
@@ -220,11 +222,12 @@ func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
 }
 
 func (s *Server) managementAvailable(c *gin.Context) bool {
-	if s == nil || s.cfg == nil {
+	cfg := s.getConfig()
+	if s == nil || cfg == nil {
 		c.AbortWithStatus(http.StatusNotFound)
 		return false
 	}
-	if s.cfg.Home.Enabled {
+	if cfg.Home.Enabled {
 		c.AbortWithStatus(http.StatusNotFound)
 		return false
 	}
@@ -305,7 +308,8 @@ func (s *Server) pluginResourceNoRoute(c *gin.Context) {
 		}
 		return
 	}
-	if s.cfg == nil || s.cfg.Home.Enabled || s.pluginHost == nil {
+	cfg := s.getConfig()
+	if cfg == nil || cfg.Home.Enabled || s.pluginHost == nil {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
@@ -317,7 +321,7 @@ func (s *Server) pluginResourceNoRoute(c *gin.Context) {
 }
 
 func (s *Server) serveManagementControlPanel(c *gin.Context) {
-	cfg := s.cfg
+	cfg := s.getConfig()
 	if cfg == nil || cfg.Home.Enabled || cfg.RemoteManagement.DisableControlPanel {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
