@@ -319,17 +319,7 @@ func (a *RequestArchive) LogStreamingRequest(url, method string, headers map[str
 	cfg := a.cfg.Load()
 	r := a.redactor(headers)
 	counted := a.acquireCapture(concurrentCaptureLimit(cfg))
-	w, err := a.file.LogStreamingRequest(string(r.Bytes([]byte(url))), method, r.Headers(headers), r.Bytes(body), string(r.Bytes([]byte(id))))
-	if err != nil {
-		if counted {
-			a.activeCaptures.Add(-1)
-		}
-		return nil, err
-	}
-	if file, ok := w.(*FileStreamingLogWriter); ok {
-		file.lossless = true
-	}
-	stream := &archiveStream{StreamingLogWriter: w, redactor: r, archive: a, counted: counted, budget: archiveBudget{remaining: captureBudgetBytes(cfg)}, limitMarker: archiveTruncatedMarker}
+	stream := &archiveStream{redactor: r, archive: a, counted: counted, budget: archiveBudget{remaining: captureBudgetBytes(cfg)}, limitMarker: archiveTruncatedMarker}
 	if !counted {
 		// Over the concurrent limit the request is still recorded, without transcript bytes.
 		stream.budget.remaining = 0
@@ -341,6 +331,20 @@ func (a *RequestArchive) LogStreamingRequest(url, method string, headers map[str
 		stream.metadataOnly = true
 		stream.limitMarker = archiveMetadataOnlyMarker
 	}
+	// The file writer persists the body as soon as it is constructed, so the body is
+	// admitted under the same rules as later sections before that call.
+	admittedBody := stream.admitRequestBody(body)
+	w, err := a.file.LogStreamingRequest(string(r.Bytes([]byte(url))), method, r.Headers(headers), admittedBody, string(r.Bytes([]byte(id))))
+	if err != nil {
+		if counted {
+			a.activeCaptures.Add(-1)
+		}
+		return nil, err
+	}
+	if file, ok := w.(*FileStreamingLogWriter); ok {
+		file.lossless = true
+	}
+	stream.StreamingLogWriter = w
 	return stream, nil
 }
 
@@ -390,6 +394,17 @@ func (w *archiveStream) admit(body []byte) []byte {
 	}
 	masked := w.redactor.Transcript(body)
 	return admitRedacted(&w.budget, masked, w.redactor.secrets, w.limitMarker)
+}
+
+// admitRequestBody masks the client request body and charges it to the same budget.
+func (w *archiveStream) admitRequestBody(body []byte) []byte {
+	if len(body) == 0 {
+		return nil
+	}
+	if w.metadataOnly {
+		return []byte(archiveMetadataOnlyMarker)
+	}
+	return admitRedacted(&w.budget, w.redactor.Bytes(body), w.redactor.secrets, w.limitMarker)
 }
 
 func (w *archiveStream) Close() error {
