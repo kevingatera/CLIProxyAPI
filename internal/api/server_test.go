@@ -1674,21 +1674,31 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 		t.Fatalf("missing key status = %d, want %d body=%s", missingKeyRR.Code, http.StatusUnauthorized, missingKeyRR.Body.String())
 	}
 
-	// The /v0/management/usage endpoint serves the in-memory usage statistics
-	// snapshot for the management UI's Usage page.
-	usageReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage", nil)
-	usageReq.Header.Set("Authorization", "Bearer test-management-key")
-	usageRR := httptest.NewRecorder()
-	server.engine.ServeHTTP(usageRR, usageReq)
-	if usageRR.Code != http.StatusOK {
-		t.Fatalf("usage status = %d, want %d body=%s", usageRR.Code, http.StatusOK, usageRR.Body.String())
+	// Upstream removed the legacy usage snapshot route. This fork restores the read for the
+	// management UI, so it requires management auth and returns fingerprinted identities.
+	legacyNoKeyReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage", nil)
+	legacyNoKeyRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(legacyNoKeyRR, legacyNoKeyReq)
+	if legacyNoKeyRR.Code != http.StatusUnauthorized {
+		t.Fatalf("usage without key status = %d, want %d body=%s", legacyNoKeyRR.Code, http.StatusUnauthorized, legacyNoKeyRR.Body.String())
 	}
-	var usageSnapshot struct {
-		Usage          json.RawMessage `json:"usage"`
-		FailedRequests int64           `json:"failed_requests"`
+
+	legacyReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage", nil)
+	legacyReq.Header.Set("Authorization", "Bearer test-management-key")
+	legacyRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(legacyRR, legacyReq)
+	if legacyRR.Code != http.StatusOK {
+		t.Fatalf("usage status = %d, want %d body=%s", legacyRR.Code, http.StatusOK, legacyRR.Body.String())
 	}
-	if errUnmarshal := json.Unmarshal(usageRR.Body.Bytes(), &usageSnapshot); errUnmarshal != nil {
-		t.Fatalf("unmarshal usage response: %v body=%s", errUnmarshal, usageRR.Body.String())
+	var usagePayload struct {
+		Usage          map[string]json.RawMessage `json:"usage"`
+		FailedRequests *int64                     `json:"failed_requests"`
+	}
+	if errUnmarshal := json.Unmarshal(legacyRR.Body.Bytes(), &usagePayload); errUnmarshal != nil {
+		t.Fatalf("unmarshal usage response: %v body=%s", errUnmarshal, legacyRR.Body.String())
+	}
+	if usagePayload.Usage == nil || usagePayload.FailedRequests == nil {
+		t.Fatalf("usage response lacks usage or failed_requests: %s", legacyRR.Body.String())
 	}
 
 	authReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)
