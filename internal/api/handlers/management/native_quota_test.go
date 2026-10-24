@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -102,8 +103,7 @@ func TestConfiguredQuotaCredentialsShareAccountAcrossProtocols(t *testing.T) {
 }
 
 // fixtureTransport serves fixture responses by URL and records each request.
-// The fixtures are shaped from the parsers, not captured from providers. Replace them with
-// sanitized live captures before relying on the balances.
+// Captured response provenance and the remaining synthetic cases are documented in testdata/native_quota/README.md.
 type fixtureTransport struct {
 	t         *testing.T
 	responses map[string]fixtureResponse
@@ -142,10 +142,10 @@ func TestNativeQuotaHTTPAdapters(t *testing.T) {
 	}{
 		{
 			provider:  "opencode-go",
-			responses: map[string]fixtureResponse{"https://opencode.ai/zen/go/v1/usage": {http.StatusForbidden, "opencode-go-usage-exhausted.json"}},
+			responses: map[string]fixtureResponse{"https://opencode.ai/zen/go/v1/usage": {http.StatusOK, "opencode-go-usage.json"}},
 			check: func(t *testing.T, r pluginapi.QuotaFetchResponse) {
 				b := r.Groups[0].Buckets
-				if len(b) != 3 || b[0].RemainingFraction != .875 || b[2].RemainingFraction != 0 || b[1].ResetTime == "" {
+				if len(b) != 3 || b[0].RemainingFraction != 1 || math.Abs(b[1].RemainingFraction-.67) > 1e-12 || math.Abs(b[2].RemainingFraction-.71) > 1e-12 || b[1].ResetTime != "2026-10-26T00:00:00.000Z" {
 					t.Fatalf("buckets=%+v", b)
 				}
 			},
@@ -155,7 +155,7 @@ func TestNativeQuotaHTTPAdapters(t *testing.T) {
 			responses: map[string]fixtureResponse{"https://api.kimi.com/coding/v1/usages": {http.StatusOK, "kimi-usages.json"}},
 			check: func(t *testing.T, r pluginapi.QuotaFetchResponse) {
 				b := r.Groups[0].Buckets
-				if len(b) != 2 || b[0].RemainingFraction != .75 || b[1].RemainingFraction != .5 {
+				if len(b) != 2 || b[0].RemainingFraction != 1 || b[1].RemainingFraction != 1 || b[0].ResetTime != "2026-10-24T03:15:14Z" {
 					t.Fatalf("buckets=%+v", b)
 				}
 			},
@@ -177,16 +177,20 @@ func TestNativeQuotaHTTPAdapters(t *testing.T) {
 		{
 			provider: "commandcode",
 			responses: map[string]fixtureResponse{
-				"https://api.commandcode.ai/alpha/whoami?limits=1":                    {http.StatusOK, "commandcode-whoami.json"},
-				"https://api.commandcode.ai/alpha/billing/credits?orgId=org-redacted": {http.StatusOK, "commandcode-billing-credits.json"},
+				"https://api.commandcode.ai/alpha/whoami?limits=1": {http.StatusOK, "commandcode-whoami.json"},
+				"https://api.commandcode.ai/alpha/billing/credits": {http.StatusOK, "commandcode-billing-credits.json"},
 			},
-			wantURLs: []string{"https://api.commandcode.ai/alpha/whoami?limits=1", "https://api.commandcode.ai/alpha/billing/credits?orgId=org-redacted"},
+			wantURLs: []string{"https://api.commandcode.ai/alpha/whoami?limits=1", "https://api.commandcode.ai/alpha/billing/credits"},
 			check: func(t *testing.T, r pluginapi.QuotaFetchResponse) {
-				if len(r.Summary) != 3 || r.Summary[1].Value != 8.89 || len(r.Groups[0].Buckets) != 2 {
+				if len(r.Summary) != 3 || r.Summary[0].Value != 120.0212633812 || r.Summary[1].Value != 0.085519748 || len(r.Groups[0].Buckets) != 2 {
 					t.Fatalf("report=%+v", r)
 				}
+				b := r.Groups[0].Buckets
+				if math.Abs(b[0].RemainingFraction-(1-0.086885916/45)) > 1e-12 || math.Abs(b[1].RemainingFraction-(1-26.545168398/90)) > 1e-12 || b[0].ResetTime == "" || b[1].ResetTime == "" {
+					t.Fatalf("buckets=%+v", b)
+				}
 				out, _ := json.Marshal(r)
-				if strings.Contains(string(out), "redacted") {
+				if strings.Contains(string(out), "REDACTED") {
 					t.Fatal("account identity leaked into quota report")
 				}
 			},
