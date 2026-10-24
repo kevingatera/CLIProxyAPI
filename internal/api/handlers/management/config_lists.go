@@ -1311,6 +1311,111 @@ func (h *Handler) DeleteOAuthExcludedModels(c *gin.Context) {
 	h.persistLocked(c)
 }
 
+// global-excluded-models: []string (wildcard patterns like "cursor/*", "*-preview").
+// These v0 handlers are a one-release compatibility path. New callers use
+// /v8/management/config/routing/excluded-models.
+func markGlobalExcludedModelsDeprecated(c *gin.Context) {
+	c.Header("Deprecation", "true")
+	c.Header("Link", `</v8/management/config/routing/excluded-models>; rel="successor-version"`)
+}
+
+func (h *Handler) GetGlobalExcludedModels(c *gin.Context) {
+	markGlobalExcludedModelsDeprecated(c)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	c.JSON(200, gin.H{"global-excluded-models": config.NormalizeExcludedModels(h.cfg.GlobalExcludedModels)})
+}
+
+func (h *Handler) PutGlobalExcludedModels(c *gin.Context) {
+	markGlobalExcludedModelsDeprecated(c)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	data, err := c.GetRawData()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	var patterns []string
+	if err = json.Unmarshal(data, &patterns); err != nil {
+		// Envelopes are matched by key, so an unknown object is rejected instead of
+		// clearing the list.
+		var envelope struct {
+			Models *[]string `json:"global-excluded-models"`
+			Items  *[]string `json:"items"`
+		}
+		if err2 := json.Unmarshal(data, &envelope); err2 != nil {
+			c.JSON(400, gin.H{"error": "invalid body"})
+			return
+		}
+		switch {
+		case envelope.Models != nil:
+			patterns = *envelope.Models
+		case envelope.Items != nil:
+			patterns = *envelope.Items
+		default:
+			c.JSON(400, gin.H{"error": "invalid body; expected a string array or {\"global-excluded-models\": [...]}"})
+			return
+		}
+	}
+	h.cfg.GlobalExcludedModels = config.NormalizeExcludedModels(patterns)
+	h.persistLocked(c)
+}
+
+func (h *Handler) PatchGlobalExcludedModels(c *gin.Context) {
+	markGlobalExcludedModelsDeprecated(c)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var body struct {
+		Model  *string `json:"model"`
+		Remove *bool   `json:"remove"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Model == nil {
+		c.JSON(400, gin.H{"error": "invalid body; expected {\"model\": \"cursor/*\"}"})
+		return
+	}
+	pattern := strings.ToLower(strings.TrimSpace(*body.Model))
+	if pattern == "" {
+		c.JSON(400, gin.H{"error": "model pattern is required"})
+		return
+	}
+	existing := config.NormalizeExcludedModels(h.cfg.GlobalExcludedModels)
+	if body.Remove != nil && *body.Remove {
+		filtered := existing[:0]
+		for _, p := range existing {
+			if p != pattern {
+				filtered = append(filtered, p)
+			}
+		}
+		h.cfg.GlobalExcludedModels = config.NormalizeExcludedModels(filtered)
+	} else {
+		// Add if not already present (NormalizeExcludedModels dedupes)
+		h.cfg.GlobalExcludedModels = config.NormalizeExcludedModels(append(existing, pattern))
+	}
+	h.persistLocked(c)
+}
+
+func (h *Handler) DeleteGlobalExcludedModels(c *gin.Context) {
+	markGlobalExcludedModelsDeprecated(c)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	pattern := strings.ToLower(strings.TrimSpace(c.Query("model")))
+	if pattern == "" {
+		// Clear all
+		h.cfg.GlobalExcludedModels = nil
+		h.persistLocked(c)
+		return
+	}
+	existing := config.NormalizeExcludedModels(h.cfg.GlobalExcludedModels)
+	filtered := existing[:0]
+	for _, p := range existing {
+		if p != pattern {
+			filtered = append(filtered, p)
+		}
+	}
+	h.cfg.GlobalExcludedModels = config.NormalizeExcludedModels(filtered)
+	h.persistLocked(c)
+}
+
 // oauth-model-alias: map[string][]OAuthModelAlias
 func (h *Handler) GetOAuthModelAlias(c *gin.Context) {
 	c.JSON(200, gin.H{"oauth-model-alias": sanitizedOAuthModelAlias(h.cfg.OAuthModelAlias)})
