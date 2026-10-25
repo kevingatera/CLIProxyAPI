@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"slices"
 	"sort"
@@ -143,29 +144,31 @@ func (m *Manager) refreshUnifiedQuotas(ctx context.Context) {
 	if refresh != nil {
 		m.startUnifiedAllowanceRefresh(ctx, refresh)
 	}
-	if fetch == nil {
-		return
-	}
+	now := time.Now()
 	for _, a := range m.List() {
-		if a.Disabled || m.unifiedQuotaFresh(a.ID, time.Now()) {
+		if a.Disabled || !unifiedParticipates(cfg, a) {
 			continue
 		}
-		participates := false
-		for _, model := range cfg.Routing.UnifiedModels.Models {
-			for _, route := range model.Routes {
-				if MatchesUnifiedRoute(route, a) {
-					participates = true
-				}
-			}
-		}
-		if !participates {
+		if fetch == nil || m.unifiedQuotaFresh(a.ID, now) {
 			continue
 		}
 		// Fetches are never joined, so a stalled provider cannot hold back later ticks.
-		if m.beginUnifiedFetch(a.ID, time.Now()) {
+		if m.beginUnifiedFetch(a.ID, now) {
 			go m.runUnifiedFetch(ctx, fetch, a)
 		}
 	}
+}
+
+// unifiedParticipates reports whether any unified route can use the credential.
+func unifiedParticipates(cfg *config.Config, a *Auth) bool {
+	for _, model := range cfg.Routing.UnifiedModels.Models {
+		for _, route := range model.Routes {
+			if MatchesUnifiedRoute(route, a) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 const (
@@ -200,11 +203,11 @@ func (m *Manager) beginUnifiedFetch(authID string, now time.Time) bool {
 	return true
 }
 
-func (m *Manager) runUnifiedFetch(ctx context.Context, fetch func(context.Context, *Auth) (pluginapi.QuotaFetchResponse, error), a *Auth) {
-	report, err := fetch(ctx, a)
-	now := time.Now()
+// finishUnifiedFetch releases the credential's slot and records the outcome for backoff.
+func (m *Manager) finishUnifiedFetch(authID string, err error, now time.Time) {
 	m.unifiedMu.Lock()
-	st := m.unifiedFetches[a.ID]
+	defer m.unifiedMu.Unlock()
+	st := m.unifiedFetches[authID]
 	st.inFlight = false
 	if err != nil {
 		st.failures++
@@ -213,7 +216,12 @@ func (m *Manager) runUnifiedFetch(ctx context.Context, fetch func(context.Contex
 		st.failures = 0
 		st.retryAt = time.Time{}
 	}
-	m.unifiedMu.Unlock()
+}
+
+func (m *Manager) runUnifiedFetch(ctx context.Context, fetch func(context.Context, *Auth) (pluginapi.QuotaFetchResponse, error), a *Auth) {
+	report, err := fetch(ctx, a)
+	now := time.Now()
+	m.finishUnifiedFetch(a.ID, err, now)
 	if err == nil {
 		m.ObserveUnifiedQuota(a.ID, report, now)
 	}
@@ -386,57 +394,7 @@ func (m *Manager) UnifiedRoutes(model string, now time.Time) []UnifiedRouteStatu
 			}
 		}
 		m.unifiedMu.Unlock()
-		if !snapshot.At.IsZero() {
-			at := snapshot.At
-			status.ObservedAt = &at
-		}
-		if snapshot.fresh(now) {
-			for _, group := range snapshot.Report.Groups {
-				for _, bucket := range group.Buckets {
-					if bucket.Scope == "model" && !slices.Contains(bucket.Models, route.Model) {
-						continue
-					}
-					reset, err := time.Parse(time.RFC3339Nano, bucket.ResetTime)
-					if err == nil && !reset.After(now) {
-						continue
-					}
-					remaining := bucket.RemainingFraction
-					if math.IsNaN(remaining) || math.IsInf(remaining, 0) || remaining < 0 || remaining > 1 {
-						continue
-					}
-					depletion := snapshot.Depletion[group.DisplayName+"/"+bucket.Window]
-					pressure := 0.0
-					if err == nil && remaining > 0 {
-						pressure = depletion * reset.Sub(now).Hours() / remaining
-					}
-					score := remaining / (1 + pressure)
-					if !status.QuotaKnown || score < status.CapacityScore {
-						status.Remaining = &remaining
-						status.CapacityScore = score
-						status.ResetTime = bucket.ResetTime
-						status.DepletionPerHour = depletion
-					}
-					status.QuotaKnown = true
-					if remaining <= 0 {
-						status.Eligible = false
-						status.Reason = "provider allowance exhausted"
-					}
-				}
-			}
-		}
-		if snapshot.fresh(now) {
-			credits, count := 0.0, 0
-			for _, metric := range snapshot.Report.Summary {
-				if metric.Key == "monthlyCredits" || metric.Key == "purchasedCredits" || metric.Key == "freeCredits" {
-					credits += metric.Value
-					count++
-				}
-			}
-			if count == 3 && credits <= 0 {
-				status.Eligible = false
-				status.Reason = "provider credit exhausted"
-			}
-		}
+		applyUnifiedSnapshot(&status, snapshot, route.Model, now)
 		if status.Eligible && status.QuotaKnown {
 			status.Reason = "fresh provider quota; plan and capacity ranked"
 		}
@@ -447,12 +405,7 @@ func (m *Manager) UnifiedRoutes(model string, now time.Time) []UnifiedRouteStatu
 		if a.Eligible != b.Eligible {
 			return a.Eligible
 		}
-		// Preserve included plans unless a binding window has less than five percent headroom.
-		comfortableA := a.Remaining == nil || *a.Remaining >= .05
-		comfortableB := b.Remaining == nil || *b.Remaining >= .05
-		includedA := a.Plan == "included" && comfortableA
-		includedB := b.Plan == "included" && comfortableB
-		if includedA != includedB {
+		if includedA, includedB := unifiedIncluded(a), unifiedIncluded(b); includedA != includedB {
 			return includedA
 		}
 		if a.Priority != b.Priority {
@@ -471,10 +424,111 @@ func (m *Manager) UnifiedRoutes(model string, now time.Time) []UnifiedRouteStatu
 	return out
 }
 
-// unifiedRoutingPlan turns the eligible routes of a unified model into pinned steps, included
-// plans first. Each step runs through the normal execution path, so a failed step falls back
-// by the policy's failure classes (HTTP 402 counts as exhausted).
-func (m *Manager) unifiedRoutingPlan(cfg *config.Config, providers []string, model string) *routingPlan {
+// applyUnifiedSnapshot ranks a credential from its fresh allowance report, using only the buckets
+// that apply to upstreamModel. Within one group, an applicable window whose reset has passed, or whose
+// remaining fraction is invalid, makes the whole group unknown until the next read: the other windows
+// of the same account cannot stand in for it. A live exhausted window still excludes the route.
+func applyUnifiedSnapshot(status *UnifiedRouteStatus, snapshot unifiedQuotaSnapshot, upstreamModel string, now time.Time) {
+	if !snapshot.At.IsZero() {
+		at := snapshot.At
+		status.ObservedAt = &at
+	}
+	if !snapshot.fresh(now) {
+		return
+	}
+	for _, group := range snapshot.Report.Groups {
+		var live []unifiedLiveBucket
+		unknown := false
+		for _, bucket := range group.Buckets {
+			if bucket.Scope == "model" && !slices.Contains(bucket.Models, upstreamModel) {
+				continue
+			}
+			reset, errReset := time.Parse(time.RFC3339Nano, bucket.ResetTime)
+			hasReset := errReset == nil
+			if hasReset && !reset.After(now) {
+				unknown = true
+				continue
+			}
+			remaining := bucket.RemainingFraction
+			if math.IsNaN(remaining) || math.IsInf(remaining, 0) || remaining < 0 || remaining > 1 {
+				unknown = true
+				continue
+			}
+			live = append(live, unifiedLiveBucket{bucket: bucket, remaining: remaining, reset: reset, hasReset: hasReset})
+		}
+		exhausted := slices.ContainsFunc(live, func(b unifiedLiveBucket) bool { return b.remaining <= 0 })
+		if unknown && !exhausted {
+			continue
+		}
+		for _, b := range live {
+			depletion := snapshot.Depletion[group.DisplayName+"/"+b.bucket.Window]
+			pressure := 0.0
+			if b.hasReset && b.remaining > 0 {
+				pressure = depletion * b.reset.Sub(now).Hours() / b.remaining
+			}
+			score := b.remaining / (1 + pressure)
+			if !status.QuotaKnown || score < status.CapacityScore {
+				remaining := b.remaining
+				status.Remaining = &remaining
+				status.CapacityScore = score
+				status.ResetTime = b.bucket.ResetTime
+				status.DepletionPerHour = depletion
+			}
+			status.QuotaKnown = true
+			if b.remaining <= 0 {
+				status.Eligible = false
+				status.Reason = "provider allowance exhausted"
+			}
+		}
+	}
+	credits, count := 0.0, 0
+	for _, metric := range snapshot.Report.Summary {
+		if metric.Key == "monthlyCredits" || metric.Key == "purchasedCredits" || metric.Key == "freeCredits" {
+			credits += metric.Value
+			count++
+		}
+	}
+	if count == 3 && credits <= 0 {
+		status.Eligible = false
+		status.Reason = "provider credit exhausted"
+	}
+}
+
+// unifiedLiveBucket is one applicable bucket that passed validation and whose reset has not passed.
+type unifiedLiveBucket struct {
+	bucket    pluginapi.QuotaBucket
+	remaining float64
+	reset     time.Time
+	hasReset  bool
+}
+
+// unifiedIncluded preserves included plans unless a binding window has less than five percent headroom.
+func unifiedIncluded(r UnifiedRouteStatus) bool {
+	comfortable := r.Remaining == nil || *r.Remaining >= .05
+	return r.Plan == "included" && comfortable
+}
+
+// unifiedRank is the ordering key a route is ranked by before the credential ID tiebreak.
+// Routes with equal ranks are interchangeable, so the plan rotates them.
+type unifiedRank struct {
+	included   bool
+	priority   int
+	quotaKnown bool
+	capacity   int
+}
+
+func unifiedRankOf(r UnifiedRouteStatus) unifiedRank {
+	// Quantization avoids changing providers for insignificant quota fluctuations.
+	return unifiedRank{included: unifiedIncluded(r), priority: r.Priority, quotaKnown: r.QuotaKnown, capacity: int(r.CapacityScore * 20)}
+}
+
+// unifiedRoutingPlan turns the eligible routes of a unified model into pinned steps in ranking
+// order. Routes that tie on every ranking key take turns, starting after the credential last
+// selected from that tie group; an explicit policy auth-order is authoritative and is never
+// rotated. The rotation advances only when a step's credential is actually selected, and
+// operation "count_tokens" never advances it. Each step runs through the normal execution path,
+// so a failed step falls back by the policy's failure classes (HTTP 402 counts as exhausted).
+func (m *Manager) unifiedRoutingPlan(cfg *config.Config, providers []string, model, operation string) *routingPlan {
 	plan := &routingPlan{
 		fallbackOn: routingFallbackTriggers(cfg.Routing.Policy.Fallback),
 		traceLimit: routingTraceLimit(cfg.Routing.Policy.Observability),
@@ -483,17 +537,83 @@ func (m *Manager) unifiedRoutingPlan(cfg *config.Config, providers []string, mod
 	for _, provider := range providers {
 		allowed[strings.ToLower(strings.TrimSpace(provider))] = struct{}{}
 	}
+	var candidates []UnifiedRouteStatus
 	for _, route := range m.UnifiedRoutes(model, time.Now()) {
 		provider := strings.ToLower(strings.TrimSpace(route.Provider))
 		if _, ok := allowed[provider]; !route.Eligible || !ok {
 			continue
 		}
-		plan.steps = append(plan.steps, routingStep{providers: []string{provider}, authID: route.AuthID})
-		if !slices.Contains(plan.providers, provider) {
-			plan.providers = append(plan.providers, provider)
+		candidates = append(candidates, route)
+	}
+	orders := policyAuthOrders(cfg.Routing.Policy, model)
+	candidates = applyPolicyAuthOrder(candidates, orders)
+	advance := operation != "count_tokens"
+	for _, group := range unifiedTieGroups(candidates, orders) {
+		rotated, key := m.rotateUnifiedTie(model, group)
+		for _, route := range rotated {
+			provider := strings.ToLower(strings.TrimSpace(route.Provider))
+			step := routingStep{providers: []string{provider}, authID: route.AuthID}
+			if advance && key != "" {
+				step.selected = func(authID string) { m.recordUnifiedPick(key, authID) }
+			}
+			plan.steps = append(plan.steps, step)
+			if !slices.Contains(plan.providers, provider) {
+				plan.providers = append(plan.providers, provider)
+			}
 		}
 	}
 	return plan
+}
+
+// unifiedTieGroups splits ranked routes into runs whose ranking keys are equal. Ranking is already
+// sorted, so equal keys are contiguous. A route under an explicit policy auth-order is a group of its
+// own, so rotation never reorders it.
+func unifiedTieGroups(ranked []UnifiedRouteStatus, orders map[string]policyAuthOrder) [][]UnifiedRouteStatus {
+	pinned := func(r UnifiedRouteStatus) bool {
+		_, ok := orders[strings.ToLower(strings.TrimSpace(r.Provider))]
+		return ok
+	}
+	var groups [][]UnifiedRouteStatus
+	for start := 0; start < len(ranked); {
+		end := start + 1
+		for !pinned(ranked[start]) && end < len(ranked) && !pinned(ranked[end]) && unifiedRankOf(ranked[end]) == unifiedRankOf(ranked[start]) {
+			end++
+		}
+		groups = append(groups, ranked[start:end])
+		start = end
+	}
+	return groups
+}
+
+// rotateUnifiedTie orders a tie group so the credential after the last selected one comes first.
+// It returns the group's rotation key, which recordUnifiedPick uses; singleton groups have no key.
+func (m *Manager) rotateUnifiedTie(model string, group []UnifiedRouteStatus) ([]UnifiedRouteStatus, string) {
+	if len(group) < 2 {
+		return group, ""
+	}
+	rank := unifiedRankOf(group[0])
+	key := fmt.Sprintf("%s\x00%t|%d|%t|%d", thinking.ParseSuffix(model).ModelName, rank.included, rank.priority, rank.quotaKnown, rank.capacity)
+	m.unifiedMu.Lock()
+	defer m.unifiedMu.Unlock()
+	if m.unifiedRotation == nil {
+		m.unifiedRotation = make(map[string]string)
+	}
+	last := m.unifiedRotation[key]
+	start := 0
+	if i := slices.IndexFunc(group, func(r UnifiedRouteStatus) bool { return r.AuthID == last }); i >= 0 {
+		start = (i + 1) % len(group)
+	}
+	return append(append([]UnifiedRouteStatus(nil), group[start:]...), group[:start]...), key
+}
+
+// recordUnifiedPick stores the credential a tie group actually selected. Only a real selection calls it.
+func (m *Manager) recordUnifiedPick(key, authID string) {
+	m.unifiedMu.Lock()
+	defer m.unifiedMu.Unlock()
+	if m.unifiedRotation == nil {
+		m.unifiedRotation = make(map[string]string)
+	}
+	m.unifiedRotation[key] = authID
 }
 
 func unifiedUpstreamModel(route *config.UnifiedModelRoute, requested string) string {

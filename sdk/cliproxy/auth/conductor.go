@@ -176,6 +176,8 @@ type Manager struct {
 	unifiedFetches            map[string]*unifiedFetchState
 	unifiedQuotaFetcher       func(context.Context, *Auth) (pluginapi.QuotaFetchResponse, error)
 	unifiedAllowanceRefresher func(context.Context)
+	// unifiedRotation remembers the credential last selected from each full-tie group; guarded by unifiedMu.
+	unifiedRotation           map[string]string
 	store                     Store
 	cooldownStore             CooldownStateStore
 	pendingCooldownStateStore CooldownStateStore

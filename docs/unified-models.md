@@ -50,15 +50,26 @@ creates a private timestamped backup, and preserves the rest of the document.
    Unknown is not unlimited.
 5. Compare binding-window headroom adjusted for observed allowance depletion and
    time until reset. Scores are grouped into 5% bands to reduce trivial switches.
-6. Use stable credential ordering for ties. Retry a different eligible route for
-   capacity, rate-limit, server and transport failures before streaming begins.
-   An invalid request is terminal. Credit exhaustion fails over only when the
-   provider returns HTTP 402; message text is never inspected.
+6. Full ties take turns. The rotation advances only when a credential is actually
+   selected, so planning, route reads and `count_tokens` never move it. Retry a
+   different eligible route for capacity, rate-limit, server and transport failures
+   before streaming begins. An invalid request is terminal. Credit exhaustion fails
+   over only when the provider returns HTTP 402; message text is never inspected.
+7. An enabled routing policy with `auth-order` for a provider is authoritative for
+   that provider. Listed auths keep their configured order and are never rotated.
+   With `include-remaining-auth: false`, unlisted auths are not used. Cooling and
+   ineligible listed auths are skipped.
 
 Native account reports refresh in the background every five minutes. Selection
-never performs network calls. Reports expire after ten minutes or at an earlier expiry the source declares, and a passed
-reset makes that bucket unknown until refreshed. Reports are account-wide,
-not per-model token grants. Model token burn is a bounded ten-minute observation;
+never performs network calls. Reports expire after ten minutes or at an earlier expiry the source declares. A passed reset, or an invalid
+remaining fraction, makes the whole window group unknown until refreshed; a live
+exhausted window still excludes the route.
+
+Codex OAuth accounts report through the same native path, from the account's
+`wham/usage` windows. Each window is one model-scoped bucket that applies to the
+wire models of that account's unified routes, because the window is account-wide.
+Named additional limits are not mapped to models. Unified routing ignores the
+passive response observation for Codex; only the native report ranks it. Model token burn is a bounded ten-minute observation;
 it is shown separately because tokens cannot be converted to provider allowance
 without a documented conversion. Allowance depletion compares consecutive
 reports of the same window and reset, including usage outside this proxy.
@@ -69,7 +80,9 @@ token rate. `GET /v8/management/routing/traces` proves the actual attempts.
 These management endpoints require authentication. They never return API keys.
 
 This feature does not change the routing policy of legacy model IDs. In
-particular, existing Claude OAuth-first ordering remains in effect.
+particular, existing Claude OAuth-first ordering remains in effect. For unified
+model IDs, only an explicit `auth-order` in the routing policy is honored, as
+described in step 7.
 # Private allowance snapshots
 
 Routes can set `subscription-only: true` with `auth-kind: oauth`. Such a route

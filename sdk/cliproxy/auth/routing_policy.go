@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -59,6 +60,8 @@ type routingStep struct {
 	providers []string
 	authID    string
 	exclude   []string
+	// selected runs only when the pinned authID is actually selected, never when the step is planned.
+	selected func(authID string)
 }
 
 // routingPlan is the operation-independent route for one request. Every step runs through
@@ -87,7 +90,7 @@ func (m *Manager) routingPlanFor(operation string, providers []string, model str
 	var plan *routingPlan
 	switch {
 	case cfg.Routing.UnifiedModels.Find(thinking.ParseSuffix(model).ModelName) != nil:
-		plan = m.unifiedRoutingPlan(cfg, providers, model)
+		plan = m.unifiedRoutingPlan(cfg, providers, model, operation)
 	case cfg.Routing.Policy.Enabled:
 		plan = buildRoutingPlan(cfg.Routing.Policy, providers, model)
 	default:
@@ -113,14 +116,7 @@ func buildRoutingPlan(policy internalconfig.RoutingPolicy, providers []string, m
 		traceLimit: routingTraceLimit(policy.Observability),
 	}
 
-	rule := policy.Defaults
-	trimmed := strings.TrimSpace(model)
-	if override, ok := policy.ModelOverrides[trimmed]; ok {
-		rule = override
-	} else if override, ok := policy.ModelOverrides[strings.TrimSpace(thinking.ParseSuffix(trimmed).ModelName)]; ok {
-		rule = override
-	}
-
+	rule := routingRuleFor(policy, model)
 	input := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
 		input[strings.ToLower(strings.TrimSpace(provider))] = struct{}{}
@@ -177,6 +173,99 @@ func buildRoutingPlan(policy internalconfig.RoutingPolicy, providers []string, m
 		plan.filter = &routingAuthFilter{allowOnly: allowOnly}
 	}
 	return plan
+}
+
+// routingRuleFor returns the rule for a request model: an exact model override, then the override
+// for its name without a thinking suffix, then the defaults.
+func routingRuleFor(policy internalconfig.RoutingPolicy, model string) internalconfig.RoutingPolicyRule {
+	trimmed := strings.TrimSpace(model)
+	if override, ok := policy.ModelOverrides[trimmed]; ok {
+		return override
+	}
+	if override, ok := policy.ModelOverrides[strings.TrimSpace(thinking.ParseSuffix(trimmed).ModelName)]; ok {
+		return override
+	}
+	return policy.Defaults
+}
+
+// policyAuthOrder is the explicit credential order that the routing policy sets for one provider.
+type policyAuthOrder struct {
+	authIDs          []string
+	includeRemaining bool
+}
+
+// policyAuthOrders returns the explicit auth-orders of the rule that applies to model, keyed by
+// lowercase provider. Only an enabled policy sets them. The first route per provider wins, as in
+// buildRoutingPlan, and a route without auth-order sets nothing.
+func policyAuthOrders(policy internalconfig.RoutingPolicy, model string) map[string]policyAuthOrder {
+	if !policy.Enabled {
+		return nil
+	}
+	orders := make(map[string]policyAuthOrder)
+	seenProviders := make(map[string]struct{})
+	for _, route := range routingRuleFor(policy, model).Route {
+		provider := strings.ToLower(strings.TrimSpace(route.Provider))
+		if _, dup := seenProviders[provider]; dup {
+			continue
+		}
+		seenProviders[provider] = struct{}{}
+		var authIDs []string
+		for _, raw := range route.AuthOrder {
+			authID := strings.TrimSpace(raw)
+			if authID != "" && !slices.Contains(authIDs, authID) {
+				authIDs = append(authIDs, authID)
+			}
+		}
+		if len(authIDs) > 0 {
+			orders[provider] = policyAuthOrder{authIDs: authIDs, includeRemaining: route.IncludeRemainingAuth}
+		}
+	}
+	if len(orders) == 0 {
+		return nil
+	}
+	return orders
+}
+
+// applyPolicyAuthOrder keeps each explicit provider's routes in their configured order. The order
+// fills the positions the ranking gave that provider, so cross-provider ranking is unchanged. Listed
+// auths that are not eligible (exhausted, disabled or cooling) are skipped. Unlisted auths are dropped
+// unless include-remaining-auth is set, in which case they follow the listed ones in ranking order.
+func applyPolicyAuthOrder(ranked []UnifiedRouteStatus, orders map[string]policyAuthOrder) []UnifiedRouteStatus {
+	if len(orders) == 0 {
+		return ranked
+	}
+	pools := make(map[string][]UnifiedRouteStatus, len(orders))
+	for provider, order := range orders {
+		var pool []UnifiedRouteStatus
+		for _, authID := range order.authIDs {
+			for _, r := range ranked {
+				if strings.ToLower(strings.TrimSpace(r.Provider)) == provider && r.AuthID == authID {
+					pool = append(pool, r)
+				}
+			}
+		}
+		if order.includeRemaining {
+			for _, r := range ranked {
+				if strings.ToLower(strings.TrimSpace(r.Provider)) == provider && !slices.Contains(order.authIDs, r.AuthID) {
+					pool = append(pool, r)
+				}
+			}
+		}
+		pools[provider] = pool
+	}
+	out := make([]UnifiedRouteStatus, 0, len(ranked))
+	for _, r := range ranked {
+		provider := strings.ToLower(strings.TrimSpace(r.Provider))
+		if _, explicit := orders[provider]; !explicit {
+			out = append(out, r)
+			continue
+		}
+		if pool := pools[provider]; len(pool) > 0 {
+			out = append(out, pool[0])
+			pools[provider] = pool[1:]
+		}
+	}
+	return out
 }
 
 func routingFallbackTriggers(fallback internalconfig.RoutingFallbackPolicy) map[string]struct{} {
@@ -248,6 +337,17 @@ func (step routingStep) options(opts cliproxyexecutor.Options) cliproxyexecutor.
 	}
 	opts.Metadata = cloneRequestMetadata(opts.Metadata)
 	opts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey] = step.authID
+	if step.selected != nil {
+		prev, _ := opts.Metadata[cliproxyexecutor.SelectedAuthCallbackMetadataKey].(func(string))
+		opts.Metadata[cliproxyexecutor.SelectedAuthCallbackMetadataKey] = func(authID string) {
+			if authID == step.authID {
+				step.selected(authID)
+			}
+			if prev != nil {
+				prev(authID)
+			}
+		}
+	}
 	return opts
 }
 

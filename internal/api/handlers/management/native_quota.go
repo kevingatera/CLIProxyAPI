@@ -76,6 +76,9 @@ func nativeQuotaProvider(a *coreauth.Auth) string {
 	if a.Provider == "kimi" && a.AuthKind() == coreauth.AuthKindOAuth {
 		return "kimi"
 	}
+	if a.Provider == "codex" && a.AuthKind() == coreauth.AuthKindOAuth {
+		return "codex"
+	}
 	u, err := url.Parse(a.Attributes["base_url"])
 	if err != nil {
 		return ""
@@ -130,7 +133,7 @@ func (h *Handler) FetchCredentialQuotaV8(c *gin.Context) {
 	switch {
 	case !handled:
 		c.JSON(http.StatusNotImplemented, gin.H{"error": nativeQuotaUnsupported})
-	case errors.Is(err, errNativeQuotaKeyMissing):
+	case errors.Is(err, errNativeQuotaKeyMissing), errors.Is(err, errNativeQuotaCredentialMissing):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 	case err != nil:
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
@@ -171,6 +174,9 @@ func (h *Handler) fetchNativeQuota(ctx context.Context, a *coreauth.Auth) (plugi
 	provider := nativeQuotaProvider(a)
 	if provider == "" {
 		return pluginapi.QuotaFetchResponse{}, false, nil
+	}
+	if provider == "codex" {
+		return h.fetchCodexQuota(ctx, a)
 	}
 	key := a.Attributes["api_key"]
 	if key == "" && provider == "kimi" && a.AuthKind() == coreauth.AuthKindOAuth {
