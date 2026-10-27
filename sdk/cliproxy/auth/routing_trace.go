@@ -221,4 +221,8 @@ func (p *routingPlan) recordCreditsAttempt(ctx context.Context, auth *Auth, err 
 	reason := classifyRoutingFailure(ctx, err)
 	p.recordAttempt(routingStep{providers: []string{auth.Provider}, authID: auth.ID}, err, reason, p.allowsFallback(reason))
 	p.trace.Attempts[len(p.trace.Attempts)-1].Credits = true
+	// A credits-only request has no plain provider, so the trace names the credits provider for filtering.
+	if !containsFold(p.trace.Providers, auth.Provider) {
+		p.trace.Providers = append(p.trace.Providers, auth.Provider)
+	}
 }
