@@ -478,16 +478,28 @@ func (m *Manager) unifiedRoutingPlan(cfg *config.Config, providers []string, mod
 	plan := &routingPlan{
 		fallbackOn: routingFallbackTriggers(cfg.Routing.Policy.Fallback),
 		traceLimit: routingTraceLimit(cfg.Routing.Policy.Observability),
+		filter:     &routingAuthFilter{allowOnly: make(map[string]map[string]struct{})},
+		eligible:   func(authID string) bool { return m.unifiedAuthEligible(model, authID) },
 	}
 	allowed := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
-		allowed[strings.ToLower(strings.TrimSpace(provider))] = struct{}{}
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		allowed[provider] = struct{}{}
+		plan.filter.allowOnly[provider] = make(map[string]struct{})
+	}
+	var policy *routingPlan
+	if cfg.Routing.Policy.Enabled {
+		policy = buildRoutingPlan(cfg.Routing.Policy, providers, model)
 	}
 	for _, route := range m.UnifiedRoutes(model, time.Now()) {
 		provider := strings.ToLower(strings.TrimSpace(route.Provider))
 		if _, ok := allowed[provider]; !route.Eligible || !ok {
 			continue
 		}
+		if policy != nil && (!slices.Contains(policy.providers, provider) || !policy.filter.allows(&Auth{ID: route.AuthID, Provider: provider})) {
+			continue
+		}
+		plan.filter.allowOnly[provider][route.AuthID] = struct{}{}
 		plan.steps = append(plan.steps, routingStep{providers: []string{provider}, authID: route.AuthID})
 		if !slices.Contains(plan.providers, provider) {
 			plan.providers = append(plan.providers, provider)
@@ -514,4 +526,19 @@ func (m *Manager) wakeUnifiedRouting() {
 		default:
 		}
 	}
+}
+
+// unifiedAuthEligible rechecks local quota and cooldown state without holding the auth lock.
+// Legacy credits routes intentionally retain their separate cooldown bypass.
+func (m *Manager) unifiedAuthEligible(model, authID string) bool {
+	cfg, _ := m.runtimeConfig.Load().(*config.Config)
+	if cfg == nil || cfg.Routing.UnifiedModels.Find(thinking.ParseSuffix(model).ModelName) == nil {
+		return true
+	}
+	for _, route := range m.UnifiedRoutes(model, time.Now()) {
+		if route.AuthID == authID {
+			return route.Eligible
+		}
+	}
+	return false
 }
