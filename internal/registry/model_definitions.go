@@ -66,17 +66,33 @@ func GetCodexFreeModels() []*ModelInfo {
 
 // GetCodexTeamModels returns model definitions for the Codex team plan tier.
 func GetCodexTeamModels() []*ModelInfo {
-	return WithCodexBuiltins(cloneModelInfos(getModels().CodexTeam))
+	return WithCodexBuiltins(withCodexTerra(cloneModelInfos(getModels().CodexTeam)))
 }
 
 // GetCodexPlusModels returns model definitions for the Codex plus plan tier.
 func GetCodexPlusModels() []*ModelInfo {
-	return WithCodexBuiltins(cloneModelInfos(getModels().CodexPlus))
+	return WithCodexBuiltins(withCodexTerra(cloneModelInfos(getModels().CodexPlus)))
 }
 
 // GetCodexProModels returns model definitions for the Codex pro plan tier.
 func GetCodexProModels() []*ModelInfo {
-	return WithCodexBuiltins(cloneModelInfos(getModels().CodexPro))
+	return WithCodexBuiltins(withCodexTerra(cloneModelInfos(getModels().CodexPro)))
+}
+
+// Keep the authenticated Codex catalog addition available across remote catalog refreshes.
+func withCodexTerra(models []*ModelInfo) []*ModelInfo {
+	for _, model := range models {
+		if model != nil && model.ID == "gpt-6.1-terra" {
+			return models
+		}
+	}
+	return append(models, &ModelInfo{
+		ID: "gpt-6.1-terra", Object: "model", OwnedBy: "openai", Type: "openai",
+		DisplayName: "GPT-6.1 Terra", Description: "GPT-6.1 Terra Codex model.",
+		ContextLength:       500000,
+		SupportedParameters: []string{"tools"},
+		Thinking:            &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
+	})
 }
 
 // GetKimiModels returns the standard Kimi (Moonshot AI) model definitions.
