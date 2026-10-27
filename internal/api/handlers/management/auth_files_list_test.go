@@ -66,7 +66,7 @@ func TestBuildAuthFileEntry_HidesUsageStatsFile(t *testing.T) {
 	}
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	if entry := h.buildAuthFileEntry(auth); entry != nil {
+	if entry := h.buildAuthFileEntry(auth, authFileQuotaContext{}); entry != nil {
 		t.Fatalf("expected usage stats file to be hidden, got %#v", entry)
 	}
 }
