@@ -63,7 +63,7 @@ func (h *Handler) CollectAllowances(c *gin.Context) {
 		var report pluginapi.QuotaFetchResponse
 		var err error
 		if provider != "" {
-			report, err = h.fetchNativeQuota(c.Request.Context(), a)
+			report, _, err = h.fetchNativeQuota(c.Request.Context(), a)
 			account.Provider = provider
 		} else {
 			h.mu.Lock()
