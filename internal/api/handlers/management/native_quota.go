@@ -134,7 +134,9 @@ func (h *Handler) FetchCredentialQuotaV8(c *gin.Context) {
 	default:
 		if h.authManager != nil {
 			for _, peer := range h.authManager.List() {
-				if sameNativeAccount(a, peer) { h.authManager.ObserveUnifiedQuota(peer.ID, report, time.Now()) }
+				if sameNativeAccount(a, peer) {
+					h.authManager.ObserveUnifiedQuota(peer.ID, report, time.Now())
+				}
 			}
 		}
 		c.JSON(http.StatusOK, report)

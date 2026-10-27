@@ -1358,7 +1358,7 @@ func (h *Handler) PutGlobalExcludedModels(c *gin.Context) {
 		}
 	}
 	h.cfg.GlobalExcludedModels = config.NormalizeExcludedModels(patterns)
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) PatchGlobalExcludedModels(c *gin.Context) {
@@ -1391,7 +1391,7 @@ func (h *Handler) PatchGlobalExcludedModels(c *gin.Context) {
 		// Add if not already present (NormalizeExcludedModels dedupes)
 		h.cfg.GlobalExcludedModels = config.NormalizeExcludedModels(append(existing, pattern))
 	}
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) DeleteGlobalExcludedModels(c *gin.Context) {
@@ -1402,7 +1402,7 @@ func (h *Handler) DeleteGlobalExcludedModels(c *gin.Context) {
 	if pattern == "" {
 		// Clear all
 		h.cfg.GlobalExcludedModels = nil
-		h.persist(c)
+		h.persistLocked(c)
 		return
 	}
 	existing := config.NormalizeExcludedModels(h.cfg.GlobalExcludedModels)
@@ -1413,7 +1413,7 @@ func (h *Handler) DeleteGlobalExcludedModels(c *gin.Context) {
 		}
 	}
 	h.cfg.GlobalExcludedModels = config.NormalizeExcludedModels(filtered)
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 // oauth-model-alias: map[string][]OAuthModelAlias

@@ -121,6 +121,8 @@ func (h *Handler) validateRoutingPolicy(policy config.RoutingPolicy) error {
 
 // PutRoutingPolicy updates the full routing policy object.
 func (h *Handler) PutRoutingPolicy(c *gin.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h == nil || h.cfg == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
 		return
@@ -141,7 +143,7 @@ func (h *Handler) PutRoutingPolicy(c *gin.Context) {
 	}
 
 	h.cfg.Routing.Policy = scratch.Routing.Policy
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 // PreviewRoutingPolicy previews resolved routing order and auth candidates for a model.
