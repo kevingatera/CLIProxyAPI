@@ -1687,7 +1687,7 @@ func TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart(t *t
 		}
 		return false
 	}
-	teamModels := []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "codex-auto-review"}
+	teamModels := []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6.1-terra", "codex-auto-review"}
 	for _, m := range teamModels {
 		if !hasModel(m) {
 			t.Fatalf("expected %q to be in initial /v1/models list: %s", m, rec.Body.String())
@@ -1849,7 +1849,7 @@ func TestEndToEndAuthFilePatch_RestoresModelsInV1ModelsWithoutRestart(t *testing
 		Code:       "unauthorized",
 		Message:    "Encountered invalidated oauth token: test-token",
 	}
-	teamModels := []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "codex-auto-review"}
+	teamModels := []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6.1-terra", "codex-auto-review"}
 	for _, m := range teamModels {
 		service.coreManager.MarkResult(context.Background(), coreauth.Result{
 			AuthID:     authID,
