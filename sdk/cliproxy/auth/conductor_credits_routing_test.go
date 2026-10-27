@@ -742,3 +742,115 @@ func TestCreditsFallbackConcurrentRequestTraces(t *testing.T) {
 		seen[trace.ID] = true
 	}
 }
+
+const creditsInvalidRequestBody = `{"error":{"type":"invalid_request_error","message":"bad request"}}`
+
+// A credits attempt that the upstream rejects as a request fault is terminal, as on the plain pipeline. The
+// sweep must not try another credential, so the client does not get a later credential's 503 and Retry-After.
+func TestUnifiedCreditsSweepStopsOnRequestInvalid(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			m, e, model := newUnifiedCreditsRoutingManager(t, internalconfig.RoutingPolicy{Enabled: true})
+			e.plainStatus = http.StatusTooManyRequests
+			e.creditsErrors = map[string]error{
+				"alpha": &Error{HTTPStatus: http.StatusBadRequest, Message: creditsInvalidRequestBody},
+				"beta":  creditsStatusError{status: http.StatusServiceUnavailable, msg: "busy", retryAfter: 37 * time.Second},
+			}
+			headers, err := creditsRequestHeaders(t, m, model, stream)
+			if err == nil {
+				t.Fatal("request succeeded with a request-invalid credits rejection")
+			}
+			if got := statusCodeFromError(err); got != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 from the request fault (err=%v)", got, err)
+			}
+			if got := headers.Get("Retry-After"); got != "" {
+				t.Fatalf("Retry-After = %q, want none from the request fault (err=%v)", got, err)
+			}
+			if got := fmt.Sprint(e.snapshot()); got != "[alpha:plain beta:plain alpha:credits]" {
+				t.Fatalf("calls = %s, want the sweep to stop after alpha", got)
+			}
+		})
+	}
+}
+
+// A request-invalid credits bootstrap keeps the upstream headers on the terminal stream result.
+func TestUnifiedCreditsStreamInvalidBootstrapKeepsHeaders(t *testing.T) {
+	m, e, model := newUnifiedCreditsRoutingManager(t, internalconfig.RoutingPolicy{Enabled: true})
+	e.plainStatus = http.StatusTooManyRequests
+	e.creditsBootstrap = map[string]error{"alpha": &Error{HTTPStatus: http.StatusBadRequest, Message: creditsInvalidRequestBody}}
+	e.creditsHeaders = http.Header{"Retry-After": []string{"37"}}
+	got, err := creditsRequestHeaders(t, m, model, true)
+	if err == nil {
+		t.Fatal("stream succeeded with a request-invalid credits bootstrap")
+	}
+	if statusCodeFromError(err) != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (err=%v)", statusCodeFromError(err), err)
+	}
+	if got.Get("Retry-After") != "37" {
+		t.Fatalf("stream Retry-After = %q, want 37 from the credits bootstrap (err=%v)", got.Get("Retry-After"), err)
+	}
+	if calls := fmt.Sprint(e.snapshot()); calls != "[alpha:plain beta:plain alpha:credits]" {
+		t.Fatalf("calls = %s, want the sweep to stop after alpha", calls)
+	}
+}
+
+// A 400 that reports an exhausted balance is not a request fault, so the sweep moves on to the next credential.
+func TestUnifiedCreditsSweepContinuesPastCreditExhaustedBadRequest(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			m, e, model := newUnifiedCreditsRoutingManager(t, internalconfig.RoutingPolicy{Enabled: true})
+			e.plainStatus = http.StatusTooManyRequests
+			e.creditsErrors = map[string]error{
+				"alpha": &Error{HTTPStatus: http.StatusBadRequest, Message: `{"error":{"code":"insufficient_quota","message":"out of credits"}}`},
+			}
+			if err := runCreditsRoutingRequest(t, m, model, stream); err != nil {
+				t.Fatalf("request failed: %v; calls = %s", err, fmt.Sprint(e.snapshot()))
+			}
+			if got := fmt.Sprint(e.snapshot()); got != "[alpha:plain beta:plain alpha:credits beta:credits]" {
+				t.Fatalf("calls = %s, want the sweep to reach beta", got)
+			}
+		})
+	}
+}
+
+// Terminal unauthorized state excludes a credential from credits for every model, not only unified ones.
+// Cooldown from a plain 429 still does not exclude it.
+func TestCreditsCandidatesExcludeTerminalCredentialForNonUnifiedModel(t *testing.T) {
+	const model = "claude-plain-review"
+	m, _, _ := newUnifiedCreditsRoutingManager(t, internalconfig.RoutingPolicy{Enabled: true})
+	markUnifiedAuthTerminal(m, "alpha")
+	m.mu.Lock()
+	beta := m.auths["beta"]
+	beta.Unavailable = true
+	beta.Status = StatusError
+	beta.LastError = &Error{Code: "rate_limited", HTTPStatus: http.StatusTooManyRequests, Message: "slow down"}
+	beta.NextRetryAfter = time.Now().Add(time.Hour)
+	m.mu.Unlock()
+	candidates, err := m.findAllAntigravityCreditsCandidateAuths(context.Background(), model, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0].auth.ID != "beta" {
+		t.Fatalf("candidates = %+v, want only the cooled-down beta", candidates)
+	}
+	if m.unifiedCreditsEligible(model, "alpha") {
+		t.Fatal("terminally rejected alpha is eligible for credits on a non-unified model")
+	}
+	if !m.unifiedCreditsEligible(model, "beta") {
+		t.Fatal("cooldown excluded beta from credits on a non-unified model")
+	}
+}
+
+// The plain round's marked upstream failure keeps precedence over a credits failure, even when the plain error is
+// one of the synthetic answers. Without the marker the synthetic answer yields to the credits failure.
+func TestPreferCreditsAttemptErrorHonorsUpstreamMarker(t *testing.T) {
+	creditsErr := &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "busy"}
+	marked := markUpstreamExecutionAttempt(newModelCooldownError("claude-plain-review", "antigravity", time.Minute))
+	var cooldown *modelCooldownError
+	if got := preferCreditsAttemptError(marked, creditsErr); !errors.As(got, &cooldown) {
+		t.Fatalf("marked cooldown lost to credits: got %v", got)
+	}
+	if got := preferCreditsAttemptError(newModelCooldownError("claude-plain-review", "antigravity", time.Minute), creditsErr); got != creditsErr {
+		t.Fatalf("unmarked cooldown kept over credits: got %v", got)
+	}
+}

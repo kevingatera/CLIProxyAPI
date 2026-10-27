@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
@@ -1508,7 +1509,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 				// Same trusted Retry-After annotation as the plain path, so the client sees the credits hint.
 				errExec = annotateTrustedRetryAfterByHint(errExec)
 				*lastFailure = markUpstreamExecutionAttempt(errExec)
-				if creditsSweepTerminal(errExec) {
+				if creditsAttemptTerminal(errExec) {
 					return cliproxyexecutor.Response{}, false, unwrapExecutionBoundaryError(errExec)
 				}
 				if result.CredentialScope {
@@ -1577,7 +1578,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		plan.recordCreditsAttempt(creditsCtx, c.auth, errStream)
 		if errStream != nil {
 			*lastFailure = markUpstreamExecutionAttempt(errStream)
-			if creditsSweepTerminal(errStream) {
+			if creditsAttemptTerminal(errStream) {
 				// Keep the raw error: the bootstrap wrapper carries the upstream headers to the client.
 				return nil, false, errStream
 			}
@@ -1591,9 +1592,10 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 // preferCreditsAttemptError chooses the error for a failed request after the credits sweep. A plain failure
 // that is only a synthetic "no candidate" or cooldown answer, with no upstream attempt, yields to a credits
 // failure that did reach upstream, which keeps its status and Retry-After. Any other plain failure is kept.
+// plainErr must still carry its upstream-attempt marker, so callers pass it before unwrapping.
 func preferCreditsAttemptError(plainErr, creditsErr error) error {
 	if creditsErr == nil || hasUpstreamExecutionAttempt(plainErr) || !isSyntheticPlainFailure(plainErr) {
-		return plainErr
+		return unwrapExecutionBoundaryError(plainErr)
 	}
 	return unwrapExecutionBoundaryError(creditsErr)
 }
@@ -1617,8 +1619,20 @@ func isSyntheticPlainFailure(err error) bool {
 
 // creditsSweepTerminal reports errors that end the credits sweep for every candidate. The request
 // itself was stopped or terminated; any other failure belongs to one credential and the sweep moves on.
+// Preparation failures use only this rule.
 func creditsSweepTerminal(err error) bool {
 	return isRequestTerminatedError(err) || isRequestStopError(err)
+}
+
+// creditsAttemptTerminal extends creditsSweepTerminal to an upstream credits attempt. A request-invalid
+// failure, such as a 400 invalid_request_error, is the request's own fault, so the plain pipeline stops
+// there too and the sweep must not try another credential. A 400 that reports an exhausted balance is not
+// request-invalid for routing (see classifyRoutingFailure), so it keeps sweeping.
+func creditsAttemptTerminal(err error) bool {
+	if creditsSweepTerminal(err) {
+		return true
+	}
+	return !clienterror.IsCreditExhaustedBody(statusCodeFromError(err), err) && isRequestInvalidError(err)
 }
 
 // creditsTerminalStreamResult hands a terminal credits error back as a stream result when it wraps a

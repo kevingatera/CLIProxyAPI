@@ -549,15 +549,12 @@ func (m *Manager) unifiedAuthEligible(model, authID string) bool {
 	return false
 }
 
-// unifiedCreditsEligible decides whether a credential may serve the credits lane for a unified model.
-// Cooldown and an exhausted plan allowance are the conditions the lane exists to get past, so they do not
-// exclude here. Disabled or terminally rejected credentials, missing executors, credentials the model does
-// not route to, and credentials whose AI credits are exhausted do.
+// unifiedCreditsEligible decides whether a credential may serve the credits lane. Cooldown and an exhausted
+// plan allowance are the conditions the lane exists to get past, so they do not exclude here. Disabled or
+// terminally rejected credentials exclude for every model, unified or not. Missing executors, credentials
+// the unified model does not route to, and credentials whose AI credits are exhausted exclude for unified models.
 func (m *Manager) unifiedCreditsEligible(model, authID string) bool {
 	cfg, _ := m.runtimeConfig.Load().(*config.Config)
-	if cfg == nil || cfg.Routing.UnifiedModels.Find(thinking.ParseSuffix(model).ModelName) == nil {
-		return true
-	}
 	auth, ok := m.GetByID(authID)
 	if !ok || auth.Disabled || auth.Status == StatusDisabled {
 		return false
@@ -566,6 +563,9 @@ func (m *Manager) unifiedCreditsEligible(model, authID string) bool {
 	// grant cannot serve credits either, while cooldown from plain 429/503 responses still does not exclude.
 	if hasUnauthorizedAuthFailure(auth) || hasDisabledInvalidGrantFailure(auth) {
 		return false
+	}
+	if cfg == nil || cfg.Routing.UnifiedModels.Find(thinking.ParseSuffix(model).ModelName) == nil {
+		return true
 	}
 	if _, ok := m.Executor(auth.Provider); !ok {
 		return false

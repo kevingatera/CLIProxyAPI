@@ -438,6 +438,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
 				bootstrapErr = annotateTrustedRetryAfterByHint(bootstrapErr)
+				// A credits attempt hands its terminal error to the client with the upstream headers, so keep them.
+				if AntigravityCreditsRequested(ctx) {
+					bootstrapErr = newStreamBootstrapError(bootstrapErr, streamResult.Headers)
+				}
 				syncPreferredUpstreamError(&upstreamErr, bootstrapErr)
 				discardStreamChunks(streamResult.Chunks)
 				return nil, bootstrapErr
