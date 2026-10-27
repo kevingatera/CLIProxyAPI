@@ -1332,6 +1332,9 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 	var known []creditsCandidateEntry
 	var unknown []creditsCandidateEntry
 	for _, candidate := range candidates {
+		if !m.unifiedAuthEligible(routeModel, candidate.auth.ID) {
+			continue
+		}
 		hint, okHint, errHint := GetAntigravityCreditsHintRequired(ctx, candidate.auth.ID)
 		if errHint != nil {
 			return nil, antigravityCreditsKVUnavailableError(errHint)
@@ -1437,7 +1440,7 @@ func (b *creditsAttemptBudget) allow(authID string) bool {
 	return true
 }
 
-func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, attempted map[string]struct{}) (cliproxyexecutor.Response, bool, error) {
+func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, attempted map[string]struct{}, plan *routingPlan) (cliproxyexecutor.Response, bool, error) {
 	if m != nil && m.HomeEnabled() {
 		return cliproxyexecutor.Response{}, false, &Error{Code: "home_fallback_unsupported", Message: "Home does not support Antigravity credits fallback", HTTPStatus: http.StatusServiceUnavailable}
 	}
@@ -1469,9 +1472,16 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		creditsCtx = coreusage.WithSelectionID(creditsCtx, "")
 		preparedAuth, errPrepare := m.prepareRequestAuth(creditsCtx, c.executor, c.auth)
 		if errPrepare != nil {
+			plan.recordCreditsAttempt(creditsCtx, c.auth, errPrepare)
+			if !plan.allowsCreditsFallback(creditsCtx, errPrepare) {
+				return cliproxyexecutor.Response{}, false, unwrapExecutionBoundaryError(errPrepare)
+			}
 			continue
 		}
 		c.auth = preparedAuth
+		if !m.unifiedAuthEligible(routeModel, c.auth.ID) {
+			continue
+		}
 		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth)
 		models, pooled, aliasResult, routing := m.executionModelCandidatesWithAlias(c.auth, routeModel)
 		if len(models) == 0 {
@@ -1484,6 +1494,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			creditsCtx = syncMetadataSessionToContext(creditsCtx, creditsOpts.Metadata)
 			executionSeq := m.nextExecutionSeq()
 			resp, errExec := c.executor.Execute(creditsCtx, c.auth, execReq, creditsOpts)
+			plan.recordCreditsAttempt(creditsCtx, c.auth, errExec)
 			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, RouteModel: routeModel, Success: errExec == nil, Options: creditsOpts, CredentialVersion: c.auth.CredentialVersion, RegistrationEpoch: c.auth.RegistrationEpoch, ExecutionSeq: executionSeq}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
@@ -1494,6 +1505,9 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 					result.CredentialScope = true
 				}
 				m.MarkResult(creditsCtx, result)
+				if !plan.allowsCreditsFallback(creditsCtx, errExec) {
+					return cliproxyexecutor.Response{}, false, unwrapExecutionBoundaryError(errExec)
+				}
 				if result.CredentialScope {
 					break
 				}
@@ -1508,7 +1522,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 	return cliproxyexecutor.Response{}, false, nil
 }
 
-func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, attempted map[string]struct{}) (*cliproxyexecutor.StreamResult, bool, error) {
+func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, attempted map[string]struct{}, plan *routingPlan) (*cliproxyexecutor.StreamResult, bool, error) {
 	if m != nil && m.HomeEnabled() {
 		return nil, false, &Error{Code: "home_fallback_unsupported", Message: "Home does not support Antigravity credits fallback", HTTPStatus: http.StatusServiceUnavailable}
 	}
@@ -1540,9 +1554,16 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		creditsCtx = coreusage.WithSelectionID(creditsCtx, "")
 		preparedAuth, errPrepare := m.prepareRequestAuth(creditsCtx, c.executor, c.auth)
 		if errPrepare != nil {
+			plan.recordCreditsAttempt(creditsCtx, c.auth, errPrepare)
+			if !plan.allowsCreditsFallback(creditsCtx, errPrepare) {
+				return nil, false, unwrapExecutionBoundaryError(errPrepare)
+			}
 			continue
 		}
 		c.auth = preparedAuth
+		if !m.unifiedAuthEligible(routeModel, c.auth.ID) {
+			continue
+		}
 		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth)
 		models, pooled, aliasResult, routing := m.executionModelCandidatesWithAlias(c.auth, routeModel)
 		if len(models) == 0 {
@@ -1550,7 +1571,11 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		}
 		creditsCtx = syncMetadataSessionToContext(creditsCtx, creditsOpts.Metadata)
 		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, "", models, pooled, aliasResult, routing, true, false)
+		plan.recordCreditsAttempt(creditsCtx, c.auth, errStream)
 		if errStream != nil {
+			if !plan.allowsCreditsFallback(creditsCtx, errStream) {
+				return nil, false, unwrapExecutionBoundaryError(errStream)
+			}
 			continue
 		}
 		return result, true, nil

@@ -29,6 +29,7 @@ type RoutingTrace struct {
 type RoutingTraceAttempt struct {
 	Providers      []string `json:"providers"`
 	AuthID         string   `json:"auth_id,omitempty"`
+	Credits        bool     `json:"credits,omitempty"`
 	Success        bool     `json:"success"`
 	HTTPStatus     int      `json:"http_status,omitempty"`
 	Error          string   `json:"error,omitempty"`
@@ -210,4 +211,14 @@ func (p *routingPlan) finishStream(ctx context.Context, result *cliproxyexecutor
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: result.Headers, Chunks: out}
+}
+
+// Credits attempts run after the plain routing round but belong to the same request trace.
+func (p *routingPlan) recordCreditsAttempt(ctx context.Context, auth *Auth, err error) {
+	if p == nil {
+		return
+	}
+	reason := classifyRoutingFailure(ctx, err)
+	p.recordAttempt(routingStep{providers: []string{auth.Provider}, authID: auth.ID}, err, reason, p.allowsFallback(reason))
+	p.trace.Attempts[len(p.trace.Attempts)-1].Credits = true
 }

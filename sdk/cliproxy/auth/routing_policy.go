@@ -68,6 +68,7 @@ type routingPlan struct {
 	steps      []routingStep
 	providers  []string
 	filter     *routingAuthFilter
+	eligible   func(string) bool
 	fallbackOn map[string]struct{}
 	traceLimit int
 	trace      RoutingTrace
@@ -323,6 +324,9 @@ func runRoutingRound[T any](ctx context.Context, plan *routingPlan, providers []
 	var zero T
 	var lastErr error
 	for _, step := range plan.steps {
+		if plan.eligible != nil && !plan.eligible(step.authID) {
+			continue
+		}
 		budget := maxRetryCredentials
 		if maxRetryCredentials > 0 {
 			budget = maxRetryCredentials - len(attempted)
@@ -347,4 +351,11 @@ func runRoutingRound[T any](ctx context.Context, plan *routingPlan, providers []
 		lastErr = &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	return zero, lastErr
+}
+
+func (p *routingPlan) allowsCreditsFallback(ctx context.Context, err error) bool {
+	if isRequestTerminatedError(err) || isRequestStopError(err) || (ctx != nil && ctx.Err() != nil) {
+		return false
+	}
+	return p == nil || p.allowsFallback(classifyRoutingFailure(ctx, err))
 }
