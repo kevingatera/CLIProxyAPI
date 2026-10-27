@@ -424,18 +424,9 @@ func (m *Manager) UnifiedRoutes(model string, now time.Time) []UnifiedRouteStatu
 				}
 			}
 		}
-		if snapshot.fresh(now) {
-			credits, count := 0.0, 0
-			for _, metric := range snapshot.Report.Summary {
-				if metric.Key == "monthlyCredits" || metric.Key == "purchasedCredits" || metric.Key == "freeCredits" {
-					credits += metric.Value
-					count++
-				}
-			}
-			if count == 3 && credits <= 0 {
-				status.Eligible = false
-				status.Reason = "provider credit exhausted"
-			}
+		if snapshot.fresh(now) && unifiedCreditsExhausted(snapshot.Report) {
+			status.Eligible = false
+			status.Reason = "provider credit exhausted"
 		}
 		if status.Eligible && status.QuotaKnown {
 			status.Reason = "fresh provider quota; plan and capacity ranked"
@@ -491,15 +482,31 @@ func (m *Manager) unifiedRoutingPlan(cfg *config.Config, providers []string, mod
 	if cfg.Routing.Policy.Enabled {
 		policy = buildRoutingPlan(cfg.Routing.Policy, providers, model)
 	}
+	// The credits lane serves requests whose free routes are exhausted, so it keeps every
+	// requested provider the policy allows, even when no plain route step survives planning.
+	for _, provider := range providers {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		if policy != nil && !slices.Contains(policy.providers, provider) {
+			continue
+		}
+		if !slices.Contains(plan.creditsProviders, provider) {
+			plan.creditsProviders = append(plan.creditsProviders, provider)
+		}
+	}
 	for _, route := range m.UnifiedRoutes(model, time.Now()) {
 		provider := strings.ToLower(strings.TrimSpace(route.Provider))
-		if _, ok := allowed[provider]; !route.Eligible || !ok {
+		if _, ok := allowed[provider]; !ok {
 			continue
 		}
 		if policy != nil && (!slices.Contains(policy.providers, provider) || !policy.filter.allows(&Auth{ID: route.AuthID, Provider: provider})) {
 			continue
 		}
+		// Every route member stays in the filter, so the credits lane can reach members that are only
+		// temporarily ineligible for plain steps. Plain steps are pinned and rechecked on each attempt.
 		plan.filter.allowOnly[provider][route.AuthID] = struct{}{}
+		if !route.Eligible {
+			continue
+		}
 		plan.steps = append(plan.steps, routingStep{providers: []string{provider}, authID: route.AuthID})
 		if !slices.Contains(plan.providers, provider) {
 			plan.providers = append(plan.providers, provider)
@@ -528,8 +535,7 @@ func (m *Manager) wakeUnifiedRouting() {
 	}
 }
 
-// unifiedAuthEligible rechecks local quota and cooldown state without holding the auth lock.
-// Legacy credits routes intentionally retain their separate cooldown bypass.
+// unifiedAuthEligible rechecks local quota and cooldown state for plain route steps without holding the auth lock.
 func (m *Manager) unifiedAuthEligible(model, authID string) bool {
 	cfg, _ := m.runtimeConfig.Load().(*config.Config)
 	if cfg == nil || cfg.Routing.UnifiedModels.Find(thinking.ParseSuffix(model).ModelName) == nil {
@@ -541,4 +547,42 @@ func (m *Manager) unifiedAuthEligible(model, authID string) bool {
 		}
 	}
 	return false
+}
+
+// unifiedCreditsEligible decides whether a credential may serve the credits lane for a unified model.
+// Cooldown and an exhausted plan allowance are the conditions the lane exists to get past, so they do not
+// exclude here. Disabled credentials, missing executors, credentials the model does not route to, and
+// credentials whose AI credits are exhausted do.
+func (m *Manager) unifiedCreditsEligible(model, authID string) bool {
+	cfg, _ := m.runtimeConfig.Load().(*config.Config)
+	if cfg == nil || cfg.Routing.UnifiedModels.Find(thinking.ParseSuffix(model).ModelName) == nil {
+		return true
+	}
+	auth, ok := m.GetByID(authID)
+	if !ok || auth.Disabled {
+		return false
+	}
+	if _, ok := m.Executor(auth.Provider); !ok {
+		return false
+	}
+	if unifiedRouteForAuth(cfg, auth, model) == nil {
+		return false
+	}
+	now := time.Now()
+	m.unifiedMu.Lock()
+	snapshot := m.unifiedQuota[auth.ID]
+	m.unifiedMu.Unlock()
+	return !(snapshot.fresh(now) && unifiedCreditsExhausted(snapshot.Report))
+}
+
+// unifiedCreditsExhausted reports a report whose three AI credit pools are all empty.
+func unifiedCreditsExhausted(report pluginapi.QuotaFetchResponse) bool {
+	credits, count := 0.0, 0
+	for _, metric := range report.Summary {
+		if metric.Key == "monthlyCredits" || metric.Key == "purchasedCredits" || metric.Key == "freeCredits" {
+			credits += metric.Value
+			count++
+		}
+	}
+	return count == 3 && credits <= 0
 }

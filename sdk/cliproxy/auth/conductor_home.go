@@ -1332,7 +1332,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 	var known []creditsCandidateEntry
 	var unknown []creditsCandidateEntry
 	for _, candidate := range candidates {
-		if !m.unifiedAuthEligible(routeModel, candidate.auth.ID) {
+		if !m.unifiedCreditsEligible(routeModel, candidate.auth.ID) {
 			continue
 		}
 		hint, okHint, errHint := GetAntigravityCreditsHintRequired(ctx, candidate.auth.ID)
@@ -1473,13 +1473,13 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		preparedAuth, errPrepare := m.prepareRequestAuth(creditsCtx, c.executor, c.auth)
 		if errPrepare != nil {
 			plan.recordCreditsAttempt(creditsCtx, c.auth, errPrepare)
-			if !plan.allowsCreditsFallback(creditsCtx, errPrepare) {
+			if creditsSweepTerminal(errPrepare) {
 				return cliproxyexecutor.Response{}, false, unwrapExecutionBoundaryError(errPrepare)
 			}
 			continue
 		}
 		c.auth = preparedAuth
-		if !m.unifiedAuthEligible(routeModel, c.auth.ID) {
+		if !m.unifiedCreditsEligible(routeModel, c.auth.ID) {
 			continue
 		}
 		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth)
@@ -1505,7 +1505,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 					result.CredentialScope = true
 				}
 				m.MarkResult(creditsCtx, result)
-				if !plan.allowsCreditsFallback(creditsCtx, errExec) {
+				if creditsSweepTerminal(errExec) {
 					return cliproxyexecutor.Response{}, false, unwrapExecutionBoundaryError(errExec)
 				}
 				if result.CredentialScope {
@@ -1555,13 +1555,13 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		preparedAuth, errPrepare := m.prepareRequestAuth(creditsCtx, c.executor, c.auth)
 		if errPrepare != nil {
 			plan.recordCreditsAttempt(creditsCtx, c.auth, errPrepare)
-			if !plan.allowsCreditsFallback(creditsCtx, errPrepare) {
+			if creditsSweepTerminal(errPrepare) {
 				return nil, false, unwrapExecutionBoundaryError(errPrepare)
 			}
 			continue
 		}
 		c.auth = preparedAuth
-		if !m.unifiedAuthEligible(routeModel, c.auth.ID) {
+		if !m.unifiedCreditsEligible(routeModel, c.auth.ID) {
 			continue
 		}
 		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth)
@@ -1573,14 +1573,32 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, "", models, pooled, aliasResult, routing, true, false)
 		plan.recordCreditsAttempt(creditsCtx, c.auth, errStream)
 		if errStream != nil {
-			if !plan.allowsCreditsFallback(creditsCtx, errStream) {
-				return nil, false, unwrapExecutionBoundaryError(errStream)
+			if creditsSweepTerminal(errStream) {
+				// Keep the raw error: the bootstrap wrapper carries the upstream headers to the client.
+				return nil, false, errStream
 			}
 			continue
 		}
 		return result, true, nil
 	}
 	return nil, false, nil
+}
+
+// creditsSweepTerminal reports errors that end the credits sweep for every candidate. The request
+// itself was stopped or terminated; any other failure belongs to one credential and the sweep moves on.
+func creditsSweepTerminal(err error) bool {
+	return isRequestTerminatedError(err) || isRequestStopError(err)
+}
+
+// creditsTerminalStreamResult hands a terminal credits error back as a stream result when it wraps a
+// bootstrap failure, so the client still receives the upstream response headers.
+func creditsTerminalStreamResult(err error) (*cliproxyexecutor.StreamResult, error) {
+	err = unwrapExecutionBoundaryError(err)
+	var bootstrapErr *streamBootstrapError
+	if errors.As(err, &bootstrapErr) && bootstrapErr != nil {
+		return streamErrorResult(bootstrapErr.Headers(), err), nil
+	}
+	return nil, err
 }
 
 func antigravityCreditsKVUnavailableError(cause error) error {
