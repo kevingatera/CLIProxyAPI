@@ -155,17 +155,6 @@ func containsFallbackTrigger(set map[string]struct{}, trigger string) bool {
 	return ok
 }
 
-func cloneMetadataMap(meta map[string]any) map[string]any {
-	if len(meta) == 0 {
-		return nil
-	}
-	out := make(map[string]any, len(meta))
-	for key, value := range meta {
-		out[key] = value
-	}
-	return out
-}
-
 func (m *Manager) setRoutingTraceLimitFromConfig(cfg *internalconfig.Config) {
 	limit := defaultRoutingTraceLimit
 	if cfg != nil {
