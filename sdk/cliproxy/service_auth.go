@@ -30,7 +30,6 @@ func newDefaultAuthManager() *sdkAuth.Manager {
 		sdkAuth.NewXAIAuthenticator(),
 		sdkAuth.NewDevinAuthenticator(),
 		sdkAuth.NewMetaAuthenticator(),
-		sdkAuth.NewCursorAuthenticator(),
 	)
 }
 
@@ -720,9 +719,6 @@ func resolveCooldownStateAuthDir(cfg *config.Config) (string, error) {
 
 func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName string, ok bool) {
 	if a == nil {
-		return "", "", false
-	}
-	if strings.EqualFold(strings.TrimSpace(a.Provider), "cursor") {
 		return "", "", false
 	}
 	if len(a.Attributes) > 0 {
