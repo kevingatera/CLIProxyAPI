@@ -106,21 +106,34 @@ func (h *Handler) CollectAllowances(c *gin.Context) {
 	c.JSON(http.StatusOK, snapshot)
 }
 
-func (h *Handler) refreshAllowanceService(ctx context.Context) bool {
+// refreshAllowanceService records each fresh account from the service snapshot with its own expiry.
+// Credentials it does not cover are left for the native refresh.
+func (h *Handler) refreshAllowanceService(ctx context.Context) {
 	h.mu.Lock()
 	cfg := h.cfg.Routing.Allowances
 	h.mu.Unlock()
 	if cfg.ServiceURL == "" || len(cfg.ServiceKey) < 32 || h.authManager == nil {
-		return false
+		return
 	}
 	snapshot, err := capacity.Fetch(ctx, &http.Client{}, cfg.ServiceURL, cfg.ServiceKey)
 	if err != nil {
-		return false
+		return
 	}
-	auths := h.authManager.List()
-	now := time.Now()
+	observeAllowanceSnapshot(h.authManager, snapshot, time.Now())
+}
+
+func observeAllowanceSnapshot(manager *coreauth.Manager, snapshot capacity.Snapshot, now time.Time) {
+	byIndex := map[string]*coreauth.Auth{}
+	for _, a := range manager.List() {
+		a.EnsureIndex()
+		byIndex[a.Index] = a
+	}
 	for _, account := range snapshot.Accounts {
-		if account.Status != "ok" || !account.ExpiresAt.After(now) {
+		expires := account.ExpiresAt
+		if !snapshot.ExpiresAt.IsZero() && snapshot.ExpiresAt.Before(expires) {
+			expires = snapshot.ExpiresAt
+		}
+		if account.Status != "ok" || !expires.After(now) || account.ObservedAt.After(now) {
 			continue
 		}
 		data, marshalErr := json.Marshal(account.Report)
@@ -131,17 +144,12 @@ func (h *Handler) refreshAllowanceService(ctx context.Context) bool {
 		if json.Unmarshal(data, &report) != nil {
 			continue
 		}
-		for _, a := range auths {
-			a.EnsureIndex()
-			for _, index := range account.CredentialIndexes {
-				if a.Index == index {
-					h.authManager.ObserveUnifiedQuota(a.ID, report, account.ObservedAt)
-					break
-				}
+		for _, index := range account.CredentialIndexes {
+			if a := byIndex[index]; a != nil {
+				manager.ObserveUnifiedQuotaUntil(a.ID, report, account.ObservedAt, expires)
 			}
 		}
 	}
-	return len(snapshot.Accounts) > 0
 }
 
 func sameNativeAccount(a, b *coreauth.Auth) bool {

@@ -2,9 +2,11 @@ package cliproxy
 
 import (
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/diff"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -70,6 +72,15 @@ type modelRegistrationFence struct {
 	disabled                  bool
 	authKind                  string
 	attributes                map[string]string
+	// unifiedModels and subscriptionActive shape unified aliases. A change to either
+	// before publication supersedes the computation, like a changed exclusion.
+	unifiedModels      internalconfig.UnifiedModels
+	subscriptionActive bool
+}
+
+func subscriptionActive(a *coreauth.Auth) bool {
+	active, _ := a.Metadata["is_subs_active"].(bool)
+	return active
 }
 
 func newModelRegistrationFence(a *coreauth.Auth, cfg *config.Config) modelRegistrationFence {
@@ -85,8 +96,12 @@ func newModelRegistrationFence(a *coreauth.Auth, cfg *config.Config) modelRegist
 			exclusions[provider] = diff.SummarizeExcludedModels(rules)
 		}
 	}
+	var unified internalconfig.UnifiedModels
+	if cfg != nil {
+		unified = cfg.Routing.UnifiedModels
+	}
 	if a == nil {
-		return modelRegistrationFence{globalExclusions: exclusions, globalExcludedModels: globalExcluded, globalExcludedSummary: globalSummary}
+		return modelRegistrationFence{globalExclusions: exclusions, globalExcludedModels: globalExcluded, globalExcludedSummary: globalSummary, unifiedModels: unified}
 	}
 	provider := strings.ToLower(strings.TrimSpace(a.Provider))
 	if _, _, compat := openAICompatInfoFromAuth(a); compat {
@@ -104,6 +119,8 @@ func newModelRegistrationFence(a *coreauth.Auth, cfg *config.Config) modelRegist
 		disabled:              a.Disabled || a.Status == coreauth.StatusDisabled,
 		authKind:              a.AuthKind(),
 		attributes:            maps.Clone(a.Attributes),
+		unifiedModels:         unified,
+		subscriptionActive:    subscriptionActive(a),
 	}
 }
 
@@ -120,6 +137,7 @@ func (f modelRegistrationFence) withAuth(a *coreauth.Auth) modelRegistrationFenc
 	next.globalExcludedSummary = f.globalExcludedSummary
 	next.fallbackExclusionProvider = f.fallbackExclusionProvider
 	next.registryEpoch = f.registryEpoch
+	next.unifiedModels = f.unifiedModels
 	return next
 }
 
@@ -140,16 +158,28 @@ func (f modelRegistrationFence) publishIfCurrent(s *Service, authID string, publ
 		if s == nil || f.disabled {
 			return publish()
 		}
-		// Hold cfgMu through registry publication, not just the comparison.
+		// Read the subscription flag before cfgMu so the manager lock is never taken inside it.
+		subscriptionNow := f.subscriptionActive
+		if s.coreManager != nil {
+			if current, ok := s.coreManager.GetByID(authID); ok && current != nil {
+				subscriptionNow = subscriptionActive(current)
+			}
+		}
 		s.cfgMu.RLock()
 		defer s.cfgMu.RUnlock()
+		// Hold cfgMu through registry publication, not just the comparison.
 		// global-excluded-models applies to every auth kind and is not overridden
 		// by credential-level exclusions, so it is checked unconditionally.
 		var currentGlobal []string
+		var currentUnified internalconfig.UnifiedModels
 		if s.cfg != nil {
 			currentGlobal = s.cfg.GlobalExcludedModels
+			currentUnified = s.cfg.Routing.UnifiedModels
 		}
 		if f.globalExcludedSummary != diff.SummarizeExcludedModels(currentGlobal) {
+			return false
+		}
+		if !reflect.DeepEqual(currentUnified, f.unifiedModels) || subscriptionNow != f.subscriptionActive {
 			return false
 		}
 		if f.authKind != coreauth.AuthKindAPIKey && strings.TrimSpace(f.attributes["excluded_models"]) == "" {

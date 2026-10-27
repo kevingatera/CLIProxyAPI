@@ -123,6 +123,9 @@ func (h *Handler) FetchCredentialQuotaV8(c *gin.Context) {
 	report, handled, err := h.fetchPluginQuota(ctx, a, body.PluginID, body.Provider)
 	if !handled {
 		report, handled, err = h.fetchNativeQuota(ctx, a)
+		if handled && err == nil {
+			h.observeNativeQuota(a, report)
+		}
 	}
 	switch {
 	case !handled:
@@ -132,15 +135,35 @@ func (h *Handler) FetchCredentialQuotaV8(c *gin.Context) {
 	case err != nil:
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 	default:
-		if h.authManager != nil {
-			for _, peer := range h.authManager.List() {
-				if sameNativeAccount(a, peer) {
-					h.authManager.ObserveUnifiedQuota(peer.ID, report, time.Now())
-				}
-			}
-		}
 		c.JSON(http.StatusOK, report)
 	}
+}
+
+// observeNativeQuota feeds a native report to every credential that shares the same account.
+func (h *Handler) observeNativeQuota(a *coreauth.Auth, report pluginapi.QuotaFetchResponse) {
+	if h.authManager == nil {
+		return
+	}
+	for _, peer := range h.authManager.List() {
+		if sameNativeAccount(a, peer) {
+			h.authManager.ObserveUnifiedQuota(peer.ID, report, time.Now())
+		}
+	}
+}
+
+// unifiedQuotaFetch adapts the built-in adapters to the routing refresh. An unsupported account is an
+// error here, so it never becomes an empty report.
+func (h *Handler) unifiedQuotaFetch(ctx context.Context, a *coreauth.Auth) (pluginapi.QuotaFetchResponse, error) {
+	// Shared plugin dispatch goes first, as in the management quota endpoint, so plugin-only
+	// credentials refresh even when no built-in adapter matches.
+	if report, handled, err := h.fetchPluginQuota(ctx, a, "", ""); handled || err != nil {
+		return report, err
+	}
+	report, handled, err := h.fetchNativeQuota(ctx, a)
+	if err == nil && !handled {
+		return report, errors.New(nativeQuotaUnsupported)
+	}
+	return report, err
 }
 
 // fetchNativeQuota reports handled=false when no built-in adapter matches the credential.

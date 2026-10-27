@@ -3,6 +3,8 @@ package management
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -58,5 +60,52 @@ func TestSharedNativeAccountMatchesOnlySameProviderAndKey(t *testing.T) {
 	b.Attributes["base_url"] = "https://api.kimi.com/coding/v1"
 	if sameNativeAccount(a, b) {
 		t.Fatal("provider scopes conflated")
+	}
+}
+
+// The v8 config route reads raw YAML, so secrets must be hidden there, not only by json:"-".
+func TestConfigV8KeepsAllowanceSecretsPrivate(t *testing.T) {
+	const collector = "synthetic-collector-token-at-least-32-characters"
+	const reader = "synthetic-service-reader-token-at-least-32-chars"
+	const serviceURL = "http://allowance.example.invalid/v1/allowances"
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	initial := "port: 8317\nrouting:\n  strategy: round-robin\n  allowances:\n    collector-key: " + collector +
+		"\n    service-key: " + reader + "\n    service-url: " + serviceURL + "\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(&config.Config{}, path, coreauth.NewManager(nil, nil, nil))
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/v8/management/config", h.ConfigV8)
+	router.PUT("/v8/management/config/*path", h.ConfigV8)
+
+	get := httptest.NewRecorder()
+	router.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/v8/management/config", nil))
+	if get.Code != http.StatusOK {
+		t.Fatalf("GET status=%d body=%s", get.Code, get.Body.String())
+	}
+	for _, secret := range []string{collector, reader, serviceURL} {
+		if strings.Contains(get.Body.String(), secret) {
+			t.Fatal("v8 config read exposed a private allowance value")
+		}
+	}
+
+	// A JSON write that replaces routing without the allowance block keeps the stored secrets.
+	put := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/v8/management/config/routing", strings.NewReader(`{"strategy":"fill-first"}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(put, req)
+	if put.Code != http.StatusOK {
+		t.Fatalf("PUT status=%d body=%s", put.Code, put.Body.String())
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{collector, reader, serviceURL} {
+		if !strings.Contains(string(saved), secret) {
+			t.Fatal("JSON write dropped a stored allowance value")
+		}
 	}
 }
