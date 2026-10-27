@@ -25,6 +25,9 @@ type creditsRoutingExecutor struct {
 	prepareErrors   map[string]error
 	creditsErrors   map[string]error
 	streamTailError error
+	// creditsBootstrap makes a credits stream fail at bootstrap, with creditsHeaders on the stream result.
+	creditsBootstrap map[string]error
+	creditsHeaders   http.Header
 }
 
 func (e *creditsRoutingExecutor) execute(ctx context.Context, a *Auth) error {
@@ -53,6 +56,13 @@ func (e *creditsRoutingExecutor) Execute(ctx context.Context, a *Auth, _ cliprox
 }
 
 func (e *creditsRoutingExecutor) ExecuteStream(ctx context.Context, a *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	if errBootstrap, ok := e.creditsBootstrap[a.ID]; ok && AntigravityCreditsRequested(ctx) {
+		e.record(ctx, a)
+		chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+		chunks <- cliproxyexecutor.StreamChunk{Err: errBootstrap}
+		close(chunks)
+		return &cliproxyexecutor.StreamResult{Headers: e.creditsHeaders, Chunks: chunks}, nil
+	}
 	if err := e.execute(ctx, a); err != nil {
 		return nil, err
 	}
@@ -455,6 +465,216 @@ func TestUnifiedCreditsCandidatesSkipIneligibleBeforeHintLookup(t *testing.T) {
 	if len(candidates) != 0 {
 		t.Fatalf("candidates = %d, want 0", len(candidates))
 	}
+}
+
+// creditsStatusError is an upstream rejection with a status and a Retry-After hint.
+type creditsStatusError struct {
+	status     int
+	msg        string
+	retryAfter time.Duration
+}
+
+func (e creditsStatusError) Error() string              { return e.msg }
+func (e creditsStatusError) StatusCode() int            { return e.status }
+func (e creditsStatusError) RetryAfter() *time.Duration { return &e.retryAfter }
+
+// Plain round never reaches upstream (no candidate), so the credits attempt's own failure is the answer.
+func TestUnifiedCreditsFailureReplacesSyntheticPlainError(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+			t.Run(fmt.Sprintf("stream=%t/status=%d", stream, status), func(t *testing.T) {
+				m, e, model := newUnifiedCreditsRoutingManager(t, internalconfig.RoutingPolicy{Enabled: true})
+				disableUnifiedAuth(m, "alpha")
+				now := time.Now()
+				m.ObserveUnifiedQuota("beta", reportUnified(0, now.Add(time.Hour)), now)
+				e.creditsErrors = map[string]error{"beta": creditsStatusError{status: status, msg: "credits rejected", retryAfter: 37 * time.Second}}
+				headers, err := creditsRequestHeaders(t, m, model, stream)
+				if err == nil {
+					t.Fatal("request succeeded with the only credential rejected")
+				}
+				if got := statusCodeFromError(err); got != status {
+					t.Fatalf("status = %d, want the credits failure status %d (err=%v)", got, status, err)
+				}
+				if got := headers.Get("Retry-After"); got != "37" {
+					t.Fatalf("Retry-After = %q, want 37 from the credits failure (err=%v)", got, err)
+				}
+				if got := fmt.Sprint(e.snapshot()); got != "[beta:credits]" {
+					t.Fatalf("calls = %s, want [beta:credits]", got)
+				}
+				traces := m.ListRoutingTraces(10, "", "antigravity", false)
+				if len(traces) != 1 || traces[0].FinalStatus != "failed" || len(traces[0].Attempts) != 1 {
+					t.Fatalf("traces = %+v, want one failed credits-only trace", traces)
+				}
+				if attempt := traces[0].Attempts[0]; !attempt.Credits || attempt.Success || attempt.HTTPStatus != status {
+					t.Fatalf("attempt = %+v, want a failed credits attempt with status %d", attempt, status)
+				}
+			})
+		}
+	}
+}
+
+// Credits-only requests have no plain provider, so the trace names the credits provider for filtering.
+func TestUnifiedCreditsOnlyTraceNamesProvider(t *testing.T) {
+	m, _, model := newUnifiedCreditsRoutingManager(t, internalconfig.RoutingPolicy{Enabled: true})
+	disableUnifiedAuth(m, "alpha")
+	now := time.Now()
+	m.ObserveUnifiedQuota("beta", reportUnified(0, now.Add(time.Hour)), now)
+	if err := runCreditsRoutingRequest(t, m, model, false); err != nil {
+		t.Fatal(err)
+	}
+	traces := m.ListRoutingTraces(10, "", "antigravity", false)
+	if len(traces) != 1 {
+		t.Fatalf("provider-filtered traces = %+v, want the credits-only trace", traces)
+	}
+	if got := fmt.Sprint(traces[0].Providers); got != "[antigravity]" {
+		t.Fatalf("trace providers = %s, want [antigravity]", got)
+	}
+}
+
+// A credits stream bootstrap error keeps the headers the upstream sent, both when it is the final error and
+// when a terminal credits error ends the sweep.
+func TestUnifiedCreditsStreamBootstrapKeepsHeaders(t *testing.T) {
+	headers := http.Header{"Retry-After": []string{"37"}}
+	t.Run("final credits bootstrap failure", func(t *testing.T) {
+		m, e, model := newUnifiedCreditsRoutingManager(t, internalconfig.RoutingPolicy{Enabled: true})
+		disableUnifiedAuth(m, "alpha")
+		now := time.Now()
+		m.ObserveUnifiedQuota("beta", reportUnified(0, now.Add(time.Hour)), now)
+		e.creditsBootstrap = map[string]error{"beta": creditsStatusError{status: http.StatusTooManyRequests, msg: "credits rejected", retryAfter: 37 * time.Second}}
+		e.creditsHeaders = headers
+		got, err := creditsRequestHeaders(t, m, model, true)
+		if err == nil {
+			t.Fatal("stream succeeded with the only credential rejected at bootstrap")
+		}
+		if got.Get("Retry-After") != "37" {
+			t.Fatalf("stream Retry-After = %q, want 37 from the credits bootstrap (err=%v)", got.Get("Retry-After"), err)
+		}
+		if statusCodeFromError(err) != http.StatusTooManyRequests {
+			t.Fatalf("status = %d, want 429 (err=%v)", statusCodeFromError(err), err)
+		}
+	})
+	t.Run("terminal credits bootstrap failure", func(t *testing.T) {
+		m, e, model := newUnifiedCreditsRoutingManager(t, internalconfig.RoutingPolicy{Enabled: true})
+		e.plainStatus = http.StatusTooManyRequests
+		e.creditsBootstrap = map[string]error{"alpha": &cliproxyexecutor.RequestTerminatedError{HTTPStatus: http.StatusForbidden, Body: []byte("stopped")}}
+		e.creditsHeaders = headers
+		got, err := creditsRequestHeaders(t, m, model, true)
+		var terminated *cliproxyexecutor.RequestTerminatedError
+		if !errors.As(err, &terminated) {
+			t.Fatalf("error = %v, want the request termination", err)
+		}
+		if got.Get("Retry-After") != "37" {
+			t.Fatalf("stream Retry-After = %q, want 37 from the terminated bootstrap", got.Get("Retry-After"))
+		}
+		if calls := fmt.Sprint(e.snapshot()); calls != "[alpha:plain beta:plain alpha:credits]" {
+			t.Fatalf("calls = %s, want the sweep to stop after alpha", calls)
+		}
+	})
+}
+
+// A credential in the terminal unauthorized state (a refresh failed with 401 or invalid_grant) gets no credits
+// attempts, while cooldown from a plain 429 on the other credential still does not exclude it from credits.
+func TestUnifiedCreditsSkipsTerminallyRejectedCredential(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			m, e, model := newUnifiedCreditsRoutingManager(t, internalconfig.RoutingPolicy{Enabled: true})
+			e.plainStatus = http.StatusTooManyRequests
+			markUnifiedAuthTerminal(m, "alpha")
+			if err := runCreditsRoutingRequest(t, m, model, stream); err != nil {
+				t.Fatal(err)
+			}
+			if got := fmt.Sprint(e.snapshot()); got != "[beta:plain beta:credits]" {
+				t.Fatalf("calls = %s, want [beta:plain beta:credits]", got)
+			}
+		})
+	}
+}
+
+// Requests race the moment a credential becomes terminally rejected. Once the wave settles, no later request
+// may reach that credential's credits lane, and the untouched credential keeps serving.
+func TestUnifiedCreditsConcurrentTerminalRejection(t *testing.T) {
+	m, e, model := newUnifiedCreditsRoutingManager(t, internalconfig.RoutingPolicy{Enabled: true})
+	e.plainStatus = http.StatusTooManyRequests
+	e.creditsErrors = map[string]error{"alpha": &Error{HTTPStatus: http.StatusUnauthorized, Message: "invalid credential"}}
+	const requests = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, requests)
+	for i := 0; i < requests; i++ {
+		wg.Add(1)
+		go func(stream bool) {
+			defer wg.Done()
+			errs <- runCreditsRoutingRequest(t, m, model, stream)
+		}(i%2 == 0)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		markUnifiedAuthTerminal(m, "alpha")
+	}()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent request failed: %v", err)
+		}
+	}
+	// A credits 401 can re-mark alpha after the terminal write, so the final state is set once the wave has settled.
+	markUnifiedAuthTerminal(m, "alpha")
+	before := len(e.snapshot())
+	if err := runCreditsRoutingRequest(t, m, model, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(e.snapshot()[before:]); got != "[beta:plain beta:credits]" {
+		t.Fatalf("post-wave calls = %s, want [beta:plain beta:credits]", got)
+	}
+}
+
+// An antigravity credential that the unified model does not route to never enters the credits lane, even
+// when the request's plan filter is absent.
+func TestUnifiedCreditsExcludesUnroutedCredential(t *testing.T) {
+	m, e, model := newUnifiedCreditsRoutingManager(t, internalconfig.RoutingPolicy{Enabled: true})
+	registerRetryRoundLocalAuths(t, m, "antigravity", "claude-other-source", map[string]int{"gamma": 0})
+	candidates, err := m.findAllAntigravityCreditsCandidateAuths(context.Background(), model, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range candidates {
+		if candidate.auth.ID == "gamma" {
+			t.Fatalf("unrouted credential gamma offered to credits: %+v", candidates)
+		}
+	}
+	disableUnifiedAuth(m, "alpha")
+	now := time.Now()
+	m.ObserveUnifiedQuota("beta", reportUnified(0, now.Add(time.Hour)), now)
+	if err := runCreditsRoutingRequest(t, m, model, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(e.snapshot()); got != "[beta:credits]" {
+		t.Fatalf("calls = %s, want [beta:credits]", got)
+	}
+}
+
+// markUnifiedAuthTerminal puts an auth in the terminal unauthorized state: a refresh failed with 401 after a
+// credits rejection, so no refresh is pending and the credential is not retried.
+func markUnifiedAuthTerminal(m *Manager, authID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	auth := m.auths[authID]
+	auth.Unavailable = true
+	auth.Status = StatusError
+	auth.LastError = &Error{Code: "unauthorized", HTTPStatus: http.StatusUnauthorized, Message: "invalid credential"}
+	auth.NextRetryAfter = time.Time{}
+	auth.NextRefreshAfter = time.Time{}
+}
+
+// unifiedAuthTerminallyRejected reports whether the auth carries the terminal unauthorized state.
+func unifiedAuthTerminallyRejected(t *testing.T, m *Manager, authID string) bool {
+	t.Helper()
+	auth, ok := m.GetByID(authID)
+	if !ok {
+		t.Fatalf("auth %s missing", authID)
+	}
+	return hasUnauthorizedAuthFailure(auth)
 }
 
 func TestCreditsFallbackTracesEveryCandidate(t *testing.T) {

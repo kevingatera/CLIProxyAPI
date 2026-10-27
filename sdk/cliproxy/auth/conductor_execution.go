@@ -179,11 +179,13 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		lastErr = unwrapExecutionBoundaryError(lastErr)
 		creditsProviders := plan.creditsFallbackProviders(normalized)
 		if plan.allowsCreditsFallback(ctx, lastErr) && hasAntigravityProvider(creditsProviders) && shouldAttemptAntigravityCreditsFallback(m, lastErr, creditsProviders) {
-			if resp, ok, errCredits := m.tryAntigravityCreditsExecute(ctx, req, opts, lastRoundAttempted, plan); errCredits != nil {
+			var creditsErr error
+			if resp, ok, errCredits := m.tryAntigravityCreditsExecute(ctx, req, opts, lastRoundAttempted, plan, &creditsErr); errCredits != nil {
 				return cliproxyexecutor.Response{}, errCredits
 			} else if ok {
 				return resp, nil
 			}
+			lastErr = preferCreditsAttemptError(lastErr, creditsErr)
 		}
 		return cliproxyexecutor.Response{}, lastErr
 	}
@@ -342,11 +344,13 @@ func (m *Manager) executeStream(ctx context.Context, normalized []string, req cl
 		lastErr = unwrapExecutionBoundaryError(lastErr)
 		creditsProviders := plan.creditsFallbackProviders(normalized)
 		if plan.allowsCreditsFallback(ctx, lastErr) && hasAntigravityProvider(creditsProviders) && shouldAttemptAntigravityCreditsFallback(m, lastErr, creditsProviders) {
-			if result, ok, errCredits := m.tryAntigravityCreditsExecuteStream(ctx, req, opts, lastRoundAttempted, plan); errCredits != nil {
+			var creditsErr error
+			if result, ok, errCredits := m.tryAntigravityCreditsExecuteStream(ctx, req, opts, lastRoundAttempted, plan, &creditsErr); errCredits != nil {
 				return creditsTerminalStreamResult(errCredits)
 			} else if ok {
 				return result, nil
 			}
+			lastErr = preferCreditsAttemptError(lastErr, creditsErr)
 		}
 		var bootstrapErr *streamBootstrapError
 		if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {

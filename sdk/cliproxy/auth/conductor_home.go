@@ -1440,7 +1440,7 @@ func (b *creditsAttemptBudget) allow(authID string) bool {
 	return true
 }
 
-func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, attempted map[string]struct{}, plan *routingPlan) (cliproxyexecutor.Response, bool, error) {
+func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, attempted map[string]struct{}, plan *routingPlan, lastFailure *error) (cliproxyexecutor.Response, bool, error) {
 	if m != nil && m.HomeEnabled() {
 		return cliproxyexecutor.Response{}, false, &Error{Code: "home_fallback_unsupported", Message: "Home does not support Antigravity credits fallback", HTTPStatus: http.StatusServiceUnavailable}
 	}
@@ -1505,6 +1505,9 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 					result.CredentialScope = true
 				}
 				m.MarkResult(creditsCtx, result)
+				// Same trusted Retry-After annotation as the plain path, so the client sees the credits hint.
+				errExec = annotateTrustedRetryAfterByHint(errExec)
+				*lastFailure = markUpstreamExecutionAttempt(errExec)
 				if creditsSweepTerminal(errExec) {
 					return cliproxyexecutor.Response{}, false, unwrapExecutionBoundaryError(errExec)
 				}
@@ -1522,7 +1525,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 	return cliproxyexecutor.Response{}, false, nil
 }
 
-func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, attempted map[string]struct{}, plan *routingPlan) (*cliproxyexecutor.StreamResult, bool, error) {
+func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, attempted map[string]struct{}, plan *routingPlan, lastFailure *error) (*cliproxyexecutor.StreamResult, bool, error) {
 	if m != nil && m.HomeEnabled() {
 		return nil, false, &Error{Code: "home_fallback_unsupported", Message: "Home does not support Antigravity credits fallback", HTTPStatus: http.StatusServiceUnavailable}
 	}
@@ -1573,6 +1576,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, "", models, pooled, aliasResult, routing, true, false)
 		plan.recordCreditsAttempt(creditsCtx, c.auth, errStream)
 		if errStream != nil {
+			*lastFailure = markUpstreamExecutionAttempt(errStream)
 			if creditsSweepTerminal(errStream) {
 				// Keep the raw error: the bootstrap wrapper carries the upstream headers to the client.
 				return nil, false, errStream
@@ -1582,6 +1586,33 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		return result, true, nil
 	}
 	return nil, false, nil
+}
+
+// preferCreditsAttemptError chooses the error for a failed request after the credits sweep. A plain failure
+// that is only a synthetic "no candidate" or cooldown answer, with no upstream attempt, yields to a credits
+// failure that did reach upstream, which keeps its status and Retry-After. Any other plain failure is kept.
+func preferCreditsAttemptError(plainErr, creditsErr error) error {
+	if creditsErr == nil || hasUpstreamExecutionAttempt(plainErr) || !isSyntheticPlainFailure(plainErr) {
+		return plainErr
+	}
+	return unwrapExecutionBoundaryError(creditsErr)
+}
+
+// isSyntheticPlainFailure reports the plain round's no-candidate and cooldown answers, which are produced
+// without contacting upstream.
+func isSyntheticPlainFailure(err error) bool {
+	var cooldown *modelCooldownError
+	if errors.As(err, &cooldown) {
+		return true
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil {
+		switch authErr.Code {
+		case "auth_not_found", "auth_unavailable", "executor_not_found":
+			return true
+		}
+	}
+	return false
 }
 
 // creditsSweepTerminal reports errors that end the credits sweep for every candidate. The request
