@@ -27,7 +27,7 @@ func TestUnifiedSubscriptionRouteRequiresActiveOAuth(t *testing.T) {
 
 func TestUnifiedSubscriptionExpiryCannotExecuteCachedModel(t *testing.T) {
 	m := NewManager(nil, nil, nil)
-	e := &unifiedTestExecutor{routingPolicyTestExecutor: routingPolicyTestExecutor{id: "meta"}}
+	e := &unifiedTestExecutor{routingPolicyTestExecutor: routingPolicyTestExecutor{provider: "meta"}}
 	m.RegisterExecutor(e)
 	cfg := &config.Config{}
 	cfg.Routing.UnifiedModels = config.UnifiedModels{Enabled: true, Models: []config.UnifiedModel{{ID: "muse-spark-test", Routes: []config.UnifiedModelRoute{{Provider: "meta", AuthKind: "oauth", SubscriptionOnly: true, Source: "muse-spark-test", Model: "muse-spark-test", Plan: "included"}}}}}

@@ -483,9 +483,9 @@ func (s *Service) registerResolvedModelsForAuthFenced(a *coreauth.Auth, fence mo
 			return s.unregisterModelsForAuthFenced(a, fence)
 		}
 	}
-	if s.cfg != nil && s.cfg.Routing.UnifiedModels.Enabled {
+	if fence.unifiedModels.Enabled {
 		originals := append([]*ModelInfo(nil), normalizedModels...)
-		for _, unified := range s.cfg.Routing.UnifiedModels.Models {
+		for _, unified := range fence.unifiedModels.Models {
 			for _, route := range unified.Routes {
 				if !coreauth.MatchesUnifiedRoute(route, a) {
 					continue
@@ -495,7 +495,7 @@ func (s *Service) registerResolvedModelsForAuthFenced(a *coreauth.Auth, fence mo
 						continue
 					}
 					clone := *source
-					clone.ID = s.cfg.Routing.UnifiedModels.PublicID(unified.ID)
+					clone.ID = fence.unifiedModels.PublicID(unified.ID)
 					clone.OwnedBy = "cliproxy"
 					clone.DisplayName = unified.ID
 					if unified.ContextLength > 0 {

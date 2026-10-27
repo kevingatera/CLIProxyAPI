@@ -11,7 +11,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -21,8 +20,18 @@ const unifiedQuotaFreshness = 10 * time.Minute
 type unifiedQuotaSnapshot struct {
 	Report    pluginapi.QuotaFetchResponse
 	At        time.Time
+	ExpiresAt time.Time
 	Depletion map[string]float64
 }
+
+// fresh honors the earlier of the reporter's expiry and the local freshness window.
+func (s unifiedQuotaSnapshot) fresh(now time.Time) bool {
+	if s.At.IsZero() || now.Before(s.At) || now.Sub(s.At) > unifiedQuotaFreshness {
+		return false
+	}
+	return s.ExpiresAt.IsZero() || now.Before(s.ExpiresAt)
+}
+
 type unifiedTokenWindow struct {
 	Minutes [10]int64
 	Epochs  [10]int64
@@ -88,7 +97,8 @@ func (m *Manager) SetUnifiedQuotaFetcher(fetch func(context.Context, *Auth) (plu
 }
 
 // SetUnifiedAllowanceRefresher installs an optional background snapshot reader.
-func (m *Manager) SetUnifiedAllowanceRefresher(refresh func(context.Context) bool) {
+// Credentials it leaves without a fresh report are refreshed through the quota fetcher.
+func (m *Manager) SetUnifiedAllowanceRefresher(refresh func(context.Context)) {
 	m.unifiedMu.Lock()
 	defer m.unifiedMu.Unlock()
 	m.unifiedAllowanceRefresher = refresh
@@ -130,15 +140,14 @@ func (m *Manager) refreshUnifiedQuotas(ctx context.Context) {
 	fetch := m.unifiedQuotaFetcher
 	refresh := m.unifiedAllowanceRefresher
 	m.unifiedMu.Unlock()
-	if refresh != nil && refresh(ctx) {
-		return
+	if refresh != nil {
+		m.startUnifiedAllowanceRefresh(ctx, refresh)
 	}
 	if fetch == nil {
 		return
 	}
-	var done []chan struct{}
 	for _, a := range m.List() {
-		if a.Disabled {
+		if a.Disabled || m.unifiedQuotaFresh(a.ID, time.Now()) {
 			continue
 		}
 		participates := false
@@ -152,34 +161,117 @@ func (m *Manager) refreshUnifiedQuotas(ctx context.Context) {
 		if !participates {
 			continue
 		}
-		finished := make(chan struct{})
-		done = append(done, finished)
-		go func(a *Auth) {
-			defer close(finished)
-			report, err := fetch(ctx, a)
-			if err == nil {
-				m.ObserveUnifiedQuota(a.ID, report, time.Now())
-			}
-		}(a)
-	}
-	for _, ch := range done {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ch:
+		// Fetches are never joined, so a stalled provider cannot hold back later ticks.
+		if m.beginUnifiedFetch(a.ID, time.Now()) {
+			go m.runUnifiedFetch(ctx, fetch, a)
 		}
 	}
 }
 
+const (
+	unifiedFetchBackoffBase = 30 * time.Second
+	unifiedFetchBackoffMax  = 5 * time.Minute
+)
+
+// unifiedFetchState is one credential's native quota fetch slot. At most one call is in flight per
+// credential, and consecutive failures push the next attempt out with exponential backoff.
+type unifiedFetchState struct {
+	inFlight bool
+	failures int
+	retryAt  time.Time
+}
+
+// beginUnifiedFetch claims the credential's slot unless a call is in flight or backoff is pending.
+func (m *Manager) beginUnifiedFetch(authID string, now time.Time) bool {
+	m.unifiedMu.Lock()
+	defer m.unifiedMu.Unlock()
+	if m.unifiedFetches == nil {
+		m.unifiedFetches = make(map[string]*unifiedFetchState)
+	}
+	st := m.unifiedFetches[authID]
+	if st == nil {
+		st = &unifiedFetchState{}
+		m.unifiedFetches[authID] = st
+	}
+	if st.inFlight || now.Before(st.retryAt) {
+		return false
+	}
+	st.inFlight = true
+	return true
+}
+
+func (m *Manager) runUnifiedFetch(ctx context.Context, fetch func(context.Context, *Auth) (pluginapi.QuotaFetchResponse, error), a *Auth) {
+	report, err := fetch(ctx, a)
+	now := time.Now()
+	m.unifiedMu.Lock()
+	st := m.unifiedFetches[a.ID]
+	st.inFlight = false
+	if err != nil {
+		st.failures++
+		st.retryAt = now.Add(unifiedFetchBackoff(st.failures))
+	} else {
+		st.failures = 0
+		st.retryAt = time.Time{}
+	}
+	m.unifiedMu.Unlock()
+	if err == nil {
+		m.ObserveUnifiedQuota(a.ID, report, now)
+	}
+}
+
+// unifiedFetchBackoff doubles the delay per consecutive failure, capped at the refresh interval.
+func unifiedFetchBackoff(failures int) time.Duration {
+	delay := unifiedFetchBackoffBase
+	for i := 1; i < failures && delay < unifiedFetchBackoffMax; i++ {
+		delay *= 2
+	}
+	return min(delay, unifiedFetchBackoffMax)
+}
+
+// startUnifiedAllowanceRefresh runs the allowance read beside native fetches, so a stalled
+// service cannot delay them. A call still in flight is not repeated, which bounds the goroutines.
+func (m *Manager) startUnifiedAllowanceRefresh(ctx context.Context, refresh func(context.Context)) {
+	m.unifiedMu.Lock()
+	if m.unifiedAllowanceRunning {
+		m.unifiedMu.Unlock()
+		return
+	}
+	m.unifiedAllowanceRunning = true
+	m.unifiedMu.Unlock()
+	go func() {
+		defer func() {
+			m.unifiedMu.Lock()
+			m.unifiedAllowanceRunning = false
+			m.unifiedMu.Unlock()
+		}()
+		refresh(ctx)
+	}()
+}
+
+func (m *Manager) unifiedQuotaFresh(authID string, now time.Time) bool {
+	m.unifiedMu.Lock()
+	defer m.unifiedMu.Unlock()
+	return m.unifiedQuota[authID].fresh(now)
+}
+
 // ObserveUnifiedQuota records provider reports. Unknown and stale capacity never become unlimited capacity.
 func (m *Manager) ObserveUnifiedQuota(authID string, report pluginapi.QuotaFetchResponse, now time.Time) {
+	m.ObserveUnifiedQuotaUntil(authID, report, now, time.Time{})
+}
+
+// ObserveUnifiedQuotaUntil records a report that its source declared valid only until expiresAt.
+func (m *Manager) ObserveUnifiedQuotaUntil(authID string, report pluginapi.QuotaFetchResponse, now, expiresAt time.Time) {
 	m.unifiedMu.Lock()
 	defer m.unifiedMu.Unlock()
 	if m.unifiedQuota == nil {
 		m.unifiedQuota = make(map[string]unifiedQuotaSnapshot)
 	}
 	old := m.unifiedQuota[authID]
-	next := unifiedQuotaSnapshot{Report: report, At: now, Depletion: make(map[string]float64)}
+	// A late arrival carrying an older observation must not replace a newer report.
+	if now.Before(old.At) {
+		return
+	}
+	next := unifiedQuotaSnapshot{Report: report, At: now, ExpiresAt: expiresAt, Depletion: make(map[string]float64)}
 	hours := now.Sub(old.At).Hours()
 	if hours >= 1.0/60 && hours <= 1 {
 		for _, group := range report.Groups {
@@ -298,7 +390,7 @@ func (m *Manager) UnifiedRoutes(model string, now time.Time) []UnifiedRouteStatu
 			at := snapshot.At
 			status.ObservedAt = &at
 		}
-		if now.Sub(snapshot.At) >= 0 && now.Sub(snapshot.At) <= unifiedQuotaFreshness {
+		if snapshot.fresh(now) {
 			for _, group := range snapshot.Report.Groups {
 				for _, bucket := range group.Buckets {
 					if bucket.Scope == "model" && !slices.Contains(bucket.Models, route.Model) {
@@ -332,7 +424,7 @@ func (m *Manager) UnifiedRoutes(model string, now time.Time) []UnifiedRouteStatu
 				}
 			}
 		}
-		if now.Sub(snapshot.At) >= 0 && now.Sub(snapshot.At) <= unifiedQuotaFreshness {
+		if snapshot.fresh(now) {
 			credits, count := 0.0, 0
 			for _, metric := range snapshot.Report.Summary {
 				if metric.Key == "monthlyCredits" || metric.Key == "purchasedCredits" || metric.Key == "freeCredits" {
@@ -379,65 +471,29 @@ func (m *Manager) UnifiedRoutes(model string, now time.Time) []UnifiedRouteStatu
 	return out
 }
 
-func (m *Manager) unifiedExecutionPlan(model string, plan routingExecutionPlan) (routingExecutionPlan, bool) {
-	cfg, _ := m.runtimeConfig.Load().(*config.Config)
-	if cfg == nil || cfg.Routing.UnifiedModels.Find(thinking.ParseSuffix(model).ModelName) == nil {
-		return plan, false
+// unifiedRoutingPlan turns the eligible routes of a unified model into pinned steps, included
+// plans first. Each step runs through the normal execution path, so a failed step falls back
+// by the policy's failure classes (HTTP 402 counts as exhausted).
+func (m *Manager) unifiedRoutingPlan(cfg *config.Config, providers []string, model string) *routingPlan {
+	plan := &routingPlan{
+		fallbackOn: routingFallbackTriggers(cfg.Routing.Policy.Fallback),
+		traceLimit: routingTraceLimit(cfg.Routing.Policy.Observability),
 	}
-	plan.Strategy = "unified-adaptive"
-	plan.PolicyEnabled = true
-	allowedProviders := append([]string(nil), plan.OrderedProviders...)
-	plan.ExplicitCandidates = nil
-	plan.OrderedProviders = nil
-	seen := make(map[string]bool)
-	allowed := make(map[string]bool)
-	for _, provider := range allowedProviders {
-		allowed[provider] = true
+	allowed := make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		allowed[strings.ToLower(strings.TrimSpace(provider))] = struct{}{}
 	}
 	for _, route := range m.UnifiedRoutes(model, time.Now()) {
-		if !route.Eligible || !allowed[route.Provider] {
+		provider := strings.ToLower(strings.TrimSpace(route.Provider))
+		if _, ok := allowed[provider]; !route.Eligible || !ok {
 			continue
 		}
-		plan.ExplicitCandidates = append(plan.ExplicitCandidates, routingAuthCandidate{Provider: route.Provider, AuthID: route.AuthID})
-		if !seen[route.Provider] {
-			plan.OrderedProviders = append(plan.OrderedProviders, route.Provider)
-			seen[route.Provider] = true
+		plan.steps = append(plan.steps, routingStep{providers: []string{provider}, authID: route.AuthID})
+		if !slices.Contains(plan.providers, provider) {
+			plan.providers = append(plan.providers, provider)
 		}
 	}
-	return plan, true
-}
-
-func (m *Manager) executeUnifiedCandidates(ctx context.Context, plan routingExecutionPlan, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, trace *routingTraceRuntime, stage string) (cliproxyexecutor.Response, bool, error) {
-	var lastErr error
-	for _, candidate := range plan.ExplicitCandidates {
-		localOpts := opts
-		localOpts.Metadata = cloneMetadataMap(opts.Metadata)
-		if localOpts.Metadata == nil {
-			localOpts.Metadata = map[string]any{}
-		}
-		localOpts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey] = candidate.AuthID
-		var response cliproxyexecutor.Response
-		var err error
-		if stage == "count_tokens" {
-			response, err = m.executeCountMixedOnce(ctx, []string{candidate.Provider}, req, localOpts, 1, 0, 0)
-		} else {
-			response, err = m.executeMixedOnce(ctx, []string{candidate.Provider}, req, localOpts, 1, 0, 0)
-		}
-		if err == nil {
-			m.appendRoutingTraceAttempt(trace, traceAttemptSuccess(candidate.Provider, candidate.AuthID, stage))
-			return response, true, nil
-		}
-		lastErr = err
-		fallback, reason := m.shouldFallbackAfterExecutionError(err, plan)
-		m.appendRoutingTraceAttempt(trace, traceAttemptFromError(candidate.Provider, candidate.AuthID, stage, err, fallback, reason))
-		if !fallback {
-			return cliproxyexecutor.Response{}, false, err
-		}
-	}
-	if lastErr == nil {
-		lastErr = &Error{Code: "auth_not_found", Message: "no eligible unified route available"}
-	}
-	return cliproxyexecutor.Response{}, false, lastErr
+	return plan
 }
 
 func unifiedUpstreamModel(route *config.UnifiedModelRoute, requested string) string {
@@ -446,18 +502,6 @@ func unifiedUpstreamModel(route *config.UnifiedModelRoute, requested string) str
 		return route.Model + "(" + parsed.RawSuffix + ")"
 	}
 	return route.Model
-}
-
-func unifiedBudgetError(err error) bool {
-	if err == nil {
-		return false
-	}
-	status := statusCodeFromError(err)
-	if status != 400 && status != 402 && status != 403 {
-		return false
-	}
-	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "insufficient credits") || strings.Contains(text, "credit balance exhausted")
 }
 
 func (m *Manager) wakeUnifiedRouting() {

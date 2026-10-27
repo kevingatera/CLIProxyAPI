@@ -339,3 +339,26 @@ func TestNativeQuotaFetchReadsConfigSnapshotUnderReload(t *testing.T) {
 		}
 	}
 }
+
+// Background refresh must reach plugin-only quota providers, which have no built-in adapter.
+func TestUnifiedQuotaFetchUsesPluginForPluginOnlyCredential(t *testing.T) {
+	host := pluginhost.New()
+	host.RegisterPluginForTest("workbuddy-plugin", pluginapi.Plugin{
+		Metadata:     pluginapi.Metadata{Name: "WorkBuddy Plugin"},
+		Capabilities: pluginapi.Capabilities{QuotaProvider: &mockQuotaProvider{identifier: "workbuddy"}},
+	})
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
+	h.SetPluginHost(host)
+
+	report, err := h.unifiedQuotaFetch(context.Background(), &coreauth.Auth{
+		ID:         "workbuddy-1",
+		Provider:   "workbuddy",
+		Attributes: map[string]string{"api_key": "test-key"},
+	})
+	if err != nil {
+		t.Fatalf("unifiedQuotaFetch error = %v, want the plugin report", err)
+	}
+	if len(report.Groups) == 0 {
+		t.Fatalf("report = %+v, want plugin groups", report)
+	}
+}

@@ -22,7 +22,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -92,14 +91,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		usageStats:          usage.GetRequestStatistics(),
 	}
 	if manager != nil {
-		manager.SetUnifiedQuotaFetcher(func(ctx context.Context, a *coreauth.Auth) (pluginapi.QuotaFetchResponse, error) {
-			report, handled, err := h.fetchPluginQuota(ctx, a, "", "")
-			if handled {
-				return report, err
-			}
-			report, _, err = h.fetchNativeQuota(ctx, a)
-			return report, err
-		})
+		manager.SetUnifiedQuotaFetcher(h.unifiedQuotaFetch)
 		manager.SetUnifiedAllowanceRefresher(h.refreshAllowanceService)
 	}
 	h.startAttemptCleanup()

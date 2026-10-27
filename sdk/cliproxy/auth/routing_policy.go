@@ -3,670 +3,348 @@ package auth
 import (
 	"context"
 	"errors"
-	"fmt"
+	"io"
 	"net"
 	"net/http"
-	"sort"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
-const (
-	routingFallbackExhausted    = "exhausted"
-	routingFallbackRateLimited  = "rate_limited"
-	routingFallbackServerError  = "server_error"
-	routingFallbackTransportErr = "transport_error"
+// routingFallbackUnavailable marks a route step that never reached upstream because its
+// credential could not be selected (unknown, disabled or missing executor). It always falls back.
+const routingFallbackUnavailable = "unavailable"
 
-	defaultRoutingTraceLimit = 200
-	maxRoutingTraceLimit     = 2000
-)
+const defaultRoutingTraceLimit = 200
 
-// RoutingPreview describes the resolved routing plan for a model request.
-type RoutingPreview struct {
-	Model            string                   `json:"model"`
-	Providers        []string                 `json:"providers"`
-	OrderedProviders []string                 `json:"ordered_providers"`
-	Strategy         string                   `json:"strategy"`
-	PolicyEnabled    bool                     `json:"policy_enabled"`
-	FallbackOn       []string                 `json:"fallback_on,omitempty"`
-	ProviderDetails  []RoutingPreviewProvider `json:"provider_details,omitempty"`
+type routingAuthFilterContextKey struct{}
+
+// routingAuthFilter restricts credential selection to what the routing policy allows.
+type routingAuthFilter struct {
+	// allowOnly maps a provider to the only auth IDs it may use.
+	allowOnly map[string]map[string]struct{}
+	// exclude lists auth IDs already covered by earlier route steps.
+	exclude map[string]struct{}
 }
 
-// RoutingPreviewProvider describes provider-level ordering in a preview.
-type RoutingPreviewProvider struct {
-	Provider         string   `json:"provider"`
-	AuthOrder        []string `json:"auth_order,omitempty"`
-	AvailableAuthIDs []string `json:"available_auth_ids,omitempty"`
-}
-
-// RoutingTrace captures one route execution lifecycle.
-type RoutingTrace struct {
-	ID               string                `json:"id"`
-	Timestamp        time.Time             `json:"timestamp"`
-	Operation        string                `json:"operation"`
-	Model            string                `json:"model"`
-	Providers        []string              `json:"providers"`
-	OrderedProviders []string              `json:"ordered_providers,omitempty"`
-	Strategy         string                `json:"strategy"`
-	PolicyEnabled    bool                  `json:"policy_enabled"`
-	FallbackOn       []string              `json:"fallback_on,omitempty"`
-	Attempts         []RoutingTraceAttempt `json:"attempts,omitempty"`
-	FinalStatus      string                `json:"final_status"`
-	StopReason       string                `json:"stop_reason,omitempty"`
-	Error            string                `json:"error,omitempty"`
-}
-
-// RoutingTraceAttempt captures one auth execution attempt.
-type RoutingTraceAttempt struct {
-	Provider       string `json:"provider"`
-	AuthID         string `json:"auth_id,omitempty"`
-	Stage          string `json:"stage"`
-	Success        bool   `json:"success"`
-	HTTPStatus     int    `json:"http_status,omitempty"`
-	Error          string `json:"error,omitempty"`
-	Fallback       bool   `json:"fallback,omitempty"`
-	FallbackReason string `json:"fallback_reason,omitempty"`
-}
-
-type routingAuthCandidate struct {
-	Provider string
-	AuthID   string
-}
-
-type routingExecutionPlan struct {
-	Strategy           string
-	PolicyEnabled      bool
-	OrderedProviders   []string
-	ExplicitCandidates []routingAuthCandidate
-	FallbackTriggers   map[string]struct{}
-	FallbackOn         []string
-}
-
-// allowsFallback reports whether the given classified fallback reason is
-// permitted by the plan's configured fallback triggers.
-func (p routingExecutionPlan) allowsFallback(reason string) bool {
-	if reason == "" {
+func (f *routingAuthFilter) allows(auth *Auth) bool {
+	if f == nil || auth == nil {
+		return true
+	}
+	if _, excluded := f.exclude[auth.ID]; excluded {
 		return false
 	}
-	if len(p.FallbackTriggers) == 0 {
-		return false
+	if allowed, restricted := f.allowOnly[strings.ToLower(strings.TrimSpace(auth.Provider))]; restricted {
+		_, ok := allowed[auth.ID]
+		return ok
 	}
-	_, ok := p.FallbackTriggers[reason]
-	return ok
+	return true
 }
 
-type routingTraceRuntime struct {
-	trace RoutingTrace
+func withRoutingAuthFilter(ctx context.Context, filter *routingAuthFilter) context.Context {
+	if filter == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, routingAuthFilterContextKey{}, filter)
 }
 
-func normalizeRoutingStrategyValue(strategy string) string {
-	switch strings.ToLower(strings.TrimSpace(strategy)) {
-	case "quota-aware", "quotaaware", "quota", "qa":
-		return "quota-aware"
-	case "fill-first", "fillfirst", "ff":
-		return "fill-first"
-	default:
-		return "round-robin"
-	}
+// routingStep is one entry of the ordered route plan. A step with an authID pins that
+// credential; otherwise the normal scheduler picks among providers, skipping exclude.
+type routingStep struct {
+	providers []string
+	authID    string
+	exclude   []string
 }
 
-func normalizeFallbackTriggerValue(trigger string) (string, bool) {
-	switch strings.ToLower(strings.TrimSpace(trigger)) {
-	case "exhausted", "quota", "quota_exhausted":
-		return routingFallbackExhausted, true
-	case "rate_limited", "ratelimited", "rate-limited", "429":
-		return routingFallbackRateLimited, true
-	case "server_error", "server", "5xx":
-		return routingFallbackServerError, true
-	case "transport_error", "transport", "network", "timeout":
-		return routingFallbackTransportErr, true
-	default:
-		return "", false
-	}
+// routingPlan is the operation-independent route for one request. Every step runs through
+// the normal execution pipeline, so aliases, interceptors, retries and payload rules apply.
+type routingPlan struct {
+	manager    *Manager
+	steps      []routingStep
+	providers  []string
+	filter     *routingAuthFilter
+	fallbackOn map[string]struct{}
+	traceLimit int
+	trace      RoutingTrace
 }
 
-func defaultFallbackTriggerSet() (map[string]struct{}, []string) {
-	list := []string{
-		routingFallbackExhausted,
-		routingFallbackRateLimited,
-		routingFallbackServerError,
-		routingFallbackTransportErr,
-	}
-	set := make(map[string]struct{}, len(list))
-	for _, item := range list {
-		set[item] = struct{}{}
-	}
-	return set, list
-}
-
-func containsFallbackTrigger(set map[string]struct{}, trigger string) bool {
-	if len(set) == 0 {
-		return false
-	}
-	_, ok := set[trigger]
-	return ok
-}
-
-func (m *Manager) setRoutingTraceLimitFromConfig(cfg *internalconfig.Config) {
-	limit := defaultRoutingTraceLimit
-	if cfg != nil {
-		if cfgLimit := cfg.Routing.Policy.Observability.TraceLimit; cfgLimit > 0 {
-			limit = cfgLimit
-		}
-	}
-	if limit < 1 {
-		limit = defaultRoutingTraceLimit
-	}
-	if limit > maxRoutingTraceLimit {
-		limit = maxRoutingTraceLimit
-	}
-	m.routingTraceLimit.Store(int32(limit))
-}
-
-func normalizeModelOverrideKeys(model string) (string, string) {
-	trimmed := strings.TrimSpace(model)
-	base := strings.TrimSpace(thinking.ParseSuffix(trimmed).ModelName)
-	return trimmed, base
-}
-
-func normalizeProviderSlice(input []string) []string {
-	if len(input) == 0 {
+// routingPlanFor returns nil when no plan applies: no providers, Home mode, a caller-pinned
+// credential, or neither a unified model nor an enabled routing policy.
+// Traces are kept only while the routing policy is enabled.
+func (m *Manager) routingPlanFor(operation string, providers []string, model string, opts cliproxyexecutor.Options) *routingPlan {
+	if m == nil || len(providers) == 0 || m.HomeEnabled() || pinnedAuthIDFromMetadata(opts.Metadata) != "" {
 		return nil
 	}
-	out := make([]string, 0, len(input))
-	seen := make(map[string]struct{}, len(input))
-	for _, provider := range input {
-		key := strings.ToLower(strings.TrimSpace(provider))
-		if key == "" {
-			continue
-		}
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		out = append(out, key)
-	}
-	return out
-}
-
-func (m *Manager) snapshotEligibleAuthIDsByProvider(providers []string, model string) map[string][]string {
-	result := make(map[string][]string)
-	if m == nil || len(providers) == 0 {
-		return result
-	}
-
-	normalizedProviders := normalizeProviderSlice(providers)
-	if len(normalizedProviders) == 0 {
-		return result
-	}
-	providerSet := make(map[string]struct{}, len(normalizedProviders))
-	for _, provider := range normalizedProviders {
-		providerSet[provider] = struct{}{}
-	}
-
-	baseModel := strings.TrimSpace(thinking.ParseSuffix(model).ModelName)
-	reg := registry.GetGlobalRegistry()
-	now := time.Now()
-	auths := m.snapshotAuths()
-	for _, auth := range auths {
-		if auth == nil || auth.Disabled {
-			continue
-		}
-		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
-		if _, ok := providerSet[provider]; !ok {
-			continue
-		}
-		if _, okExecutor := m.Executor(provider); !okExecutor {
-			continue
-		}
-		if baseModel != "" && reg != nil && !reg.ClientSupportsModel(auth.ID, baseModel) {
-			continue
-		}
-		blocked, _, _ := isAuthBlockedForModel(auth, model, now)
-		if blocked {
-			continue
-		}
-		authID := strings.TrimSpace(auth.ID)
-		if authID == "" {
-			continue
-		}
-		result[provider] = append(result[provider], authID)
-	}
-
-	for provider := range result {
-		sort.Strings(result[provider])
-	}
-	return result
-}
-
-func (m *Manager) buildRoutingExecutionPlan(providers []string, model string, opts cliproxyexecutor.Options) routingExecutionPlan {
-	normalizedProviders := normalizeProviderSlice(providers)
-	set, fallbackOn := defaultFallbackTriggerSet()
-	plan := routingExecutionPlan{
-		Strategy:         "round-robin",
-		PolicyEnabled:    false,
-		OrderedProviders: normalizedProviders,
-		FallbackTriggers: set,
-		FallbackOn:       fallbackOn,
-	}
-
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	if cfg == nil {
-		return plan
+		return nil
 	}
-	plan.Strategy = normalizeRoutingStrategyValue(cfg.Routing.Strategy)
-
-	// Pinned auth should bypass policy ordering to preserve deterministic manual pin behavior.
-	if pinnedAuthIDFromMetadata(opts.Metadata) != "" {
-		return plan
+	var plan *routingPlan
+	switch {
+	case cfg.Routing.UnifiedModels.Find(thinking.ParseSuffix(model).ModelName) != nil:
+		plan = m.unifiedRoutingPlan(cfg, providers, model)
+	case cfg.Routing.Policy.Enabled:
+		plan = buildRoutingPlan(cfg.Routing.Policy, providers, model)
+	default:
+		return nil
 	}
-
-	if unified, ok := m.unifiedExecutionPlan(model, plan); ok {
-		return unified
+	if cfg.Routing.Policy.Enabled {
+		plan.manager = m
 	}
-
-	policy := cfg.Routing.Policy
-	if !policy.Enabled {
-		return plan
+	plan.trace = RoutingTrace{
+		ID:         uuid.NewString(),
+		Timestamp:  time.Now().UTC(),
+		Operation:  operation,
+		Model:      strings.TrimSpace(model),
+		Providers:  append([]string(nil), plan.providers...),
+		FallbackOn: sortedTriggerList(plan.fallbackOn),
 	}
-
-	plan.PolicyEnabled = true
-	fallbackSet := make(map[string]struct{}, len(policy.Fallback.On))
-	fallbackList := make([]string, 0, len(policy.Fallback.On))
-	for _, trigger := range policy.Fallback.On {
-		normalized, ok := normalizeFallbackTriggerValue(trigger)
-		if !ok {
-			continue
-		}
-		if _, exists := fallbackSet[normalized]; exists {
-			continue
-		}
-		fallbackSet[normalized] = struct{}{}
-		fallbackList = append(fallbackList, normalized)
-	}
-	if len(fallbackSet) > 0 {
-		plan.FallbackTriggers = fallbackSet
-		plan.FallbackOn = fallbackList
-	}
-
-	rule := policy.Defaults
-	modelKey, baseModel := normalizeModelOverrideKeys(model)
-	if override, ok := policy.ModelOverrides[modelKey]; ok {
-		rule = override
-	} else if override, ok := policy.ModelOverrides[baseModel]; ok {
-		rule = override
-	}
-
-	availableAuthsByProvider := m.snapshotEligibleAuthIDsByProvider(normalizedProviders, model)
-	inputProviderSet := make(map[string]struct{}, len(normalizedProviders))
-	for _, provider := range normalizedProviders {
-		inputProviderSet[provider] = struct{}{}
-	}
-
-	orderedProviders := make([]string, 0, len(normalizedProviders))
-	seenProviders := make(map[string]struct{}, len(normalizedProviders))
-	addProvider := func(provider string) {
-		if provider == "" {
-			return
-		}
-		if _, ok := seenProviders[provider]; ok {
-			return
-		}
-		seenProviders[provider] = struct{}{}
-		orderedProviders = append(orderedProviders, provider)
-	}
-
-	explicitCandidates := make([]routingAuthCandidate, 0)
-	for _, route := range rule.Route {
-		provider := strings.ToLower(strings.TrimSpace(route.Provider))
-		if provider == "" {
-			continue
-		}
-		if _, ok := inputProviderSet[provider]; !ok {
-			continue
-		}
-		addProvider(provider)
-
-		availableAuthIDs := availableAuthsByProvider[provider]
-		if len(availableAuthIDs) == 0 {
-			continue
-		}
-		availableSet := make(map[string]struct{}, len(availableAuthIDs))
-		for _, authID := range availableAuthIDs {
-			availableSet[authID] = struct{}{}
-		}
-		added := make(map[string]struct{}, len(route.AuthOrder))
-		for _, rawAuthID := range route.AuthOrder {
-			authID := strings.TrimSpace(rawAuthID)
-			if authID == "" {
-				continue
-			}
-			if _, ok := availableSet[authID]; !ok {
-				continue
-			}
-			if _, exists := added[authID]; exists {
-				continue
-			}
-			added[authID] = struct{}{}
-			explicitCandidates = append(explicitCandidates, routingAuthCandidate{
-				Provider: provider,
-				AuthID:   authID,
-			})
-		}
-		if route.IncludeRemainingAuth {
-			for _, authID := range availableAuthIDs {
-				if _, exists := added[authID]; exists {
-					continue
-				}
-				added[authID] = struct{}{}
-				explicitCandidates = append(explicitCandidates, routingAuthCandidate{
-					Provider: provider,
-					AuthID:   authID,
-				})
-			}
-		}
-	}
-
-	if rule.IncludeRemainingProviders || len(orderedProviders) == 0 {
-		for _, provider := range normalizedProviders {
-			addProvider(provider)
-		}
-	}
-	if len(orderedProviders) == 0 {
-		orderedProviders = normalizedProviders
-	}
-	plan.OrderedProviders = orderedProviders
-	plan.ExplicitCandidates = explicitCandidates
 	return plan
 }
 
-func (m *Manager) newRoutingTraceRuntime(operation, model string, providers []string, plan routingExecutionPlan) *routingTraceRuntime {
-	return &routingTraceRuntime{
-		trace: RoutingTrace{
-			ID:               uuid.NewString(),
-			Timestamp:        time.Now().UTC(),
-			Operation:        operation,
-			Model:            strings.TrimSpace(model),
-			Providers:        append([]string(nil), providers...),
-			OrderedProviders: append([]string(nil), plan.OrderedProviders...),
-			Strategy:         plan.Strategy,
-			PolicyEnabled:    plan.PolicyEnabled,
-			FallbackOn:       append([]string(nil), plan.FallbackOn...),
-			Attempts:         make([]RoutingTraceAttempt, 0, 4),
-		},
-	}
-}
-
-func (m *Manager) appendRoutingTraceAttempt(trace *routingTraceRuntime, attempt RoutingTraceAttempt) {
-	if trace == nil {
-		return
-	}
-	trace.trace.Attempts = append(trace.trace.Attempts, attempt)
-}
-
-func (m *Manager) finalizeRoutingTrace(trace *routingTraceRuntime, finalStatus, stopReason string, err error) {
-	if m == nil || trace == nil {
-		return
-	}
-	trace.trace.FinalStatus = strings.TrimSpace(finalStatus)
-	trace.trace.StopReason = strings.TrimSpace(stopReason)
-	if err != nil {
-		trace.trace.Error = strings.TrimSpace(err.Error())
-	}
-	m.recordRoutingTrace(trace.trace)
-}
-
-func (m *Manager) recordRoutingTrace(trace RoutingTrace) {
-	if m == nil {
-		return
-	}
-	limit := int(m.routingTraceLimit.Load())
-	if limit <= 0 {
-		limit = defaultRoutingTraceLimit
+func buildRoutingPlan(policy internalconfig.RoutingPolicy, providers []string, model string) *routingPlan {
+	plan := &routingPlan{
+		fallbackOn: routingFallbackTriggers(policy.Fallback),
+		traceLimit: routingTraceLimit(policy.Observability),
 	}
 
-	m.routingTraceMu.Lock()
-	defer m.routingTraceMu.Unlock()
-	m.routingTraces = append(m.routingTraces, trace)
-	if len(m.routingTraces) <= limit {
-		return
-	}
-	m.routingTraces = append([]RoutingTrace(nil), m.routingTraces[len(m.routingTraces)-limit:]...)
-}
-
-// ListRoutingTraces returns recent routing traces from newest to oldest.
-func (m *Manager) ListRoutingTraces(limit int, model, provider string, failedOnly bool) []RoutingTrace {
-	if m == nil {
-		return nil
-	}
-	if limit <= 0 {
-		limit = 100
-	}
-	if limit > maxRoutingTraceLimit {
-		limit = maxRoutingTraceLimit
+	rule := policy.Defaults
+	trimmed := strings.TrimSpace(model)
+	if override, ok := policy.ModelOverrides[trimmed]; ok {
+		rule = override
+	} else if override, ok := policy.ModelOverrides[strings.TrimSpace(thinking.ParseSuffix(trimmed).ModelName)]; ok {
+		rule = override
 	}
 
-	filterModel := strings.TrimSpace(model)
-	filterProvider := strings.ToLower(strings.TrimSpace(provider))
-
-	m.routingTraceMu.Lock()
-	defer m.routingTraceMu.Unlock()
-
-	result := make([]RoutingTrace, 0, limit)
-	for index := len(m.routingTraces) - 1; index >= 0 && len(result) < limit; index-- {
-		trace := m.routingTraces[index]
-		if failedOnly && strings.EqualFold(trace.FinalStatus, "success") {
+	input := make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		input[strings.ToLower(strings.TrimSpace(provider))] = struct{}{}
+	}
+	routed := make(map[string]struct{}, len(rule.Route))
+	allowOnly := make(map[string]map[string]struct{})
+	for _, route := range rule.Route {
+		provider := strings.ToLower(strings.TrimSpace(route.Provider))
+		if _, ok := input[provider]; !ok {
 			continue
 		}
-		if filterModel != "" && !strings.EqualFold(strings.TrimSpace(trace.Model), filterModel) {
+		if _, dup := routed[provider]; dup {
 			continue
 		}
-		if filterProvider != "" {
-			matched := false
-			for _, p := range trace.Providers {
-				if strings.EqualFold(strings.TrimSpace(p), filterProvider) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
+		routed[provider] = struct{}{}
+		plan.providers = append(plan.providers, provider)
+
+		explicit := make([]string, 0, len(route.AuthOrder))
+		seen := make(map[string]struct{}, len(route.AuthOrder))
+		for _, raw := range route.AuthOrder {
+			authID := strings.TrimSpace(raw)
+			if authID == "" {
 				continue
 			}
+			if _, dup := seen[authID]; dup {
+				continue
+			}
+			seen[authID] = struct{}{}
+			explicit = append(explicit, authID)
+			plan.steps = append(plan.steps, routingStep{providers: []string{provider}, authID: authID})
 		}
-		result = append(result, trace)
+		if len(explicit) == 0 || route.IncludeRemainingAuth {
+			plan.steps = append(plan.steps, routingStep{providers: []string{provider}, exclude: explicit})
+		} else {
+			allowOnly[provider] = seen
+		}
 	}
-	return result
+	// A rule with no routes is absent, so every provider is open. A configured route that the
+	// request does not offer must not open the omitted providers unless include-remaining-providers is set.
+	if rule.IncludeRemainingProviders || len(rule.Route) == 0 {
+		var remaining []string
+		for _, provider := range providers {
+			if _, ok := routed[strings.ToLower(strings.TrimSpace(provider))]; ok {
+				continue
+			}
+			remaining = append(remaining, provider)
+		}
+		if len(remaining) > 0 {
+			plan.steps = append(plan.steps, routingStep{providers: remaining})
+			plan.providers = append(plan.providers, remaining...)
+		}
+	}
+	if len(allowOnly) > 0 {
+		plan.filter = &routingAuthFilter{allowOnly: allowOnly}
+	}
+	return plan
 }
 
-// PreviewRouting returns the currently resolved route plan for the request.
-func (m *Manager) PreviewRouting(model string, providers []string, opts cliproxyexecutor.Options) RoutingPreview {
-	normalizedProviders := normalizeProviderSlice(providers)
-	plan := m.buildRoutingExecutionPlan(normalizedProviders, model, opts)
-	availableByProvider := m.snapshotEligibleAuthIDsByProvider(plan.OrderedProviders, model)
-
-	authOrderByProvider := make(map[string][]string)
-	for _, candidate := range plan.ExplicitCandidates {
-		authOrderByProvider[candidate.Provider] = append(authOrderByProvider[candidate.Provider], candidate.AuthID)
+func routingFallbackTriggers(fallback internalconfig.RoutingFallbackPolicy) map[string]struct{} {
+	set := make(map[string]struct{})
+	for _, trigger := range fallback.On {
+		if normalized, ok := internalconfig.NormalizeRoutingFallbackTrigger(trigger); ok {
+			set[normalized] = struct{}{}
+		}
 	}
-
-	details := make([]RoutingPreviewProvider, 0, len(plan.OrderedProviders))
-	for _, provider := range plan.OrderedProviders {
-		details = append(details, RoutingPreviewProvider{
-			Provider:         provider,
-			AuthOrder:        append([]string(nil), authOrderByProvider[provider]...),
-			AvailableAuthIDs: append([]string(nil), availableByProvider[provider]...),
-		})
+	if len(set) == 0 {
+		for _, trigger := range internalconfig.DefaultRoutingFallbackTriggers() {
+			set[trigger] = struct{}{}
+		}
 	}
-
-	return RoutingPreview{
-		Model:            strings.TrimSpace(model),
-		Providers:        append([]string(nil), normalizedProviders...),
-		OrderedProviders: append([]string(nil), plan.OrderedProviders...),
-		Strategy:         plan.Strategy,
-		PolicyEnabled:    plan.PolicyEnabled,
-		FallbackOn:       append([]string(nil), plan.FallbackOn...),
-		ProviderDetails:  details,
-	}
+	return set
 }
 
-func classifyFallbackReason(err error) (string, bool) {
-	if err == nil {
-		return "", false
+func routingTraceLimit(observability internalconfig.RoutingPolicyObservability) int {
+	limit := observability.TraceLimit
+	if limit <= 0 {
+		return defaultRoutingTraceLimit
 	}
-	if isRequestInvalidError(err) {
-		return "", false
-	}
-
-	status := statusCodeFromError(err)
-	if status == http.StatusTooManyRequests {
-		return routingFallbackRateLimited, true
-	}
-	if status >= 500 && status <= 599 {
-		return routingFallbackServerError, true
-	}
-	if strings.Contains(strings.ToLower(err.Error()), "quota") ||
-		strings.Contains(strings.ToLower(err.Error()), "exhaust") ||
-		strings.Contains(strings.ToLower(err.Error()), "cooldown") {
-		return routingFallbackExhausted, true
-	}
-	if status == 0 && isTransportExecutionError(err) {
-		return routingFallbackTransportErr, true
-	}
-	return "", false
+	return min(limit, internalconfig.MaxRoutingTraceLimit)
 }
 
-func isTransportExecutionError(err error) bool {
-	if err == nil {
+// retryProviders returns the providers the upstream retry loop and the credits fallback may use.
+// An empty result means the policy offers none of the request's providers.
+func (p *routingPlan) retryProviders(fallback []string) []string {
+	if p == nil {
+		return fallback
+	}
+	return p.providers
+}
+
+// routingAuthFilterFromContext returns the plan-wide auth restriction, or nil when none applies.
+func routingAuthFilterFromContext(ctx context.Context) *routingAuthFilter {
+	if ctx == nil {
+		return nil
+	}
+	filter, _ := ctx.Value(routingAuthFilterContextKey{}).(*routingAuthFilter)
+	return filter
+}
+
+// context applies the plan-wide auth restrictions to the request context.
+func (p *routingPlan) context(ctx context.Context) context.Context {
+	if p == nil {
+		return ctx
+	}
+	return withRoutingAuthFilter(ctx, p.filter)
+}
+
+func (p *routingPlan) stepContext(ctx context.Context, step routingStep) context.Context {
+	if len(step.exclude) == 0 {
+		return ctx
+	}
+	filter := &routingAuthFilter{exclude: make(map[string]struct{}, len(step.exclude))}
+	if p.filter != nil {
+		filter.allowOnly = p.filter.allowOnly
+	}
+	for _, authID := range step.exclude {
+		filter.exclude[authID] = struct{}{}
+	}
+	return withRoutingAuthFilter(ctx, filter)
+}
+
+func (step routingStep) options(opts cliproxyexecutor.Options) cliproxyexecutor.Options {
+	if step.authID == "" {
+		return opts
+	}
+	opts.Metadata = cloneRequestMetadata(opts.Metadata)
+	opts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey] = step.authID
+	return opts
+}
+
+func (p *routingPlan) allowsFallback(reason string) bool {
+	switch reason {
+	case "":
 		return false
-	}
-	if errors.Is(err, context.Canceled) {
-		return false
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	case routingFallbackUnavailable:
 		return true
 	}
-
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr != nil {
-		// A net.Error that reports a timeout is a genuine transport/timeout
-		// failure. Non-timeout net.Errors fall through to the text-match
-		// hints below so we don't classify every network error (including
-		// connection resets already covered by the hints) as a transport
-		// error solely because it satisfies net.Error.
-		if netErr.Timeout() {
-			return true
-		}
-		return false
+	if _, ok := p.fallbackOn[reason]; ok {
+		return true
 	}
-
-	text := strings.ToLower(strings.TrimSpace(err.Error()))
-	if text == "" {
-		return false
-	}
-	transportHints := []string{
-		"timeout",
-		"connection reset",
-		"connection refused",
-		"broken pipe",
-		"tls handshake",
-		"unexpected eof",
-		"eof",
-		"no such host",
-	}
-	for _, hint := range transportHints {
-		if strings.Contains(text, hint) {
-			return true
-		}
+	// Many providers report quota exhaustion as 429, so "exhausted" also covers rate limits.
+	if reason == internalconfig.RoutingFallbackRateLimited {
+		_, ok := p.fallbackOn[internalconfig.RoutingFallbackExhausted]
+		return ok
 	}
 	return false
 }
 
-func (m *Manager) shouldFallbackAfterExecutionError(err error, plan routingExecutionPlan) (bool, string) {
-	if plan.Strategy == "unified-adaptive" && unifiedBudgetError(err) {
-		return true, routingFallbackExhausted
-	}
+// classifyRoutingFailure maps an execution error to a fallback trigger using only
+// structured signals: error types, status codes and wrapped transport errors.
+func classifyRoutingFailure(ctx context.Context, err error) string {
 	if err == nil {
-		return false, ""
+		return ""
 	}
-	if isRequestInvalidError(err) {
-		return false, ""
+	if ctx != nil && ctx.Err() != nil {
+		return ""
 	}
-	if !plan.PolicyEnabled {
-		return true, "legacy"
+	if clienterror.IsCreditExhaustedBody(statusCodeFromError(err), err) {
+		return internalconfig.RoutingFallbackExhausted
 	}
-	reason, ok := classifyFallbackReason(err)
-	if !ok {
-		return false, ""
+	if errors.Is(err, context.Canceled) || isRequestInvalidError(err) || isRequestStopError(err) || isRequestTerminatedError(err) {
+		return ""
 	}
-	if containsFallbackTrigger(plan.FallbackTriggers, reason) {
-		return true, reason
+	var cooldown *modelCooldownError
+	if errors.As(err, &cooldown) && cooldown != nil {
+		return internalconfig.RoutingFallbackExhausted
 	}
-	// 429 should also honor "exhausted" if enabled.
-	if reason == routingFallbackRateLimited && containsFallbackTrigger(plan.FallbackTriggers, routingFallbackExhausted) {
-		return true, routingFallbackExhausted
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil && !hasUpstreamExecutionAttempt(err) {
+		switch authErr.Code {
+		case "auth_not_found", "auth_unavailable", "executor_not_found":
+			return routingFallbackUnavailable
+		}
 	}
-	return false, ""
+	status := statusCodeFromError(err)
+	switch {
+	case status == http.StatusPaymentRequired:
+		return internalconfig.RoutingFallbackExhausted
+	case status == http.StatusTooManyRequests:
+		return internalconfig.RoutingFallbackRateLimited
+	case status >= 500 && status <= 599:
+		return internalconfig.RoutingFallbackServerError
+	case status != 0:
+		return ""
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded) {
+		return internalconfig.RoutingFallbackTransportError
+	}
+	return ""
 }
 
-func (m *Manager) pickPinnedCandidate(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, authID string) (*Auth, ProviderExecutor, error) {
-	if m == nil {
-		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+// runRoutingRound runs one upstream retry round. Without a plan it is a single call to once;
+// with a plan it walks the route steps, carrying the round's credential budget and attempted
+// set, and stops at the first failure the policy does not allow to fall back.
+func runRoutingRound[T any](ctx context.Context, plan *routingPlan, providers []string, opts cliproxyexecutor.Options, maxRetryCredentials int, attempted map[string]struct{}, once func(context.Context, []string, cliproxyexecutor.Options, int) (T, error)) (T, error) {
+	if plan == nil {
+		return once(ctx, providers, opts, maxRetryCredentials)
 	}
-	authID = strings.TrimSpace(authID)
-	if authID == "" {
-		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	var zero T
+	var lastErr error
+	for _, step := range plan.steps {
+		budget := maxRetryCredentials
+		if maxRetryCredentials > 0 {
+			budget = maxRetryCredentials - len(attempted)
+			if budget <= 0 {
+				break
+			}
+		}
+		out, err := once(plan.stepContext(ctx, step), step.providers, step.options(opts), budget)
+		if err == nil {
+			plan.recordAttempt(step, nil, "", false)
+			return out, nil
+		}
+		reason := classifyRoutingFailure(ctx, err)
+		fallback := plan.allowsFallback(reason)
+		plan.recordAttempt(step, err, reason, fallback)
+		if !fallback {
+			return zero, err
+		}
+		lastErr = err
 	}
-	localOpts := opts
-	localOpts.Metadata = cloneMetadataMap(opts.Metadata)
-	if localOpts.Metadata == nil {
-		localOpts.Metadata = make(map[string]any, 1)
+	if lastErr == nil {
+		lastErr = &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	localOpts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey] = authID
-	return m.pickNext(ctx, provider, model, localOpts, tried)
-}
-
-func traceAttemptFromError(provider, authID, stage string, err error, fallback bool, fallbackReason string) RoutingTraceAttempt {
-	attempt := RoutingTraceAttempt{
-		Provider:       provider,
-		AuthID:         authID,
-		Stage:          stage,
-		Success:        false,
-		Fallback:       fallback,
-		FallbackReason: fallbackReason,
-	}
-	if err != nil {
-		attempt.Error = strings.TrimSpace(err.Error())
-		attempt.HTTPStatus = statusCodeFromError(err)
-	}
-	return attempt
-}
-
-func traceAttemptSuccess(provider, authID, stage string) RoutingTraceAttempt {
-	return RoutingTraceAttempt{
-		Provider: provider,
-		AuthID:   authID,
-		Stage:    stage,
-		Success:  true,
-	}
-}
-
-type routingTraceStorageFields struct {
-	routingTraceMu    sync.Mutex
-	routingTraces     []RoutingTrace
-	routingTraceLimit atomic.Int32
-}
-
-func (m *Manager) routingTraceLimitInfo() string {
-	if m == nil {
-		return "routing trace manager unavailable"
-	}
-	return fmt.Sprintf("routing trace limit=%d", m.routingTraceLimit.Load())
+	return zero, lastErr
 }

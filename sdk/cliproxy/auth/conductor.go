@@ -174,7 +174,9 @@ type Manager struct {
 	unifiedQuota              map[string]unifiedQuotaSnapshot
 	unifiedBurn               map[string]*unifiedTokenWindow
 	unifiedQuotaFetcher       func(context.Context, *Auth) (pluginapi.QuotaFetchResponse, error)
-	unifiedAllowanceRefresher func(context.Context) bool
+	unifiedAllowanceRefresher func(context.Context)
+	unifiedAllowanceRunning   bool
+	unifiedFetches            map[string]*unifiedFetchState
 	store                     Store
 	cooldownStore             CooldownStateStore
 	pendingCooldownStateStore CooldownStateStore
@@ -251,10 +253,8 @@ type Manager struct {
 	// Mutations acquire one permit; Load acquires all permits before reading the store.
 	authLoadGate *semaphore.Weighted
 
-	// routingTraces holds a bounded ring buffer of recent route execution traces.
-	routingTraces     []RoutingTrace
-	routingTraceMu    sync.Mutex
-	routingTraceLimit atomic.Int32
+	// routingTraces is written only while the routing policy is enabled.
+	routingTraces routingTraceRing
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
