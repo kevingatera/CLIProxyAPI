@@ -1121,6 +1121,16 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 		}
 	}()
 
+	m.publishAuthSchedulingState(authID, snapshot, now)
+	if errPersist != nil {
+		return nil, nil, errPersist
+	}
+	return snapshot, models, nil
+}
+
+// publishAuthSchedulingState pushes a cooldown change into the client model registry
+// and the scheduler, so the new availability takes effect for the next pick.
+func (m *Manager) publishAuthSchedulingState(authID string, snapshot *Auth, now time.Time) {
 	supportedModels, regEpoch := registry.GetGlobalRegistry().GetModelsAndEpochForClient(authID)
 	projections := make([]registry.ClientModelProjection, 0, len(supportedModels))
 	for _, sm := range supportedModels {
@@ -1135,10 +1145,6 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	if m.scheduler != nil && snapshot != nil {
 		m.scheduler.upsertAuth(snapshot)
 	}
-	if errPersist != nil {
-		return nil, nil, errPersist
-	}
-	return snapshot, models, nil
 }
 
 func modelsForRegisteredAuth(authID string) []string {
