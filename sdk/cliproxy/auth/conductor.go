@@ -237,6 +237,8 @@ type Manager struct {
 	refreshLoop   *authAutoRefreshLoop
 	// refreshJobs retains queued and running jobs across loop restarts under m.mu.
 	refreshJobs map[string]*authRefreshJob
+	// creditRecovery ends credential_quota cooldowns once usage shows capacity again.
+	creditRecovery *creditQuotaRecovery
 
 	requestPrepareLocks sync.Map
 	// refreshLocks serializes credential refresh per auth ID so concurrent
@@ -289,9 +291,12 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		manager.ApplyHomeInFlightPublisherConfig(defaultInFlightConfig)
 	}
 	manager.scheduler = newAuthScheduler(selector)
+	recovery := newCreditQuotaRecovery("")
 	if quota := quotaSelectorOf(selector); quota != nil {
 		quota.setObserver(manager.observeQuotaProbe)
+		recovery.hostProxyURL = quota.hostProxyURL
 	}
+	manager.creditRecovery = recovery
 	return manager
 }
 
