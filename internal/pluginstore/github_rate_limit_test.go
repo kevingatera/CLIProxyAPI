@@ -339,3 +339,18 @@ func TestRateLimitRetryAfterRoundsUp(t *testing.T) {
 		}
 	}
 }
+
+// Not parallel: it swaps the process-wide time.Local.
+func TestRateLimitErrorMessageUsesLocalTime(t *testing.T) {
+	loc, err := time.LoadLocation("America/Toronto")
+	if err != nil {
+		loc = time.FixedZone("EST", -5*3600)
+	}
+	prev := time.Local
+	time.Local = loc
+	t.Cleanup(func() { time.Local = prev })
+	errLimit := &RateLimitError{RetryAt: time.Date(2026, 11, 3, 16, 0, 0, 0, time.UTC)}
+	if msg := errLimit.Error(); !strings.Contains(msg, "2026-11-03T11:00:00-05:00") || strings.Contains(msg, "Z") {
+		t.Fatalf("Error()=%q, want local time with -05:00 offset", msg)
+	}
+}

@@ -19,7 +19,7 @@ type RateLimitError struct {
 }
 
 func (err *RateLimitError) Error() string {
-	return fmt.Sprintf("GitHub API rate limited; retry after %s", err.RetryAt.UTC().Format(time.RFC3339))
+	return fmt.Sprintf("GitHub API rate limited; retry after %s", err.RetryAt.Local().Format(time.RFC3339))
 }
 
 // RetryAfterSeconds rounds up so clients never retry before the reset time.
