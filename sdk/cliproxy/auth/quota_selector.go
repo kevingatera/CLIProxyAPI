@@ -264,6 +264,35 @@ func (s *QuotaAwareSelector) trackLocked(a *Auth, now time.Time) *quotaEntry {
 	return entry
 }
 
+// watch marks Codex credentials that a request path or refresh tick is about to rely on,
+// so the background loop keeps their observations warm. Unified plans pin auth IDs, so
+// Pick never sees these credentials. It performs no I/O.
+func (s *QuotaAwareSelector) watch(auths []*Auth) {
+	now := s.clock()
+	due := false
+	s.mu.Lock()
+	for _, a := range auths {
+		if !isCodexQuotaAuth(a) {
+			continue
+		}
+		entry := s.trackLocked(a, now)
+		if entry == nil {
+			continue
+		}
+		entry.needsProbe = !observedWithin(a.Quota, now, quotaRefreshInterval)
+		if entry.needsProbe && !entry.fetching && !now.Before(entry.nextAttempt) {
+			due = true
+		}
+	}
+	s.mu.Unlock()
+	if !s.manualRefresh {
+		s.startOnce.Do(s.start)
+	}
+	if due {
+		s.signal()
+	}
+}
+
 func (s *QuotaAwareSelector) pruneLocked(now time.Time) {
 	for id, entry := range s.entries {
 		if !entry.fetching && now.Sub(entry.lastSeen) > quotaTrackedTTL {
@@ -523,6 +552,36 @@ func classifyCodexSnapshot(snapshot *codexUsageSnapshot, now time.Time) (quotaSt
 		return quotaUnknown, 0, time.Time{}
 	}
 	return quotaKnown, score, time.Time{}
+}
+
+// codexUnifiedQuota derives unified-route quota from a Codex passive observation.
+// For quotaKnown it returns the binding remaining fraction over live windows and the
+// binding window's reset. For quotaExhausted it returns the nearest reset.
+func codexUnifiedQuota(q QuotaState, now time.Time) (quotaState, float64, time.Time) {
+	snap := codexSnapshotOf(q, now)
+	state, _, next := classifyCodexSnapshot(snap, now)
+	switch state {
+	case quotaExhausted:
+		return quotaExhausted, 0, next
+	case quotaKnown:
+	default:
+		return quotaUnknown, 0, time.Time{}
+	}
+	remaining := math.Inf(1)
+	var reset time.Time
+	for _, w := range []codexUsageWindow{snap.primaryWindow, snap.secondaryWindow} {
+		if !w.hasUsedPercent || w.resetAt.IsZero() || !w.resetAt.After(now) {
+			continue
+		}
+		r := min(max(1-w.usedPercent/100, 0), 1)
+		if r < remaining {
+			remaining, reset = r, w.resetAt
+		}
+	}
+	if math.IsInf(remaining, 1) {
+		return quotaUnknown, 0, time.Time{}
+	}
+	return quotaKnown, remaining, reset
 }
 
 func codexCredentialOf(a *Auth, hostProxyURL string) codexUsageCredential {
