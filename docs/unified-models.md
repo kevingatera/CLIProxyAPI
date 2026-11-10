@@ -48,6 +48,9 @@ creates a private timestamped backup, and preserves the rest of the document.
    exhausted and cooling-down credentials remain excluded. With equal priorities,
    prefer fresh known capacity over unknown capacity.
    Unknown is not unlimited.
+   Codex credentials are ranked from their usage observations (response headers,
+   plus background wham/usage probes when the quota-aware strategy is active), so
+   equal-priority Codex accounts are balanced by remaining headroom, not credential ID order.
 5. Compare binding-window headroom adjusted for observed allowance depletion and
    time until reset. Scores are grouped into 5% bands to reduce trivial switches.
 6. Use stable credential ordering for ties. Retry a different eligible route for

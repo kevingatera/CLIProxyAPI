@@ -143,22 +143,13 @@ func (m *Manager) refreshUnifiedQuotas(ctx context.Context) {
 	if refresh != nil {
 		m.startUnifiedAllowanceRefresh(ctx, refresh)
 	}
+	auths := m.List()
+	m.watchUnifiedCodex(cfg, auths)
 	if fetch == nil {
 		return
 	}
-	for _, a := range m.List() {
-		if a.Disabled || m.unifiedQuotaFresh(a.ID, time.Now()) {
-			continue
-		}
-		participates := false
-		for _, model := range cfg.Routing.UnifiedModels.Models {
-			for _, route := range model.Routes {
-				if MatchesUnifiedRoute(route, a) {
-					participates = true
-				}
-			}
-		}
-		if !participates {
+	for _, a := range auths {
+		if a.Disabled || m.unifiedQuotaFresh(a.ID, time.Now()) || !unifiedParticipates(cfg, a) {
 			continue
 		}
 		// Fetches are never joined, so a stalled provider cannot hold back later ticks.
@@ -428,7 +419,36 @@ func (m *Manager) UnifiedRoutes(model string, now time.Time) []UnifiedRouteStatu
 			status.Eligible = false
 			status.Reason = "provider credit exhausted"
 		}
-		if status.Eligible && status.QuotaKnown {
+		codexObserved := false
+		if !snapshot.fresh(now) && isCodexQuotaAuth(a) {
+			state, remaining, reset := codexUnifiedQuota(a.Quota, now)
+			switch state {
+			case quotaExhausted:
+				zero := 0.0
+				status.QuotaKnown, status.Remaining = true, &zero
+				if status.Eligible {
+					status.Reason = "provider allowance exhausted"
+				}
+				status.Eligible = false
+				if !reset.IsZero() {
+					status.ResetTime = reset.Format(time.RFC3339)
+				}
+			case quotaKnown:
+				status.QuotaKnown = true
+				status.Remaining = &remaining
+				status.CapacityScore = remaining
+				status.ResetTime = reset.Format(time.RFC3339Nano)
+				codexObserved = true
+				if status.Eligible {
+					status.Reason = "fresh codex usage; plan and capacity ranked"
+				}
+			}
+			if state != quotaUnknown {
+				observedAt := a.Quota.ObservedAt
+				status.ObservedAt = &observedAt
+			}
+		}
+		if status.Eligible && status.QuotaKnown && !codexObserved {
 			status.Reason = "fresh provider quota; plan and capacity ranked"
 		}
 		out = append(out, status)
@@ -493,6 +513,7 @@ func (m *Manager) unifiedRoutingPlan(cfg *config.Config, providers []string, mod
 			plan.creditsProviders = append(plan.creditsProviders, provider)
 		}
 	}
+	m.watchUnifiedCodex(cfg, m.List())
 	for _, route := range m.UnifiedRoutes(model, time.Now()) {
 		provider := strings.ToLower(strings.TrimSpace(route.Provider))
 		if _, ok := allowed[provider]; !ok {
@@ -513,6 +534,34 @@ func (m *Manager) unifiedRoutingPlan(cfg *config.Config, providers []string, mod
 		}
 	}
 	return plan
+}
+
+// unifiedParticipates reports whether a is a route target of any unified model.
+func unifiedParticipates(cfg *config.Config, a *Auth) bool {
+	for _, model := range cfg.Routing.UnifiedModels.Models {
+		for _, route := range model.Routes {
+			if MatchesUnifiedRoute(route, a) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// watchUnifiedCodex asks the quota-aware selector to keep participating Codex observations
+// warm. Unified plans pin auth IDs, so the selector's own Pick would never see these credentials.
+func (m *Manager) watchUnifiedCodex(cfg *config.Config, auths []*Auth) {
+	quota := quotaSelectorOf(m.Selector())
+	if quota == nil {
+		return
+	}
+	var codex []*Auth
+	for _, a := range auths {
+		if !a.Disabled && isCodexQuotaAuth(a) && unifiedParticipates(cfg, a) {
+			codex = append(codex, a)
+		}
+	}
+	quota.watch(codex)
 }
 
 func unifiedUpstreamModel(route *config.UnifiedModelRoute, requested string) string {
