@@ -111,6 +111,17 @@ func (m *Manager) routingPlanFor(operation string, providers []string, model str
 	return plan
 }
 
+// routingPolicyOverride returns the policy rule written for model itself, matched with or
+// without a thinking suffix.
+func routingPolicyOverride(policy internalconfig.RoutingPolicy, model string) (internalconfig.RoutingPolicyRule, bool) {
+	trimmed := strings.TrimSpace(model)
+	if override, ok := policy.ModelOverrides[trimmed]; ok {
+		return override, true
+	}
+	override, ok := policy.ModelOverrides[strings.TrimSpace(thinking.ParseSuffix(trimmed).ModelName)]
+	return override, ok
+}
+
 func buildRoutingPlan(policy internalconfig.RoutingPolicy, providers []string, model string) *routingPlan {
 	plan := &routingPlan{
 		fallbackOn: routingFallbackTriggers(policy.Fallback),
@@ -118,10 +129,7 @@ func buildRoutingPlan(policy internalconfig.RoutingPolicy, providers []string, m
 	}
 
 	rule := policy.Defaults
-	trimmed := strings.TrimSpace(model)
-	if override, ok := policy.ModelOverrides[trimmed]; ok {
-		rule = override
-	} else if override, ok := policy.ModelOverrides[strings.TrimSpace(thinking.ParseSuffix(trimmed).ModelName)]; ok {
+	if override, ok := routingPolicyOverride(policy, model); ok {
 		rule = override
 	}
 

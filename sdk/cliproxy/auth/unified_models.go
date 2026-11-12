@@ -498,8 +498,11 @@ func (m *Manager) unifiedRoutingPlan(cfg *config.Config, providers []string, mod
 		allowed[provider] = struct{}{}
 		plan.filter.allowOnly[provider] = make(map[string]struct{})
 	}
+	// A unified model routes by its own configuration. The policy defaults describe ordinary
+	// requests and would drop every provider they do not list, so only an override written for
+	// this model narrows its routes.
 	var policy *routingPlan
-	if cfg.Routing.Policy.Enabled {
+	if _, ok := routingPolicyOverride(cfg.Routing.Policy, model); ok && cfg.Routing.Policy.Enabled {
 		policy = buildRoutingPlan(cfg.Routing.Policy, providers, model)
 	}
 	// The credits lane serves requests whose free routes are exhausted, so it keeps every

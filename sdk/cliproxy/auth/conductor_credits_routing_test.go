@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -109,6 +110,47 @@ func newUnifiedCreditsRoutingManager(t *testing.T, policy internalconfig.Routing
 		registry.GetGlobalRegistry().RegisterClient(id, "antigravity", []*registry.ModelInfo{{ID: model}, {ID: "claude-source"}})
 	}
 	return m, e, model
+}
+
+// unifiedOverridePolicy moves the policy defaults into an override for the unified test model,
+// because policy defaults do not narrow unified routes.
+func unifiedOverridePolicy(policy internalconfig.RoutingPolicy) internalconfig.RoutingPolicy {
+	policy.ModelOverrides = map[string]internalconfig.RoutingPolicyRule{"cliproxy/claude-credits-review": policy.Defaults}
+	policy.Defaults = internalconfig.RoutingPolicyRule{}
+	return policy
+}
+
+// unifiedPinnedPolicy pins the unified test model to authID through a model override.
+func unifiedPinnedPolicy(authID string) internalconfig.RoutingPolicy {
+	return unifiedOverridePolicy(antigravityPinnedPolicy(authID))
+}
+
+// Policy defaults that list other providers must not drop a unified model's routes. Production
+// defaults route only codex and claude while unified models also route to other providers.
+func TestUnifiedRoutesIgnorePolicyDefaults(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			policy := internalconfig.RoutingPolicy{Enabled: true, Defaults: internalconfig.RoutingPolicyRule{Route: []internalconfig.RoutingPolicyRoute{{Provider: "codex"}}}}
+			m, e, model := newUnifiedCreditsRoutingManager(t, policy)
+			if err := runCreditsRoutingRequest(t, m, model, stream); err != nil {
+				t.Fatalf("unified request failed under unrelated policy defaults: %v", err)
+			}
+			if got := fmt.Sprint(e.snapshot()); !strings.Contains(got, ":plain") {
+				t.Fatalf("calls = %s, want a plain unified route call", got)
+			}
+		})
+	}
+}
+
+// A model override written for the unified model still narrows its routes.
+func TestUnifiedRoutesHonourModelOverride(t *testing.T) {
+	m, e, model := newUnifiedCreditsRoutingManager(t, unifiedPinnedPolicy("beta"))
+	if err := runCreditsRoutingRequest(t, m, model, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(e.snapshot()); strings.Contains(got, "alpha") {
+		t.Fatalf("calls = %s, want only the overridden beta credential", got)
+	}
 }
 
 // exhaustUnifiedCredits marks every AI credit pool of an auth as empty.
@@ -305,7 +347,7 @@ func TestUnifiedCreditsSweepStopsOnRequestTermination(t *testing.T) {
 func TestUnifiedCreditsRechecksEligibilityAfterConcurrentPreparation(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
-			m, e, model := newUnifiedCreditsRoutingManager(t, antigravityPinnedPolicy("beta"))
+			m, e, model := newUnifiedCreditsRoutingManager(t, unifiedPinnedPolicy("beta"))
 			for _, a := range m.List() {
 				a.Metadata["disable_cooling"] = true
 				if _, err := m.Update(context.Background(), a); err != nil {
@@ -353,7 +395,7 @@ func TestCreditsFallbackRespectsFailurePolicy(t *testing.T) {
 				var e *creditsRoutingExecutor
 				model := "claude-credits-policy"
 				if unified {
-					m, e, model = newUnifiedCreditsRoutingManager(t, policy)
+					m, e, model = newUnifiedCreditsRoutingManager(t, unifiedOverridePolicy(policy))
 				} else {
 					m, _ = newCreditsPolicyTestManager(t, []string{"alpha", "beta"}, policy, 0)
 					e = &creditsRoutingExecutor{}
@@ -380,7 +422,7 @@ func TestCreditsFallbackRecordsRoutingAttempts(t *testing.T) {
 					var e *creditsRoutingExecutor
 					model := "claude-credits-policy"
 					if unified {
-						m, e, model = newUnifiedCreditsRoutingManager(t, policy)
+						m, e, model = newUnifiedCreditsRoutingManager(t, unifiedOverridePolicy(policy))
 						for _, a := range m.List() {
 							a.Metadata["disable_cooling"] = true
 							if _, err := m.Update(context.Background(), a); err != nil {
