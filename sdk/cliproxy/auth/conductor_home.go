@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
@@ -1401,9 +1400,6 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 	var known []creditsCandidateEntry
 	var unknown []creditsCandidateEntry
 	for _, candidate := range candidates {
-		if !m.unifiedCreditsEligible(routeModel, candidate.auth.ID) {
-			continue
-		}
 		hint, okHint, errHint := GetAntigravityCreditsHintRequired(ctx, candidate.auth.ID)
 		if errHint != nil {
 			return nil, antigravityCreditsKVUnavailableError(errHint)
@@ -1509,7 +1505,7 @@ func (b *creditsAttemptBudget) allow(authID string) bool {
 	return true
 }
 
-func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, attempted map[string]struct{}, plan *routingPlan, lastFailure *error) (cliproxyexecutor.Response, bool, error) {
+func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, attempted map[string]struct{}) (cliproxyexecutor.Response, bool, error) {
 	if m != nil && m.HomeEnabled() {
 		return cliproxyexecutor.Response{}, false, &Error{Code: "home_fallback_unsupported", Message: "Home does not support Antigravity credits fallback", HTTPStatus: http.StatusServiceUnavailable}
 	}
@@ -1542,16 +1538,9 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		creditsCtx = m.newUpstreamAttemptContext(creditsCtx)
 		preparedAuth, errPrepare := m.prepareRequestAuth(creditsCtx, c.executor, c.auth)
 		if errPrepare != nil {
-			plan.recordCreditsAttempt(creditsCtx, c.auth, errPrepare)
-			if creditsSweepTerminal(errPrepare) {
-				return cliproxyexecutor.Response{}, false, unwrapExecutionBoundaryError(errPrepare)
-			}
 			continue
 		}
 		c.auth = preparedAuth
-		if !m.unifiedCreditsEligible(routeModel, c.auth.ID) {
-			continue
-		}
 		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth)
 		models, pooled, aliasResult, routing := m.executionModelCandidatesWithAlias(c.auth, routeModel)
 		if len(models) == 0 {
@@ -1565,7 +1554,6 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			creditsCtx = syncMetadataSessionToContext(creditsCtx, creditsOpts.Metadata)
 			executionSeq := m.nextExecutionSeq()
 			resp, errExec := c.executor.Execute(creditsCtx, c.auth, execReq, creditsOpts)
-			plan.recordCreditsAttempt(creditsCtx, c.auth, errExec)
 			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, RouteModel: routeModel, Success: errExec == nil, Options: creditsOpts, CredentialVersion: c.auth.CredentialVersion, RegistrationEpoch: c.auth.RegistrationEpoch, ExecutionSeq: executionSeq}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
@@ -1576,12 +1564,6 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 					result.CredentialScope = true
 				}
 				m.MarkResult(creditsCtx, result)
-				// Same trusted Retry-After annotation as the plain path, so the client sees the credits hint.
-				errExec = annotateTrustedRetryAfterByHint(errExec)
-				*lastFailure = markUpstreamExecutionAttempt(errExec)
-				if creditsAttemptTerminal(errExec) {
-					return cliproxyexecutor.Response{}, false, unwrapExecutionBoundaryError(errExec)
-				}
 				if result.CredentialScope {
 					break
 				}
@@ -1596,7 +1578,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 	return cliproxyexecutor.Response{}, false, nil
 }
 
-func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, attempted map[string]struct{}, plan *routingPlan, lastFailure *error) (*cliproxyexecutor.StreamResult, bool, error) {
+func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, attempted map[string]struct{}) (*cliproxyexecutor.StreamResult, bool, error) {
 	if m != nil && m.HomeEnabled() {
 		return nil, false, &Error{Code: "home_fallback_unsupported", Message: "Home does not support Antigravity credits fallback", HTTPStatus: http.StatusServiceUnavailable}
 	}
@@ -1629,16 +1611,9 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		creditsCtx = m.newUpstreamAttemptContext(creditsCtx)
 		preparedAuth, errPrepare := m.prepareRequestAuth(creditsCtx, c.executor, c.auth)
 		if errPrepare != nil {
-			plan.recordCreditsAttempt(creditsCtx, c.auth, errPrepare)
-			if creditsSweepTerminal(errPrepare) {
-				return nil, false, unwrapExecutionBoundaryError(errPrepare)
-			}
 			continue
 		}
 		c.auth = preparedAuth
-		if !m.unifiedCreditsEligible(routeModel, c.auth.ID) {
-			continue
-		}
 		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth)
 		models, pooled, aliasResult, routing := m.executionModelCandidatesWithAlias(c.auth, routeModel)
 		if len(models) == 0 {
@@ -1646,75 +1621,12 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		}
 		creditsCtx = syncMetadataSessionToContext(creditsCtx, creditsOpts.Metadata)
 		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, "", models, pooled, aliasResult, routing, true, false)
-		plan.recordCreditsAttempt(creditsCtx, c.auth, errStream)
 		if errStream != nil {
-			*lastFailure = markUpstreamExecutionAttempt(errStream)
-			if creditsAttemptTerminal(errStream) {
-				// Keep the raw error: the bootstrap wrapper carries the upstream headers to the client.
-				return nil, false, errStream
-			}
 			continue
 		}
 		return result, true, nil
 	}
 	return nil, false, nil
-}
-
-// preferCreditsAttemptError chooses the error for a failed request after the credits sweep. A plain failure
-// that is only a synthetic "no candidate" or cooldown answer, with no upstream attempt, yields to a credits
-// failure that did reach upstream, which keeps its status and Retry-After. Any other plain failure is kept.
-// plainErr must still carry its upstream-attempt marker, so callers pass it before unwrapping.
-func preferCreditsAttemptError(plainErr, creditsErr error) error {
-	if creditsErr == nil || hasUpstreamExecutionAttempt(plainErr) || !isSyntheticPlainFailure(plainErr) {
-		return unwrapExecutionBoundaryError(plainErr)
-	}
-	return unwrapExecutionBoundaryError(creditsErr)
-}
-
-// isSyntheticPlainFailure reports the plain round's no-candidate and cooldown answers, which are produced
-// without contacting upstream.
-func isSyntheticPlainFailure(err error) bool {
-	var cooldown *modelCooldownError
-	if errors.As(err, &cooldown) {
-		return true
-	}
-	var authErr *Error
-	if errors.As(err, &authErr) && authErr != nil {
-		switch authErr.Code {
-		case "auth_not_found", "auth_unavailable", "executor_not_found":
-			return true
-		}
-	}
-	return false
-}
-
-// creditsSweepTerminal reports errors that end the credits sweep for every candidate. The request
-// itself was stopped or terminated; any other failure belongs to one credential and the sweep moves on.
-// Preparation failures use only this rule.
-func creditsSweepTerminal(err error) bool {
-	return isRequestTerminatedError(err) || isRequestStopError(err)
-}
-
-// creditsAttemptTerminal extends creditsSweepTerminal to an upstream credits attempt. A request-invalid
-// failure, such as a 400 invalid_request_error, is the request's own fault, so the plain pipeline stops
-// there too and the sweep must not try another credential. A 400 that reports an exhausted balance is not
-// request-invalid for routing (see classifyRoutingFailure), so it keeps sweeping.
-func creditsAttemptTerminal(err error) bool {
-	if creditsSweepTerminal(err) {
-		return true
-	}
-	return !clienterror.IsCreditExhaustedBody(statusCodeFromError(err), err) && isRequestInvalidError(err)
-}
-
-// creditsTerminalStreamResult hands a terminal credits error back as a stream result when it wraps a
-// bootstrap failure, so the client still receives the upstream response headers.
-func creditsTerminalStreamResult(err error) (*cliproxyexecutor.StreamResult, error) {
-	err = unwrapExecutionBoundaryError(err)
-	var bootstrapErr *streamBootstrapError
-	if errors.As(err, &bootstrapErr) && bootstrapErr != nil {
-		return streamErrorResult(bootstrapErr.Headers(), err), nil
-	}
-	return nil, err
 }
 
 func antigravityCreditsKVUnavailableError(cause error) error {

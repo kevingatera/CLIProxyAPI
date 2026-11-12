@@ -64,17 +64,13 @@ type routingStep struct {
 // routingPlan is the operation-independent route for one request. Every step runs through
 // the normal execution pipeline, so aliases, interceptors, retries and payload rules apply.
 type routingPlan struct {
-	manager   *Manager
-	steps     []routingStep
-	providers []string
-	// creditsProviders is what the credits fallback may use. It can be non-empty when providers is
-	// empty: a unified plan whose free routes are all exhausted at build time still reaches credits.
-	creditsProviders []string
-	filter           *routingAuthFilter
-	eligible         func(string) bool
-	fallbackOn       map[string]struct{}
-	traceLimit       int
-	trace            RoutingTrace
+	manager    *Manager
+	steps      []routingStep
+	providers  []string
+	filter     *routingAuthFilter
+	fallbackOn map[string]struct{}
+	traceLimit int
+	trace      RoutingTrace
 }
 
 // routingPlanFor returns nil when no plan applies: no providers, Home mode, a caller-pinned
@@ -180,7 +176,6 @@ func buildRoutingPlan(policy internalconfig.RoutingPolicy, providers []string, m
 	if len(allowOnly) > 0 {
 		plan.filter = &routingAuthFilter{allowOnly: allowOnly}
 	}
-	plan.creditsProviders = plan.providers
 	return plan
 }
 
@@ -214,14 +209,6 @@ func (p *routingPlan) retryProviders(fallback []string) []string {
 		return fallback
 	}
 	return p.providers
-}
-
-// creditsFallbackProviders returns the providers the credits fallback may use.
-func (p *routingPlan) creditsFallbackProviders(fallback []string) []string {
-	if p == nil {
-		return fallback
-	}
-	return p.creditsProviders
 }
 
 // routingAuthFilterFromContext returns the plan-wide auth restriction, or nil when none applies.
@@ -336,9 +323,6 @@ func runRoutingRound[T any](ctx context.Context, plan *routingPlan, providers []
 	var zero T
 	var lastErr error
 	for _, step := range plan.steps {
-		if plan.eligible != nil && !plan.eligible(step.authID) {
-			continue
-		}
 		budget := maxRetryCredentials
 		if maxRetryCredentials > 0 {
 			budget = maxRetryCredentials - len(attempted)
@@ -363,13 +347,4 @@ func runRoutingRound[T any](ctx context.Context, plan *routingPlan, providers []
 		lastErr = &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	return zero, lastErr
-}
-
-// allowsCreditsFallback is the entry gate for the credits lane: the failure that ended the plain
-// round must match the routing policy's fallback triggers. Per-credential failures do not use it.
-func (p *routingPlan) allowsCreditsFallback(ctx context.Context, err error) bool {
-	if isRequestTerminatedError(err) || isRequestStopError(err) || (ctx != nil && ctx.Err() != nil) {
-		return false
-	}
-	return p == nil || p.allowsFallback(classifyRoutingFailure(ctx, err))
 }

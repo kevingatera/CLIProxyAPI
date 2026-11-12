@@ -135,6 +135,37 @@ func TestUnifiedExecutionMapsAndFallsBack(t *testing.T) {
 		})
 	}
 }
+
+// Policy defaults describe ordinary requests. A unified model whose routes use providers the
+// defaults omit must still reach them, as production defaults list only codex and claude.
+func TestUnifiedRoutesIgnorePolicyDefaults(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "response", true: "stream"}[stream], func(t *testing.T) {
+			m, goExec, _, cfg := setupUnified(t)
+			cfg.Routing.Policy = config.RoutingPolicy{Enabled: true, Defaults: config.RoutingPolicyRule{Route: []config.RoutingPolicyRoute{{Provider: "codex"}, {Provider: "claude"}}}}
+			m.SetConfig(cfg)
+			req := executor.Request{Model: "cliproxy/unified-test", Payload: []byte(`{}`)}
+			providers := []string{"unified-go", "unified-paid"}
+			var err error
+			if stream {
+				var result *executor.StreamResult
+				result, err = m.ExecuteStream(context.Background(), providers, req, executor.Options{})
+				if err == nil {
+					for range result.Chunks {
+					}
+				}
+			} else {
+				_, err = m.Execute(context.Background(), providers, req, executor.Options{})
+			}
+			if err != nil {
+				t.Fatalf("unified request failed under unrelated policy defaults: %v", err)
+			}
+			if len(goExec.models) != 1 {
+				t.Fatalf("go=%v, want the included route", goExec.models)
+			}
+		})
+	}
+}
 func TestUnifiedExhaustedRoutesNeverReachExecutor(t *testing.T) {
 	m, goExec, paidExec, _ := setupUnified(t)
 	now := time.Now()
