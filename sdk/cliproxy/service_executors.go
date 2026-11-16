@@ -278,7 +278,7 @@ func (s *Service) registerAvailableExecutors(ctx context.Context, opts executorR
 		s.registerExecutorsForAuths(opts.auths, opts.forceReplaceAuths)
 	}
 	if opts.includePlugins && s.pluginHost != nil {
-		registerPluginExecutors(s.pluginHost, s.coreManager)
+		registerPluginExecutors(s.pluginHost, s.coreManager, s.pluginCatalogRegistry())
 	}
 }
 
@@ -747,7 +747,7 @@ func (s *Service) tryRegisterPluginModelsForAuthWithConfigFenced(ctx context.Con
 	publicationFence.fallbackExclusionProvider = fallbackExclusionProvider
 	if len(models) > 0 {
 		models = applyOAuthSettingsForAuth(cfg, providerKey, activeAuthKind, models)
-		return true, s.registerResolvedModelsForAuthFenced(activeAuth, publicationFence, providerKey, applyModelPrefixes(models, activeAuth.Prefix, cfg != nil && cfg.ForceModelPrefix))
+		return true, s.registerResolvedModelsForAuthFenced(activeAuth, publicationFence, providerKey, prefixedModelsForFence(publicationFence, models, activeAuth.Prefix, cfg != nil && cfg.ForceModelPrefix))
 	}
 	return true, s.unregisterModelsForAuthFenced(activeAuth, publicationFence)
 }

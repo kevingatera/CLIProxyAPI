@@ -42,11 +42,11 @@ type executorRegistrationOptions struct {
 	auths             []*coreauth.Auth
 }
 
-var registerPluginExecutors = func(host *pluginhost.Host, manager *coreauth.Manager) {
+var registerPluginExecutors = func(host *pluginhost.Host, manager *coreauth.Manager, catalog pluginCatalogRegistry) {
 	if host == nil || manager == nil {
 		return
 	}
-	host.RegisterExecutors(manager, registry.GetGlobalRegistry())
+	host.RegisterExecutors(manager, catalog)
 }
 
 // modelRegistrationTaskHook, if set, runs after auth-update commits and before
@@ -144,7 +144,7 @@ func (s *Service) syncPluginModelRuntime(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	s.pluginHost.RegisterModels(ctx, registry.GetGlobalRegistry())
+	s.pluginHost.RegisterModels(ctx, s.pluginCatalogRegistry())
 	if ctx.Err() != nil {
 		return
 	}

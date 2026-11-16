@@ -524,6 +524,9 @@ func (s *Service) antigravityModelsForHintsWithConfig(auth *coreauth.Auth, hints
 	models = applyOAuthModelAliasForAuth(cfg, "antigravity", auth.AuthKind(), auth.Attributes, models)
 	models = s.appendPluginModels("antigravity", models, excluded)
 	models = applyOAuthSettingsForAuth(cfg, "antigravity", auth.AuthKind(), models)
+	// Publishers hold the cfgMu read lock across this call and the registry write,
+	// so the global list used here stays current until publication.
+	models = filterGlobalExcludedModels(models, cfg.GlobalExcludedModels)
 	return applyModelPrefixes(models, auth.Prefix, cfg.ForceModelPrefix)
 }
 

@@ -46,7 +46,7 @@ func TestRegisterAvailableExecutors(t *testing.T) {
 	pluginRegisterCalls := 0
 	var expectedPluginHost *pluginhost.Host
 	var expectedManager *coreauth.Manager
-	registerPluginExecutors = func(host *pluginhost.Host, manager *coreauth.Manager) {
+	registerPluginExecutors = func(host *pluginhost.Host, manager *coreauth.Manager, _ pluginCatalogRegistry) {
 		pluginRegisterCalls++
 		if host != expectedPluginHost {
 			t.Fatalf("plugin executor registration host = %p, want %p", host, expectedPluginHost)

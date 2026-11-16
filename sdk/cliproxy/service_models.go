@@ -261,11 +261,11 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 				}
 				if len(ms) > 0 {
 					ms = s.appendPluginModels(providerKey, ms, nil)
-					published = s.registerResolvedModelsForAuthFenced(a, fence, providerKey, applyModelPrefixes(ms, a.Prefix, cfg.ForceModelPrefix))
+					published = s.registerResolvedModelsForAuthFenced(a, fence, providerKey, prefixedModelsForFence(fence, ms, a.Prefix, cfg.ForceModelPrefix))
 				} else {
 					ms = s.appendPluginModels(providerKey, nil, nil)
 					if len(ms) > 0 {
-						published = s.registerResolvedModelsForAuthFenced(a, fence, providerKey, applyModelPrefixes(ms, a.Prefix, cfg.ForceModelPrefix))
+						published = s.registerResolvedModelsForAuthFenced(a, fence, providerKey, prefixedModelsForFence(fence, ms, a.Prefix, cfg.ForceModelPrefix))
 					} else {
 						published = s.unregisterModelsForAuthFenced(a, fence)
 					}
@@ -284,11 +284,11 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 					ms := cached.models
 					if len(ms) > 0 {
 						ms = s.appendPluginModels(providerKey, ms, nil)
-						published = s.registerResolvedModelsForAuthFenced(a, fence, providerKey, applyModelPrefixes(ms, a.Prefix, cfg.ForceModelPrefix))
+						published = s.registerResolvedModelsForAuthFenced(a, fence, providerKey, prefixedModelsForFence(fence, ms, a.Prefix, cfg.ForceModelPrefix))
 					} else {
 						ms = s.appendPluginModels(providerKey, nil, nil)
 						if len(ms) > 0 {
-							published = s.registerResolvedModelsForAuthFenced(a, fence, providerKey, applyModelPrefixes(ms, a.Prefix, cfg.ForceModelPrefix))
+							published = s.registerResolvedModelsForAuthFenced(a, fence, providerKey, prefixedModelsForFence(fence, ms, a.Prefix, cfg.ForceModelPrefix))
 						} else {
 							published = s.unregisterModelsForAuthFenced(a, fence)
 						}
@@ -308,7 +308,7 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 			if isCompatAuth {
 				models = s.appendPluginModels(providerKey, nil, nil)
 				if len(models) > 0 {
-					published = s.registerResolvedModelsForAuthFenced(a, fence, providerKey, applyModelPrefixes(models, a.Prefix, cfg.ForceModelPrefix))
+					published = s.registerResolvedModelsForAuthFenced(a, fence, providerKey, prefixedModelsForFence(fence, models, a.Prefix, cfg.ForceModelPrefix))
 				} else {
 					// No matching provider found or models removed entirely; drop any prior registration.
 					published = s.unregisterModelsForAuthFenced(a, fence)
@@ -331,7 +331,7 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 	models = s.appendPluginModels(key, models, excluded)
 	if len(models) > 0 {
 		models = applyOAuthSettingsForAuth(cfg, provider, authKind, models)
-		published = s.registerResolvedModelsForAuthFenced(a, fence, key, applyModelPrefixes(models, a.Prefix, cfg != nil && cfg.ForceModelPrefix))
+		published = s.registerResolvedModelsForAuthFenced(a, fence, key, prefixedModelsForFence(fence, models, a.Prefix, cfg != nil && cfg.ForceModelPrefix))
 		if strings.EqualFold(strings.TrimSpace(a.Provider), "antigravity") {
 			s.asyncProbeAntigravityCapabilities(ctx, a, key)
 		}
@@ -687,6 +687,49 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 		}
 	}
 	return filtered
+}
+
+// filterGlobalExcludedModels drops models whose ID matches a global pattern.
+// Matching is case-insensitive, like applyExcludedModels. Callers pass base IDs,
+// before the credential prefix is added, so a native ID such as "team/x" is
+// matched as written and never mistaken for a generated prefixed variant.
+func filterGlobalExcludedModels(models []*ModelInfo, patterns []string) []*ModelInfo {
+	if len(models) == 0 || len(patterns) == 0 {
+		return models
+	}
+	normalized := make([]string, 0, len(patterns))
+	for _, pattern := range patterns {
+		if trimmed := strings.ToLower(strings.TrimSpace(pattern)); trimmed != "" {
+			normalized = append(normalized, trimmed)
+		}
+	}
+	if len(normalized) == 0 {
+		return models
+	}
+	filtered := make([]*ModelInfo, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		id := strings.ToLower(strings.TrimSpace(model.ID))
+		blocked := false
+		for _, pattern := range normalized {
+			if matchWildcard(pattern, id) {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			filtered = append(filtered, model)
+		}
+	}
+	return filtered
+}
+
+// prefixedModelsForFence applies the fence's captured global list to base IDs,
+// then adds the credential prefix. Every publish path uses it so the order is fixed.
+func prefixedModelsForFence(fence modelRegistrationFence, models []*ModelInfo, prefix string, forceModelPrefix bool) []*ModelInfo {
+	return applyModelPrefixes(filterGlobalExcludedModels(models, fence.globalExcludedModels), prefix, forceModelPrefix)
 }
 
 func cloneModelInfoForCatalogRoute(model *ModelInfo) ModelInfo {
