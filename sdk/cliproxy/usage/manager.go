@@ -645,6 +645,11 @@ type Manager struct {
 	cond   *sync.Cond
 	queue  []queueItem
 	closed bool
+	// published counts accepted records; delivered counts records whose plugin
+	// dispatch has finished. Drain waits until delivered catches up.
+	published uint64
+	delivered uint64
+	drained   *sync.Cond
 
 	pluginsMu sync.RWMutex
 	plugins   []Plugin
@@ -655,6 +660,7 @@ type Manager struct {
 func NewManager(buffer int) *Manager {
 	m := &Manager{}
 	m.cond = sync.NewCond(&m.mu)
+	m.drained = sync.NewCond(&m.mu)
 	return m
 }
 
@@ -777,6 +783,7 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 		return
 	}
 	m.queue = append(m.queue, queueItem{ctx: ctx, record: record})
+	m.published++
 	m.mu.Unlock()
 	m.cond.Signal()
 }
@@ -796,7 +803,26 @@ func (m *Manager) run(ctx context.Context) {
 		m.queue = m.queue[1:]
 		m.mu.Unlock()
 		m.dispatch(item)
+		m.mu.Lock()
+		m.delivered++
+		m.drained.Broadcast()
+		m.mu.Unlock()
 	}
+}
+
+// Drain blocks until every record published before the call has been dispatched
+// to all plugins. It does not stop the dispatcher. Records published during the
+// wait are not awaited.
+func (m *Manager) Drain() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	target := m.published
+	for m.delivered < target {
+		m.drained.Wait()
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) dispatch(item queueItem) {
@@ -840,6 +866,9 @@ func PublishRecord(ctx context.Context, record Record) { DefaultManager().Publis
 
 // StartDefault starts the default manager's dispatcher.
 func StartDefault(ctx context.Context) { DefaultManager().Start(ctx) }
+
+// DrainDefault waits until records already published to the default manager have been delivered.
+func DrainDefault() { DefaultManager().Drain() }
 
 // StopDefault stops the default manager's dispatcher.
 func StopDefault() { DefaultManager().Stop() }

@@ -6,15 +6,23 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
 
 // defaultUsageSaveInterval is the periodic snapshot interval when the config leaves it unset.
 const defaultUsageSaveInterval = 60 * time.Second
 
-// configureUsagePersistence starts, restarts, or stops usage persistence to match newCfg.
-// It runs at startup and on every reload. Persistence needs usage-statistics-enabled and
-// usage-statistics-persist; otherwise the aggregate stops collecting.
+// configureUsagePersistence applies newCfg at startup and on every reload.
+//
+// Path semantics:
+//   - Same path and interval: nothing changes.
+//   - Interval change: restart on the same path; the aggregate is kept.
+//   - Path change: the old file is flushed and stays as it is. The aggregate is reset, and
+//     the new file is loaded into it. History is not moved between files.
+//   - Disabled: collection stops and the file is flushed. The in-memory aggregate is kept.
+//
+// A load failure leaves the file untouched and collection off. The next reload retries.
 func (s *Server) configureUsagePersistence(newCfg *config.Config) {
 	if s == nil {
 		return
@@ -27,7 +35,6 @@ func (s *Server) configureUsagePersistence(newCfg *config.Config) {
 	}
 
 	if newCfg == nil || !newCfg.UsageStatisticsEnabled || !newCfg.UsageStatisticsPersist {
-		usage.GetRequestStatistics().SetCollecting(false)
 		s.stopUsagePersistenceLocked()
 		return
 	}
@@ -47,23 +54,28 @@ func (s *Server) configureUsagePersistence(newCfg *config.Config) {
 		log.Error("usage: cannot resolve usage-statistics path; persistence not started")
 		return
 	}
+	stats := usage.GetRequestStatistics()
+	if path != s.usagePersistencePath {
+		stats.Reset()
+	}
 	persistence := usage.NewPersistence(usage.PersistenceConfig{
-		Stats: usage.GetRequestStatistics(), Path: path, Interval: interval,
+		Stats: stats, Path: path, Interval: interval,
 	})
 	if err := persistence.Load(); err != nil {
 		// Not started: a rejected file must stay as it is. The next config reload retries.
 		log.WithError(err).Error("usage: failed to load persisted usage statistics; the file is unchanged and persistence is not started")
+		s.usagePersistencePath = path
 		return
 	}
-	usage.GetRequestStatistics().SetCollecting(true)
+	s.usagePersistencePath = path
+	stats.SetCollecting(true)
 	persistence.Start()
 	s.usagePersistence = persistence
 	s.usagePersistenceKey = key
 }
 
-// shutdownUsagePersistence stops periodic flushing and writes a final snapshot. Server
-// shutdown calls this so usage recorded since the last periodic flush is not lost. Later
-// reloads are ignored.
+// shutdownUsagePersistence delivers queued usage, stops collection, and writes a final
+// snapshot. Later reloads are ignored.
 func (s *Server) shutdownUsagePersistence() {
 	if s == nil {
 		return
@@ -74,9 +86,16 @@ func (s *Server) shutdownUsagePersistence() {
 	s.stopUsagePersistenceLocked()
 }
 
-// stopUsagePersistenceLocked stops the current persistence handle and stops collecting.
-// The caller must hold usagePersistenceMu.
+// stopUsagePersistenceLocked runs in a fixed order so the final snapshot is complete:
+//  1. Drain the usage queue, so records published before this point reach the aggregate.
+//  2. Fence collection off. SetCollecting waits for plugin calls already recording, and
+//     no record can land after it returns.
+//  3. Stop the persistence handle, which writes the final snapshot.
+//
+// The caller must hold usagePersistenceMu. Drain never waits on this lock, because
+// plugins do not call back into the server.
 func (s *Server) stopUsagePersistenceLocked() {
+	coreusage.DrainDefault()
 	usage.GetRequestStatistics().SetCollecting(false)
 	if s.usagePersistence == nil {
 		return

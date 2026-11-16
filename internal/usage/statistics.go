@@ -8,10 +8,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
@@ -23,10 +22,12 @@ const pruneInterval = time.Hour
 
 const httpStatusBadRequest = 400
 
-// RequestDetail stores one request. JSON tags match the snapshot format.
+// RequestDetail stores one request. JSON tags match the snapshot format. RequestID is the
+// execution ID and is the deduplication key on import and restore.
 type RequestDetail struct {
+	RequestID string     `json:"request_id"`
 	Timestamp time.Time  `json:"timestamp"`
-	AuthID    string     `json:"auth_id,omitempty"`
+	AuthType  string     `json:"auth_type"`
 	Source    string     `json:"source"`
 	Provider  string     `json:"provider,omitempty"`
 	AuthIndex string     `json:"auth_index"`
@@ -94,8 +95,11 @@ type modelStats struct {
 type RequestStatistics struct {
 	mu sync.Mutex
 
-	// collecting gates the usage plugin. It is off unless usage persistence is configured.
-	collecting atomic.Bool
+	// collectMu fences the usage plugin against SetCollecting(false). Plugin calls hold
+	// the read lock while recording; turning collection off takes the write lock, so no
+	// record can land after it returns. collecting is guarded by collectMu.
+	collectMu  sync.RWMutex
+	collecting bool
 
 	totalRequests int64
 	successCount  int64
@@ -127,21 +131,64 @@ func NewRequestStatistics() *RequestStatistics {
 	}
 }
 
-// SetCollecting turns recording from the usage plugin on or off. Persistence enables it
-// only when configured, so the in-memory aggregate does not grow otherwise.
+// SetCollecting turns recording from the usage plugin on or off. It returns after
+// in-flight plugin calls finish, so a later Snapshot includes every record admitted before
+// collection stopped. Persistence enables it only when configured.
 func (s *RequestStatistics) SetCollecting(enabled bool) {
-	if s != nil {
-		s.collecting.Store(enabled)
+	if s == nil {
+		return
 	}
+	s.collectMu.Lock()
+	s.collecting = enabled
+	s.collectMu.Unlock()
 }
 
 // Collecting reports whether the usage plugin records into the aggregate.
 func (s *RequestStatistics) Collecting() bool {
-	return s != nil && s.collecting.Load()
+	if s == nil {
+		return false
+	}
+	s.collectMu.RLock()
+	defer s.collectMu.RUnlock()
+	return s.collecting
 }
 
-// Record aggregates one usage record. The API key is stored only as a fingerprint.
-func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record) {
+// RecordCollected records a plugin delivery while collection is on. It holds the
+// collection fence for the whole call.
+func (s *RequestStatistics) RecordCollected(ctx context.Context, record coreusage.Record) {
+	if s == nil {
+		return
+	}
+	s.collectMu.RLock()
+	defer s.collectMu.RUnlock()
+	if !s.collecting {
+		return
+	}
+	s.Record(ctx, record)
+}
+
+// Reset empties the aggregate and forgets which files were loaded. Callers must stop
+// collection first.
+func (s *RequestStatistics) Reset() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.totalRequests, s.successCount, s.failureCount, s.totalTokens = 0, 0, 0, 0
+	s.apis = make(map[string]*apiStats)
+	s.requestsByDay = make(map[string]int64)
+	s.requestsByHour = make(map[int]int64)
+	s.tokensByDay = make(map[string]int64)
+	s.tokensByHour = make(map[int]int64)
+	s.lastPrune = time.Time{}
+	s.loadedPaths = make(map[string]struct{})
+}
+
+// Record aggregates one usage record. It reads only the record, never the request
+// context, because plugin delivery is asynchronous. The API key is stored only as a
+// fingerprint.
+func (s *RequestStatistics) Record(_ context.Context, record coreusage.Record) {
 	if s == nil {
 		return
 	}
@@ -158,20 +205,20 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	})
 	totalTokens := detail.TotalTokens
 
-	statsKey := record.APIKey
-	if strings.TrimSpace(statsKey) == "" {
-		statsKey = resolveAPIIdentifier(ctx)
+	requestID := strings.TrimSpace(record.RequestID)
+	if requestID == "" {
+		requestID = uuid.NewString()
 	}
-	statsKey = normalizeAPIName(statsKey)
-
-	failed := record.Failed
-	if !failed {
-		failed = !resolveSuccess(ctx)
+	authType := strings.ToLower(strings.TrimSpace(record.AuthType))
+	if authType == "" {
+		authType = "unknown"
 	}
+	statsKey := apiName(record.APIKey)
 	modelName := strings.TrimSpace(record.Model)
 	if modelName == "" {
 		modelName = "unknown"
 	}
+	failed := record.Failed
 	dayKey := timestamp.Format("2006-01-02")
 	hourKey := timestamp.Hour()
 
@@ -196,9 +243,10 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		s.apis[statsKey] = stats
 	}
 	s.updateAPIStats(stats, modelName, RequestDetail{
+		RequestID: requestID,
 		Timestamp: timestamp,
-		AuthID:    record.AuthID,
-		Source:    normalizeSource(record.Source),
+		AuthType:  authType,
+		Source:    sourceName(authType, record.Source),
 		Provider:  record.Provider,
 		AuthIndex: record.AuthIndex,
 		Tokens:    detail,
@@ -363,7 +411,6 @@ func (s *RequestStatistics) mergeSnapshot(snapshot StatisticsSnapshot, loadKey s
 	if s == nil {
 		return result, nil
 	}
-	snapshot, _ = normalizeSnapshot(snapshot)
 	cutoff := time.Now().Add(-detailRetention)
 
 	// Plan the whole merge before touching the aggregate, so a rejected snapshot changes nothing.
@@ -422,10 +469,10 @@ func (s *RequestStatistics) mergeSnapshot(snapshot StatisticsSnapshot, loadKey s
 	}
 
 	seen := make(map[string]struct{})
-	for apiName, stats := range s.apis {
-		for modelName, modelStatsValue := range stats.Models {
+	for _, stats := range s.apis {
+		for _, modelStatsValue := range stats.Models {
 			for _, detail := range modelStatsValue.Details {
-				seen[dedupKey(apiName, modelName, detail)] = struct{}{}
+				seen[detail.RequestID] = struct{}{}
 			}
 		}
 	}
@@ -433,7 +480,7 @@ func (s *RequestStatistics) mergeSnapshot(snapshot StatisticsSnapshot, loadKey s
 		s.apiStatsFor(apiName)
 	}
 	for _, p := range planned {
-		key := dedupKey(p.apiName, p.modelName, p.detail)
+		key := p.detail.RequestID
 		if _, exists := seen[key]; exists {
 			result.Skipped++
 			continue
@@ -543,121 +590,12 @@ func (s *RequestStatistics) recordImported(stats *apiStats, modelName string, de
 	s.tokensByHour[hourKey] += totalTokens
 }
 
-// normalizeSnapshot rewrites raw key material into fingerprints. It returns a
-// normalized copy and whether anything changed.
-func normalizeSnapshot(snapshot StatisticsSnapshot) (StatisticsSnapshot, bool) {
-	changed := false
-	out := snapshot
-	out.APIs = make(map[string]APISnapshot, len(snapshot.APIs))
-	for name, api := range snapshot.APIs {
-		normalized := normalizeAPIName(name)
-		if normalized != name {
-			changed = true
-		}
-		api, apiChanged := normalizeAPISnapshot(api)
-		changed = changed || apiChanged
-		if existing, ok := out.APIs[normalized]; ok {
-			api = mergeAPISnapshots(existing, api)
-		}
-		out.APIs[normalized] = api
-	}
-	return out, changed
-}
-
-func normalizeAPISnapshot(api APISnapshot) (APISnapshot, bool) {
-	changed := false
-	models := make(map[string]ModelSnapshot, len(api.Models))
-	for name, model := range api.Models {
-		details := make([]RequestDetail, len(model.Details))
-		for i, detail := range model.Details {
-			if source := normalizeSource(detail.Source); source != detail.Source {
-				detail.Source = source
-				changed = true
-			}
-			details[i] = detail
-		}
-		model.Details = details
-		models[name] = model
-	}
-	api.Models = models
-	return api, changed
-}
-
-func mergeAPISnapshots(a, b APISnapshot) APISnapshot {
-	merged := APISnapshot{
-		TotalRequests: a.TotalRequests + b.TotalRequests,
-		TotalTokens:   a.TotalTokens + b.TotalTokens,
-		Models:        make(map[string]ModelSnapshot, len(a.Models)+len(b.Models)),
-	}
-	for _, source := range []map[string]ModelSnapshot{a.Models, b.Models} {
-		for name, model := range source {
-			target := merged.Models[name]
-			target.TotalRequests += model.TotalRequests
-			target.TotalTokens += model.TotalTokens
-			target.Details = append(target.Details, model.Details...)
-			merged.Models[name] = target
-		}
-	}
-	return merged
-}
-
-func dedupKey(apiName, modelName string, detail RequestDetail) string {
-	tokens := normaliseTokenStats(detail.Tokens)
-	return fmt.Sprintf(
-		"%s|%s|%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d",
-		apiName,
-		modelName,
-		detail.Timestamp.UTC().Format(time.RFC3339Nano),
-		detail.AuthID,
-		detail.Source,
-		detail.Provider,
-		detail.AuthIndex,
-		detail.Failed,
-		tokens.InputTokens,
-		tokens.OutputTokens,
-		tokens.ReasoningTokens,
-		tokens.CachedTokens,
-		tokens.TotalTokens,
-	)
-}
-
-func resolveAPIIdentifier(ctx context.Context) string {
-	if ctx == nil {
-		return "unknown"
-	}
-	ginCtx, ok := ctx.Value("gin").(*gin.Context)
-	if !ok || ginCtx == nil {
-		return "unknown"
-	}
-	path := ginCtx.FullPath()
-	if path == "" && ginCtx.Request != nil {
-		path = ginCtx.Request.URL.Path
-	}
-	if path == "" {
-		return "unknown"
-	}
-	if ginCtx.Request != nil && ginCtx.Request.Method != "" {
-		return ginCtx.Request.Method + " " + path
-	}
-	return path
-}
-
-func resolveSuccess(ctx context.Context) bool {
-	if ctx == nil {
-		return true
-	}
-	ginCtx, ok := ctx.Value("gin").(*gin.Context)
-	if !ok || ginCtx == nil {
-		return true
-	}
-	status := ginCtx.Writer.Status()
-	if status == 0 {
-		return true
-	}
-	return status < httpStatusBadRequest
-}
-
 func normaliseTokenStats(tokens TokenStats) TokenStats {
+	tokens.InputTokens = nonNegative(tokens.InputTokens)
+	tokens.OutputTokens = nonNegative(tokens.OutputTokens)
+	tokens.ReasoningTokens = nonNegative(tokens.ReasoningTokens)
+	tokens.CachedTokens = nonNegative(tokens.CachedTokens)
+	tokens.TotalTokens = nonNegative(tokens.TotalTokens)
 	if tokens.TotalTokens == 0 {
 		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens
 	}

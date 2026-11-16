@@ -125,6 +125,9 @@ type Server struct {
 	usagePersistenceClosed bool
 	usagePersistence       *usage.Persistence
 	usagePersistenceKey    string
+	// usagePersistencePath is the snapshot path last used. A change to it starts the
+	// aggregate empty from the new file; the old file keeps its history.
+	usagePersistencePath string
 }
 
 // NewServer creates and initializes a new API server instance.

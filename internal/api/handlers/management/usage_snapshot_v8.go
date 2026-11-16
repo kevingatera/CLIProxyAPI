@@ -22,15 +22,15 @@ func (h *Handler) ExportUsageSnapshotV8(c *gin.Context) {
 	c.Data(http.StatusOK, "application/json; charset=utf-8", data)
 }
 
-// ImportUsageSnapshotV8 merges a snapshot exported by this or an earlier build.
-// Raw keys in the body are converted to fingerprints before they are stored.
+// ImportUsageSnapshotV8 merges a version 2 snapshot. Snapshots of any other shape, and
+// snapshots whose API key names or sources are not fingerprints, are rejected.
 func (h *Handler) ImportUsageSnapshotV8(c *gin.Context) {
 	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxUsageImportBytes))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read usage snapshot body"})
 		return
 	}
-	snapshot, _, err := usage.DecodeSnapshot(body)
+	snapshot, err := usage.DecodeSnapshot(body)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

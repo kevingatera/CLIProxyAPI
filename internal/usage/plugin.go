@@ -21,8 +21,8 @@ type usagePlugin struct {
 
 // HandleUsage implements coreusage.Plugin.
 func (p *usagePlugin) HandleUsage(ctx context.Context, record coreusage.Record) {
-	if p == nil || !p.stats.Collecting() || !redisqueue.UsageStatisticsEnabled() {
+	if p == nil || !redisqueue.UsageStatisticsEnabled() {
 		return
 	}
-	p.stats.Record(ctx, record)
+	p.stats.RecordCollected(ctx, record)
 }

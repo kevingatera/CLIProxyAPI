@@ -6,306 +6,200 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
-// legacyRawKeySnapshot is a synthetic version 1 file of the kind earlier builds
-// wrote: raw client keys as apis map keys, and an upstream key in a detail's source.
-const legacyRawKeySnapshot = `{
-  "version": 1,
-  "saved_at": "2026-10-01T00:00:00Z",
-  "usage": {
-    "total_requests": 3,
-    "success_count": 2,
-    "failure_count": 1,
-    "total_tokens": 30,
-    "apis": {
-      "sk-example-legacy-client-0001": {
-        "total_requests": 2,
-        "total_tokens": 20,
-        "models": {
-          "gpt-test": {
-            "total_requests": 2,
-            "total_tokens": 20,
-            "details": [
-              {"timestamp": "2026-10-01T10:00:00Z", "source": "sk-example-legacy-upstream-0001", "auth_index": "a1", "tokens": {"total_tokens": 10}, "failed": false},
-              {"timestamp": "2026-10-01T11:00:00Z", "source": "sk-example-legacy-upstream-0001", "auth_index": "a1", "tokens": {"total_tokens": 10}, "failed": true}
-            ]
-          }
-        }
-      },
-      "POST /v1/responses": {
-        "total_requests": 1,
-        "total_tokens": 10,
-        "models": {
-          "gpt-test": {
-            "total_requests": 1,
-            "total_tokens": 10,
-            "details": [
-              {"timestamp": "2026-10-01T12:00:00Z", "source": "user@example.com", "auth_index": "a2", "tokens": {"total_tokens": 10}, "failed": false}
-            ]
-          }
-        }
-      }
-    },
-    "requests_by_day": {"2026-10-01": 3},
-    "requests_by_hour": {"10": 1, "11": 1, "12": 1},
-    "tokens_by_day": {"2026-10-01": 30},
-    "tokens_by_hour": {"10": 10, "11": 10, "12": 10}
-  }
-}`
-
-const (
-	legacyClientKey   = "sk-example-legacy-client-0001"
-	legacyUpstreamKey = "sk-example-legacy-upstream-0001"
-)
-
-func writeTestFile(t *testing.T, path, content string) {
+// recordsFor builds a stats aggregate holding n requests with identical fields and distinct IDs.
+func recordsFor(t *testing.T, n int, at time.Time) *RequestStatistics {
 	t.Helper()
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatalf("write %s: %v", path, err)
-	}
-}
-
-func TestLoadMigratesRawKeySnapshotOnce(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "usage_stats.json")
-	writeTestFile(t, path, legacyRawKeySnapshot)
-
 	stats := NewRequestStatistics()
-	if err := NewPersistence(PersistenceConfig{Stats: stats, Path: path}).Load(); err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-
-	migrated, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read migrated file: %v", err)
-	}
-	for _, raw := range []string{legacyClientKey, legacyUpstreamKey} {
-		if bytes.Contains(migrated, []byte(raw)) {
-			t.Fatalf("migrated file still contains raw key %q", raw)
-		}
-	}
-	if !bytes.Contains(migrated, []byte(KeyFingerprint(legacyClientKey))) {
-		t.Fatal("migrated file lacks the client key fingerprint")
-	}
-	if !bytes.Contains(migrated, []byte(`"version":2`)) {
-		t.Fatalf("migrated file is not version 2: %s", migrated)
-	}
-
-	snapshot := stats.Snapshot()
-	if snapshot.TotalRequests != 3 || snapshot.FailureCount != 1 || snapshot.TotalTokens != 30 {
-		t.Fatalf("totals lost in migration: %+v", snapshot)
-	}
-	if got := snapshot.APIs[KeyFingerprint(legacyClientKey)].TotalRequests; got != 2 {
-		t.Fatalf("client key requests = %d, want 2", got)
-	}
-	if got := snapshot.APIs["POST /v1/responses"].TotalRequests; got != 1 {
-		t.Fatalf("route requests = %d, want 1", got)
-	}
-
-	// A second load of the migrated file must not rewrite it.
-	before := append([]byte(nil), migrated...)
-	if err := NewPersistence(PersistenceConfig{Stats: NewRequestStatistics(), Path: path}).Load(); err != nil {
-		t.Fatalf("second Load: %v", err)
-	}
-	after, _ := os.ReadFile(path)
-	if !bytes.Equal(before, after) {
-		t.Fatal("second load rewrote an already migrated file")
-	}
-}
-
-func TestLoadMigratesBareLegacySnapshot(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "usage_stats.json")
-	bare := `{"total_requests":1,"success_count":1,"failure_count":0,"total_tokens":5,
-	  "apis":{"sk-example-bare-0001":{"total_requests":1,"total_tokens":5,"models":{"m":{"total_requests":1,"total_tokens":5,"details":[]}}}},
-	  "requests_by_day":{},"requests_by_hour":{},"tokens_by_day":{},"tokens_by_hour":{}}`
-	writeTestFile(t, path, bare)
-
-	stats := NewRequestStatistics()
-	if err := NewPersistence(PersistenceConfig{Stats: stats, Path: path}).Load(); err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if got := stats.Snapshot().TotalRequests; got != 1 {
-		t.Fatalf("bare snapshot loaded %d requests, want 1", got)
-	}
-	data, _ := os.ReadFile(path)
-	if strings.Contains(string(data), "sk-example-bare-0001") || !strings.Contains(string(data), `"version":2`) {
-		t.Fatalf("bare snapshot not migrated: %s", data)
-	}
-}
-
-func TestLoadRejectsUnsupportedOrMalformedWithoutTouchingFile(t *testing.T) {
-	cases := map[string]string{
-		"future version": `{"version":9,"usage":{"total_requests":1}}`,
-		"malformed":      `{not json`,
-	}
-	for name, content := range cases {
-		t.Run(name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "usage_stats.json")
-			writeTestFile(t, path, content)
-			err := NewPersistence(PersistenceConfig{Stats: NewRequestStatistics(), Path: path}).Load()
-			if err == nil {
-				t.Fatal("expected load error")
-			}
-			if got, _ := os.ReadFile(path); string(got) != content {
-				t.Fatalf("file changed after rejected load: %s", got)
-			}
+	for i := 0; i < n; i++ {
+		stats.Record(context.Background(), coreusage.Record{
+			RequestID: "id-" + string(rune('A'+i)), APIKey: "client-key-" + string(rune('a'+i)), Model: "m",
+			RequestedAt: at, AuthType: "apikey", Source: "upstream-key", Detail: coreusage.Detail{TotalTokens: 3},
 		})
 	}
+	return stats
 }
 
+// TestImportDedupesByRequestIDAndKeepsIdenticalRecords checks that two records with the same
+// timestamp and fields both survive, and that re-importing the same export adds nothing.
+func TestImportDedupesByRequestIDAndKeepsIdenticalRecords(t *testing.T) {
+	at := time.Now().UTC().Truncate(time.Second)
+	source := NewRequestStatistics()
+	for i := 0; i < 2; i++ {
+		source.Record(context.Background(), coreusage.Record{
+			RequestID: []string{"same-1", "same-2"}[i], Model: "m", RequestedAt: at, Detail: coreusage.Detail{TotalTokens: 5},
+		})
+	}
+	data := encodedFor(t, source)
+	snapshot, err := DecodeSnapshot(data)
+	if err != nil {
+		t.Fatalf("DecodeSnapshot: %v", err)
+	}
+
+	target := NewRequestStatistics()
+	result, err := target.MergeSnapshot(snapshot)
+	if err != nil || result.Added != 2 {
+		t.Fatalf("first import: result=%+v err=%v, want 2 added", result, err)
+	}
+	result, err = target.MergeSnapshot(snapshot)
+	if err != nil || result.Added != 0 || result.Skipped != 2 {
+		t.Fatalf("repeat import: result=%+v err=%v, want 2 skipped", result, err)
+	}
+	if got := target.Snapshot().TotalRequests; got != 2 {
+		t.Fatalf("total after repeat import = %d, want 2", got)
+	}
+}
+
+func TestExportImportRoundTripKeepsFingerprints(t *testing.T) {
+	source := recordsFor(t, 2, time.Now())
+	data := encodedFor(t, source)
+	snapshot, err := DecodeSnapshot(data)
+	if err != nil {
+		t.Fatalf("DecodeSnapshot(export): %v", err)
+	}
+	target := NewRequestStatistics()
+	if _, err := target.MergeSnapshot(snapshot); err != nil {
+		t.Fatalf("MergeSnapshot: %v", err)
+	}
+	if got, want := target.Snapshot().TotalTokens, source.Snapshot().TotalTokens; got != want {
+		t.Fatalf("tokens after round trip = %d, want %d", got, want)
+	}
+}
+
+// TestDecodeRejectsSnapshotsWithoutRequiredStructure covers shapes that must never be loaded
+// or rewritten: unrelated JSON, legacy and unsupported versions, missing members, broken
+// invariants, and raw key names.
+func TestDecodeRejectsSnapshotsWithoutRequiredStructure(t *testing.T) {
+	valid := `{"version":2,"saved_at":"2026-11-15T00:00:00Z","usage":{"total_requests":0,"success_count":0,"failure_count":0,"total_tokens":0,"apis":{},"requests_by_day":{},"requests_by_hour":{},"tokens_by_day":{},"tokens_by_hour":{}}}`
+	if _, err := DecodeSnapshot([]byte(valid)); err != nil {
+		t.Fatalf("baseline valid snapshot rejected: %v", err)
+	}
+	cases := map[string]string{
+		"empty object":       `{}`,
+		"unrelated json":     `{"name":"notes","items":[1,2]}`,
+		"no version":         `{"usage":{"total_requests":0}}`,
+		"version 1":          `{"version":1,"usage":{"total_requests":0}}`,
+		"bare legacy":        `{"total_requests":0,"success_count":0,"failure_count":0,"total_tokens":0,"apis":{}}`,
+		"usage object empty": `{"version":2,"usage":{}}`,
+		"usage null":         `{"version":2,"usage":null}`,
+		"missing member": `{"version":2,"usage":{"total_requests":0,"success_count":0,"failure_count":0,"total_tokens":0,"apis":{},
+			"requests_by_day":{},"requests_by_hour":{},"tokens_by_day":{}}}`,
+		"counts do not sum": `{"version":2,"usage":{"total_requests":2,"success_count":0,"failure_count":0,"total_tokens":0,"apis":{},
+			"requests_by_day":{},"requests_by_hour":{},"tokens_by_day":{},"tokens_by_hour":{}}}`,
+		"raw key name": `{"version":2,"usage":{"total_requests":1,"success_count":1,"failure_count":0,"total_tokens":0,
+			"apis":{"sk-raw-client-key":{"total_requests":1,"total_tokens":0,"models":{"m":{"total_requests":1,"total_tokens":0,
+			"details":[{"request_id":"r1","timestamp":"2026-11-15T00:00:00Z","auth_type":"apikey","source":"","failed":false,"tokens":{}}]}}}},
+			"requests_by_day":{"2026-11-15":1},"requests_by_hour":{"00":1},"tokens_by_day":{},"tokens_by_hour":{}}}`,
+		"raw api key source": `{"version":2,"usage":{"total_requests":1,"success_count":1,"failure_count":0,"total_tokens":0,
+			"apis":{"unattributed":{"total_requests":1,"total_tokens":0,"models":{"m":{"total_requests":1,"total_tokens":0,
+			"details":[{"request_id":"r1","timestamp":"2026-11-15T00:00:00Z","auth_type":"apikey","source":"sk-raw-upstream","failed":false,"tokens":{}}]}}}},
+			"requests_by_day":{"2026-11-15":1},"requests_by_hour":{"00":1},"tokens_by_day":{},"tokens_by_hour":{}}}`,
+		"detail without request id": `{"version":2,"usage":{"total_requests":1,"success_count":1,"failure_count":0,"total_tokens":0,
+			"apis":{"unattributed":{"total_requests":1,"total_tokens":0,"models":{"m":{"total_requests":1,"total_tokens":0,
+			"details":[{"timestamp":"2026-11-15T00:00:00Z","auth_type":"oauth","source":"a@b.c","failed":false,"tokens":{}}]}}}},
+			"requests_by_day":{"2026-11-15":1},"requests_by_hour":{"00":1},"tokens_by_day":{},"tokens_by_hour":{}}}`,
+	}
+	for name, body := range cases {
+		if _, err := DecodeSnapshot([]byte(body)); err == nil {
+			t.Errorf("%s: accepted, want rejection", name)
+		}
+	}
+}
+
+// TestLoadRejectedFileIsNeverRewritten checks that a file failing validation stays byte-identical,
+// and that a blocked Persistence refuses to write over it.
+func TestLoadRejectedFileIsNeverRewritten(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage_stats.json")
+	original := []byte(`{"name":"unrelated","items":[1,2,3]}`)
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stats := NewRequestStatistics()
+	p := NewPersistence(PersistenceConfig{Stats: stats, Path: path, Interval: time.Hour})
+	if err := p.Load(); err == nil {
+		t.Fatal("Load accepted an unrelated file")
+	}
+	if err := p.Flush(); !errors.Is(err, errSnapshotNotLoaded) {
+		t.Fatalf("Flush after rejected load = %v, want errSnapshotNotLoaded", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Fatalf("rejected file was rewritten: %s", after)
+	}
+}
+
+// TestFlushFailedCommitKeepsLastGoodSnapshot simulates a failed rename. The previous file must
+// survive and no temp file may be left behind.
 func TestFlushFailedCommitKeepsLastGoodSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "usage_stats.json")
+	good := encodedFor(t, recordsFor(t, 1, time.Now()))
+	if err := os.WriteFile(path, good, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	stats := NewRequestStatistics()
-	p := NewPersistence(PersistenceConfig{Stats: stats, Path: path})
-
-	stats.Record(context.Background(), coreusage.Record{APIKey: legacyClientKey, Model: "m", RequestedAt: time.Now()})
-	if err := p.Flush(); err != nil {
-		t.Fatalf("first Flush: %v", err)
+	p := NewPersistence(PersistenceConfig{Stats: stats, Path: path, Interval: time.Hour})
+	if err := p.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
 	}
-	good, _ := os.ReadFile(path)
 
-	prevRename := renameFile
-	renameFile = func(string, string) error { return errors.New("simulated rename failure") }
-	defer func() { renameFile = prevRename }()
+	prev := renameFile
+	renameFile = func(string, string) error { return errors.New("simulated commit failure") }
+	defer func() { renameFile = prev }()
 
-	stats.Record(context.Background(), coreusage.Record{APIKey: legacyClientKey, Model: "m", RequestedAt: time.Now()})
+	stats.Record(context.Background(), coreusage.Record{RequestID: "later", Model: "m", RequestedAt: time.Now()})
 	if err := p.Flush(); err == nil {
-		t.Fatal("expected flush error")
+		t.Fatal("Flush succeeded with a failing rename")
 	}
-	if after, _ := os.ReadFile(path); !bytes.Equal(good, after) {
-		t.Fatal("failed commit changed the last-good snapshot")
+	after, _ := os.ReadFile(path)
+	if !bytes.Equal(after, good) {
+		t.Fatal("failed commit changed the last good snapshot")
 	}
 	entries, _ := os.ReadDir(dir)
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".tmp") {
-			t.Fatalf("temp file left behind: %s", e.Name())
-		}
+	if len(entries) != 1 {
+		t.Fatalf("temp files left behind: %d entries", len(entries))
 	}
 }
 
-func TestExportImportRoundTripDeduplicates(t *testing.T) {
-	src := NewRequestStatistics()
-	src.Record(context.Background(), coreusage.Record{APIKey: legacyClientKey, Model: "m", RequestedAt: time.Now(), Detail: coreusage.Detail{TotalTokens: 7}})
-	data, err := EncodeSnapshot(src.Snapshot())
-	if err != nil {
-		t.Fatalf("EncodeSnapshot: %v", err)
-	}
-
-	snapshot, needsRewrite, err := DecodeSnapshot(data)
-	if err != nil || needsRewrite {
-		t.Fatalf("DecodeSnapshot current format: err=%v needsRewrite=%v", err, needsRewrite)
-	}
-	dst := NewRequestStatistics()
-	if got, err := dst.MergeSnapshot(snapshot); err != nil || got.Added != 1 || got.Skipped != 0 {
-		t.Fatalf("first merge = %+v, err %v", got, err)
-	}
-	if got, err := dst.MergeSnapshot(snapshot); err != nil || got.Added != 0 || got.Skipped != 1 {
-		t.Fatalf("repeat merge = %+v, err %v", got, err)
-	}
-}
-
-func TestImportOfRawKeyExportStoresFingerprints(t *testing.T) {
-	snapshot, _, err := DecodeSnapshot([]byte(legacyRawKeySnapshot))
-	if err != nil {
-		t.Fatalf("DecodeSnapshot: %v", err)
-	}
-	dst := NewRequestStatistics()
-	if _, err := dst.MergeSnapshot(snapshot); err != nil {
-		t.Fatalf("MergeSnapshot: %v", err)
-	}
-	data, err := EncodeSnapshot(dst.Snapshot())
-	if err != nil {
-		t.Fatalf("EncodeSnapshot: %v", err)
-	}
-	if bytes.Contains(data, []byte(legacyClientKey)) || bytes.Contains(data, []byte(legacyUpstreamKey)) {
-		t.Fatal("imported raw keys reached the stored snapshot")
-	}
-}
-
-func TestLoadFailedCommitLeavesFileAndAggregateUntouched(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "usage_stats.json")
-	writeTestFile(t, path, legacyRawKeySnapshot)
-	stats := NewRequestStatistics()
-	p := NewPersistence(PersistenceConfig{Stats: stats, Path: path})
-
-	prevRename := renameFile
-	renameFile = func(string, string) error { return errors.New("simulated rename failure") }
-	defer func() { renameFile = prevRename }()
-
-	if err := p.Load(); err == nil {
-		t.Fatal("expected migration commit error")
-	}
-	if got := stats.Snapshot().TotalRequests; got != 0 {
-		t.Fatalf("failed load changed the aggregate: total = %d", got)
-	}
-	if got, _ := os.ReadFile(path); string(got) != legacyRawKeySnapshot {
-		t.Fatal("failed load changed the file")
-	}
-	if err := p.Flush(); err == nil {
-		t.Fatal("Flush must not overwrite a snapshot that failed to load")
-	}
-	if got, _ := os.ReadFile(path); string(got) != legacyRawKeySnapshot {
-		t.Fatal("refused flush changed the file")
-	}
-
-	renameFile = prevRename
-	if err := p.Load(); err != nil {
-		t.Fatalf("retry Load: %v", err)
-	}
-	if got := stats.Snapshot().TotalRequests; got != 3 {
-		t.Fatalf("retry total = %d, want 3", got)
-	}
-	if err := p.Load(); err != nil {
-		t.Fatalf("repeat Load: %v", err)
-	}
-	if got := stats.Snapshot().TotalRequests; got != 3 {
-		t.Fatalf("repeat Load double counted: total = %d, want 3", got)
-	}
-}
-
-func TestImportRejectsPrunedTotalsIntoNonEmptyAggregate(t *testing.T) {
-	snapshot, _, err := DecodeSnapshot([]byte(legacyRawKeySnapshot))
-	if err != nil {
-		t.Fatalf("DecodeSnapshot: %v", err)
-	}
-	dst := NewRequestStatistics()
-	if _, err := dst.MergeSnapshot(snapshot); err != nil {
-		t.Fatalf("first import: %v", err)
-	}
-	if got := dst.Snapshot().TotalRequests; got != 3 {
-		t.Fatalf("first import total = %d, want 3", got)
-	}
-	if _, err := dst.MergeSnapshot(snapshot); !errors.Is(err, ErrOverlappingSnapshot) {
-		t.Fatalf("second import err = %v, want ErrOverlappingSnapshot", err)
-	}
-	if got := dst.Snapshot().TotalRequests; got != 3 {
-		t.Fatalf("rejected import changed totals: %d, want 3", got)
-	}
-}
-
+// TestLoadSamePathTwiceMergesOnce checks that reloading the same file in one process does not
+// count its requests twice.
 func TestLoadSamePathTwiceMergesOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "usage_stats.json")
-	writeTestFile(t, path, legacyRawKeySnapshot)
+	if err := os.WriteFile(path, encodedFor(t, recordsFor(t, 2, time.Now())), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	stats := NewRequestStatistics()
+	for i := 0; i < 2; i++ {
+		p := NewPersistence(PersistenceConfig{Stats: stats, Path: path, Interval: time.Hour})
+		if err := p.Load(); err != nil {
+			t.Fatalf("Load %d: %v", i, err)
+		}
+	}
+	if got := stats.Snapshot().TotalRequests; got != 2 {
+		t.Fatalf("total after two loads of one path = %d, want 2", got)
+	}
+}
 
-	if err := NewPersistence(PersistenceConfig{Stats: stats, Path: path}).Load(); err != nil {
-		t.Fatalf("first Load: %v", err)
+// TestStopWritesFinalSnapshotWithoutStart checks that Stop flushes even when periodic writes
+// never started.
+func TestStopWritesFinalSnapshotWithoutStart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage_stats.json")
+	stats := recordsFor(t, 1, time.Now())
+	p := NewPersistence(PersistenceConfig{Stats: stats, Path: path, Interval: time.Hour})
+	p.Stop()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("final snapshot missing: %v", err)
 	}
-	// A restarted Persistence for the same file sees pruned totals; it must not reject or re-add them.
-	p := NewPersistence(PersistenceConfig{Stats: stats, Path: path})
-	if err := p.Load(); err != nil {
-		t.Fatalf("second Load: %v", err)
-	}
-	if got := stats.Snapshot().TotalRequests; got != 3 {
-		t.Fatalf("total after reload = %d, want 3", got)
-	}
-	if err := p.Flush(); err != nil {
-		t.Fatalf("Flush after reload: %v", err)
+	if _, err := DecodeSnapshot(data); err != nil {
+		t.Fatalf("final snapshot does not validate: %v", err)
 	}
 }

@@ -6,53 +6,75 @@ import (
 	"strings"
 )
 
-// fingerprintPrefix marks a persisted key identifier. The digest is one-way,
-// so a snapshot never holds a raw API key.
+// fingerprintPrefix marks a stored key identifier.
 const fingerprintPrefix = "key:sha256:"
 
-// fingerprintHexLen is the number of hex digits kept from the SHA-256 digest.
+// fingerprintHexLen is the number of hex digits kept from the SHA-256 digest (64 bits).
 const fingerprintHexLen = 16
 
-// KeyFingerprint returns the stable, non-secret identifier stored in place of an API key.
+// unattributedName groups requests that carried no client API key.
+const unattributedName = "unattributed"
+
+// authTypeOAuth is the auth kind upstream reports for OAuth accounts.
+const authTypeOAuth = "oauth"
+
+// KeyFingerprint returns the stored identifier for an API key. The digest is one-way
+// and unsalted: it stops plain-text recovery, but short or guessable keys can be
+// confirmed by hashing candidates.
 func KeyFingerprint(rawKey string) string {
 	sum := sha256.Sum256([]byte(rawKey))
 	return fingerprintPrefix + hex.EncodeToString(sum[:fingerprintHexLen/2])
 }
 
-func isFingerprint(value string) bool {
-	digest, ok := strings.CutPrefix(value, fingerprintPrefix)
-	if !ok || len(digest) != fingerprintHexLen {
-		return false
+// apiName returns the aggregate key for a record. The type is known from the record
+// field, not from the string: a client API key is always fingerprinted, and a request
+// without one is grouped as unattributed.
+func apiName(clientKey string) string {
+	key := strings.TrimSpace(clientKey)
+	if key == "" {
+		return unattributedName
 	}
-	_, err := hex.DecodeString(digest)
-	return err == nil
+	return KeyFingerprint(key)
 }
 
-// isRouteLabel reports whether value is a route label such as "POST /v1/responses".
-// Route labels are not secrets; API keys never contain whitespace or a leading slash.
-func isRouteLabel(value string) bool {
-	return strings.HasPrefix(value, "/") || strings.ContainsAny(value, " \t") || value == "unknown"
-}
-
-// normalizeAPIName returns the persisted form of an aggregation key.
-func normalizeAPIName(name string) string {
-	name = strings.TrimSpace(name)
-	switch {
-	case name == "":
-		return "unknown"
-	case isFingerprint(name), isRouteLabel(name):
-		return name
-	default:
-		return KeyFingerprint(name)
-	}
-}
-
-// normalizeSource keeps account emails and fingerprints everything else. For api_key
-// auths the source is the upstream API key itself, so only emails pass through.
-func normalizeSource(source string) string {
+// sourceName returns the stored source for a record. Only OAuth accounts keep their
+// identity (typically the account email). Every other source is an upstream API key
+// and is fingerprinted, whatever its characters.
+func sourceName(authType, source string) string {
 	source = strings.TrimSpace(source)
-	if source == "" || isFingerprint(source) || strings.Contains(source, "@") {
+	if source == "" {
+		return ""
+	}
+	if authType == authTypeOAuth {
 		return source
 	}
 	return KeyFingerprint(source)
+}
+
+// isFingerprint reports whether name has exactly the stored fingerprint form.
+func isFingerprint(name string) bool {
+	digest, ok := strings.CutPrefix(name, fingerprintPrefix)
+	if !ok || len(digest) != fingerprintHexLen {
+		return false
+	}
+	for _, c := range digest {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// validAPIName reports whether name is a valid aggregate key for a snapshot.
+func validAPIName(name string) bool {
+	return name == unattributedName || isFingerprint(name)
+}
+
+// validSourceName reports whether a detail source is acceptable in a snapshot. API key
+// sources must already be fingerprints. OAuth sources are kept as stored.
+func validSourceName(authType, source string) bool {
+	if source == "" || authType == authTypeOAuth {
+		return true
+	}
+	return isFingerprint(source)
 }

@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -13,9 +14,15 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// snapshotVersion is the current on-disk and export format. Version 1 files
-// (written by earlier builds, with raw keys) are migrated on load.
+// snapshotVersion is the only on-disk and import format. Files in any other shape are
+// rejected, never rewritten.
 const snapshotVersion = 2
+
+// requiredUsageFields lists the members every usage object must carry.
+var requiredUsageFields = []string{
+	"total_requests", "success_count", "failure_count", "total_tokens", "apis",
+	"requests_by_day", "requests_by_hour", "tokens_by_day", "tokens_by_hour",
+}
 
 // renameFile is swapped in tests to simulate a failed commit.
 var renameFile = os.Rename
@@ -39,40 +46,109 @@ func EncodeSnapshot(snapshot StatisticsSnapshot) ([]byte, error) {
 	})
 }
 
-// DecodeSnapshot parses a versioned container (v1 or v2) or a bare legacy snapshot.
-// It normalizes raw key material to fingerprints. needsRewrite reports that the
-// input was not in the current format or held raw keys, so the caller should
-// write it back.
-func DecodeSnapshot(data []byte) (snapshot StatisticsSnapshot, needsRewrite bool, err error) {
+// DecodeSnapshot parses and validates a version 2 container. It returns an error for any
+// other shape, including unversioned files, unknown versions, missing fields, failed
+// invariants, and stored names that are not fingerprints. It never rewrites input.
+func DecodeSnapshot(data []byte) (StatisticsSnapshot, error) {
 	var probe struct {
 		Version *int            `json:"version"`
 		Usage   json.RawMessage `json:"usage"`
 	}
-	if err = json.Unmarshal(data, &probe); err != nil {
-		return StatisticsSnapshot{}, false, fmt.Errorf("decode usage snapshot: %w", err)
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return StatisticsSnapshot{}, fmt.Errorf("decode usage snapshot: %w", err)
 	}
+	if probe.Version == nil || *probe.Version != snapshotVersion {
+		return StatisticsSnapshot{}, fmt.Errorf("unsupported usage snapshot: want version %d", snapshotVersion)
+	}
+	if err := requireUsageFields(probe.Usage); err != nil {
+		return StatisticsSnapshot{}, err
+	}
+	var snapshot StatisticsSnapshot
+	if err := json.Unmarshal(probe.Usage, &snapshot); err != nil {
+		return StatisticsSnapshot{}, fmt.Errorf("decode usage snapshot body: %w", err)
+	}
+	if err := validateSnapshot(snapshot); err != nil {
+		return StatisticsSnapshot{}, err
+	}
+	return snapshot, nil
+}
 
-	if probe.Usage == nil {
-		// Bare snapshot from before the versioned container existed.
-		if err = json.Unmarshal(data, &snapshot); err != nil {
-			return StatisticsSnapshot{}, false, fmt.Errorf("decode legacy usage snapshot: %w", err)
+func requireUsageFields(raw json.RawMessage) error {
+	if len(raw) == 0 {
+		return errors.New("invalid usage snapshot: missing usage object")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return errors.New("invalid usage snapshot: usage must be an object")
+	}
+	for _, name := range requiredUsageFields {
+		value, ok := fields[name]
+		if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("invalid usage snapshot: missing usage.%s", name)
 		}
-		snapshot, _ = normalizeSnapshot(snapshot)
-		return snapshot, true, nil
+	}
+	return nil
+}
+
+// validateSnapshot checks the invariants a snapshot written by this code always holds.
+func validateSnapshot(s StatisticsSnapshot) error {
+	if s.TotalRequests < 0 || s.SuccessCount < 0 || s.FailureCount < 0 || s.TotalTokens < 0 {
+		return errors.New("invalid usage snapshot: negative totals")
+	}
+	if s.SuccessCount+s.FailureCount != s.TotalRequests {
+		return errors.New("invalid usage snapshot: success and failure counts do not sum to total_requests")
+	}
+	if sumCounts(s.RequestsByDay) != s.TotalRequests || sumCounts(s.RequestsByHour) != s.TotalRequests {
+		return errors.New("invalid usage snapshot: request counts by day or hour do not match total_requests")
+	}
+	if sumCounts(s.TokensByDay) != s.TotalTokens || sumCounts(s.TokensByHour) != s.TotalTokens {
+		return errors.New("invalid usage snapshot: token counts by day or hour do not match total_tokens")
 	}
 
-	version := 0
-	if probe.Version != nil {
-		version = *probe.Version
+	var apiRequests, apiTokens int64
+	seen := make(map[string]struct{})
+	for name, api := range s.APIs {
+		if !validAPIName(name) {
+			return errors.New("invalid usage snapshot: api key name is not a fingerprint")
+		}
+		var modelRequests, modelTokens int64
+		for _, model := range api.Models {
+			if model.TotalRequests < 0 || model.TotalTokens < 0 {
+				return errors.New("invalid usage snapshot: negative model totals")
+			}
+			modelRequests += model.TotalRequests
+			modelTokens += model.TotalTokens
+			for _, detail := range model.Details {
+				if strings.TrimSpace(detail.RequestID) == "" || detail.Timestamp.IsZero() {
+					return errors.New("invalid usage snapshot: detail lacks request_id or timestamp")
+				}
+				if _, dup := seen[detail.RequestID]; dup {
+					return errors.New("invalid usage snapshot: duplicate request_id")
+				}
+				seen[detail.RequestID] = struct{}{}
+				if !validSourceName(detail.AuthType, detail.Source) {
+					return errors.New("invalid usage snapshot: api key source is not a fingerprint")
+				}
+			}
+		}
+		if api.TotalRequests != modelRequests || api.TotalTokens != modelTokens {
+			return errors.New("invalid usage snapshot: api totals do not match its models")
+		}
+		apiRequests += api.TotalRequests
+		apiTokens += api.TotalTokens
 	}
-	if version < 0 || version > snapshotVersion {
-		return StatisticsSnapshot{}, false, fmt.Errorf("unsupported usage snapshot version %d", version)
+	if apiRequests != s.TotalRequests || apiTokens != s.TotalTokens {
+		return errors.New("invalid usage snapshot: api totals do not match total_requests or total_tokens")
 	}
-	if err = json.Unmarshal(probe.Usage, &snapshot); err != nil {
-		return StatisticsSnapshot{}, false, fmt.Errorf("decode usage snapshot body: %w", err)
+	return nil
+}
+
+func sumCounts(values map[string]int64) int64 {
+	var total int64
+	for _, v := range values {
+		total += v
 	}
-	snapshot, changed := normalizeSnapshot(snapshot)
-	return snapshot, changed || version != snapshotVersion, nil
+	return total
 }
 
 // Persistence periodically writes the usage aggregate to disk.
@@ -109,9 +185,7 @@ func NewPersistence(cfg PersistenceConfig) *Persistence {
 }
 
 // Load merges the snapshot at path into the aggregate. A missing file is not an error.
-// Legacy or raw-key snapshots are migrated once. The migration is committed to disk
-// before the aggregate changes, so a failed Load leaves both untouched and the
-// next Load can retry. A failed Load blocks Flush.
+// A file that fails validation is an error and is left untouched. A failed Load blocks Flush.
 func (p *Persistence) Load() error {
 	if p == nil || p.stats == nil || p.path == "" {
 		return nil
@@ -131,19 +205,9 @@ func (p *Persistence) load() error {
 		}
 		return fmt.Errorf("read usage snapshot %s: %w", p.path, err)
 	}
-	snapshot, needsRewrite, err := DecodeSnapshot(data)
+	snapshot, err := DecodeSnapshot(data)
 	if err != nil {
 		return fmt.Errorf("load usage snapshot %s: %w", p.path, err)
-	}
-	if needsRewrite {
-		encoded, err := EncodeSnapshot(snapshot)
-		if err != nil {
-			return fmt.Errorf("encode migrated usage snapshot: %w", err)
-		}
-		if err := writeFileAtomic(p.path, encoded, 0o600); err != nil {
-			return fmt.Errorf("migrate usage snapshot %s: %w", p.path, err)
-		}
-		log.Info("usage: migrated persisted snapshot to the fingerprinted format")
 	}
 	if _, err := p.stats.restoreSnapshot(p.path, snapshot); err != nil {
 		return fmt.Errorf("load usage snapshot %s: %w", p.path, err)
@@ -244,16 +308,14 @@ func (p *Persistence) Start() {
 					log.WithError(err).Warn("usage: failed to persist snapshot")
 				}
 			case <-stop:
-				if err := p.Flush(); err != nil {
-					log.WithError(err).Warn("usage: failed to persist snapshot on shutdown")
-				}
 				return
 			}
 		}
 	}()
 }
 
-// Stop stops periodic flushing and performs a final Flush.
+// Stop stops periodic flushing and performs a final Flush. The caller must stop
+// collection first so that the final snapshot is complete.
 func (p *Persistence) Stop() {
 	if p == nil {
 		return
@@ -263,9 +325,11 @@ func (p *Persistence) Stop() {
 	p.stop, p.done = nil, nil
 	p.mu.Unlock()
 
-	if stop == nil {
-		return
+	if stop != nil {
+		close(stop)
+		<-done
 	}
-	close(stop)
-	<-done
+	if err := p.Flush(); err != nil {
+		log.WithError(err).Warn("usage: failed to persist snapshot on shutdown")
+	}
 }
