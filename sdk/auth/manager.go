@@ -141,6 +141,9 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 	}
 	applyLoginProxyToRecord(record, loginProxyURL)
 
+	if errResolve := ResolveCodexRecordFileName(m.store, record); errResolve != nil {
+		return record, "", errResolve
+	}
 	savedPath, err := m.store.Save(coreauth.WithAuthCreationIntent(ctx), record)
 	if err != nil {
 		return record, "", err

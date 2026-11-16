@@ -402,6 +402,14 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				"plan_type": planType,
 			},
 		}
+		if _, targeted := GetOAuthSessionTarget(state); !targeted {
+			// Resolve before the runtime registration lookup so the record ID is final.
+			if errResolve := sdkAuth.ResolveCodexRecordFileName(h.tokenStoreWithBaseDir(), record); errResolve != nil {
+				log.Errorf("Failed to resolve Codex credential file: %v", errResolve)
+				SetOAuthSessionError(state, "Failed to save authentication tokens")
+				return
+			}
+		}
 		savedPath, okSaved := h.commitAndCompleteBuiltinOAuthSession(ctx, state, "codex", sessionProxyURL, record, "Failed to save authentication tokens", true)
 		if !okSaved {
 			return

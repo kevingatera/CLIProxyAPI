@@ -1,6 +1,9 @@
 package auth
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -47,7 +50,7 @@ func firstNonEmptyString(values ...string) string {
 
 // codexAuthIdentity derives the identity of an in-memory Codex credential.
 func codexAuthIdentity(auth *cliproxyauth.Auth) string {
-	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+	if !isCodexAuth(auth) {
 		return ""
 	}
 	accountID, idToken := "", ""
@@ -61,156 +64,173 @@ func codexAuthIdentity(auth *cliproxyauth.Auth) string {
 	return codexIdentity(accountID, idToken)
 }
 
+func isCodexAuth(auth *cliproxyauth.Auth) bool {
+	return auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex")
+}
+
 func metadataString(metadata map[string]any, key string) string {
 	value, _ := metadata[key].(string)
 	return value
 }
 
-// codexIdentityIndex maps identity to the credential files that carry it. It is built
-// once per base directory and kept current by Save and Delete. Guarded by FileTokenStore.mu.
-type codexIdentityIndex struct {
-	dir    string
-	built  bool
-	byKey  map[string]map[string]struct{}
-	byName map[string]string
-}
-
-func (idx *codexIdentityIndex) reset(dir string) {
-	idx.dir = dir
-	idx.built = true
-	idx.byKey = make(map[string]map[string]struct{})
-	idx.byName = make(map[string]string)
-}
-
-// set records that file name carries identity. An empty identity removes the entry.
-func (idx *codexIdentityIndex) set(name, identity string) {
-	if !idx.built || name == "" {
-		return
-	}
-	if old, ok := idx.byName[name]; ok {
-		if names := idx.byKey[old]; names != nil {
-			delete(names, name)
-			if len(names) == 0 {
-				delete(idx.byKey, old)
-			}
-		}
-		delete(idx.byName, name)
-	}
-	if identity == "" {
-		return
-	}
-	idx.byName[name] = identity
-	names := idx.byKey[identity]
-	if names == nil {
-		names = make(map[string]struct{})
-		idx.byKey[identity] = names
-	}
-	names[name] = struct{}{}
-}
-
-// relIndexName returns the index key for path inside dir, or "" when path is outside dir.
-func relIndexName(dir, path string) string {
-	rel, err := filepath.Rel(dir, path)
-	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
-		return ""
-	}
-	return rel
-}
-
-func (s *FileTokenStore) ensureCodexIndexLocked(dir string) {
-	if s.codexIndex.built && s.codexIndex.dir == dir {
-		return
-	}
-	s.codexIndex.reset(dir)
-	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil || d.IsDir() || !strings.HasSuffix(strings.ToLower(d.Name()), ".json") {
-			return nil
-		}
-		name := relIndexName(dir, path)
-		raw, errRead := os.ReadFile(path)
-		if name == "" || errRead != nil {
-			return nil
-		}
-		var probe struct {
-			Type      string `json:"type"`
-			AccountID string `json:"account_id"`
-			IDToken   string `json:"id_token"`
-		}
-		if errJSON := json.Unmarshal(raw, &probe); errJSON != nil {
-			return nil
-		}
-		if strings.EqualFold(strings.TrimSpace(probe.Type), "codex") {
-			s.codexIndex.set(name, codexIdentity(probe.AccountID, probe.IDToken))
-		}
-		return nil
-	})
-}
-
-// redirectCodexDuplicateLocked returns the file a Codex credential should be written to.
-// A save that would create a new file is redirected to the single existing file with the
-// same identity. An existing target file is never redirected. When several files share an
-// identity, none is overwritten and the new file keeps its own path. Caller holds s.mu.
-func (s *FileTokenStore) redirectCodexDuplicateLocked(auth *cliproxyauth.Auth, path string) string {
-	identity := codexAuthIdentity(auth)
-	dir := s.baseDirSnapshot()
-	if identity == "" || dir == "" {
-		return path
-	}
-	s.ensureCodexIndexLocked(dir)
-	if _, errStat := os.Stat(path); errStat == nil {
-		return path
-	}
-	matches := s.codexIndex.byKey[identity]
-	if len(matches) == 0 {
-		return path
-	}
-	if len(matches) > 1 {
-		log.Warnf("codex: %d credential files share one account and user; saving without merging", len(matches))
-		return path
-	}
-	for name := range matches {
-		target := filepath.Join(dir, name)
-		if _, errStat := os.Stat(target); errStat != nil {
-			// Stale index entry: the file was removed outside this store.
-			s.codexIndex.set(name, "")
-			return path
-		}
-		auth.FileName = name
-		auth.ID = name
-		return target
-	}
-	return path
-}
-
-// indexSavedCodexLocked refreshes the index entry for a file this store just wrote.
-func (s *FileTokenStore) indexSavedCodexLocked(auth *cliproxyauth.Auth, path string) {
-	dir := s.baseDirSnapshot()
-	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") || dir == "" {
-		return
-	}
-	if !s.codexIndex.built || s.codexIndex.dir != dir {
-		return
-	}
-	name := relIndexName(dir, path)
-	raw, errRead := os.ReadFile(path)
-	if name == "" || errRead != nil {
-		s.codexIndex.set(name, "")
-		return
+// readCodexIdentity reads one JSON file. isCodex is false for files that are not
+// Codex credentials or do not parse, so they are ignored. A returned error means the
+// file could not be read and the caller must not decide from it.
+func readCodexIdentity(path string) (identity string, isCodex bool, err error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", false, err
 	}
 	var probe struct {
+		Type      string `json:"type"`
 		AccountID string `json:"account_id"`
 		IDToken   string `json:"id_token"`
 	}
 	if errJSON := json.Unmarshal(raw, &probe); errJSON != nil {
-		s.codexIndex.set(name, "")
-		return
+		return "", false, nil
 	}
-	s.codexIndex.set(name, codexIdentity(probe.AccountID, probe.IDToken))
+	if !strings.EqualFold(strings.TrimSpace(probe.Type), "codex") {
+		return "", false, nil
+	}
+	return codexIdentity(probe.AccountID, probe.IDToken), true, nil
 }
 
-// forgetCodexFileLocked drops a deleted file from the index. Caller holds s.mu.
-func (s *FileTokenStore) forgetCodexFileLocked(path string) {
-	if dir := s.baseDirSnapshot(); dir != "" {
-		s.codexIndex.set(relIndexName(dir, path), "")
+// scanCodexIdentities reads every Codex credential under dir on each call. Nothing is
+// cached, so files added, replaced, or deleted outside this store are seen immediately.
+// Any read error other than a file that vanished during the scan fails the whole scan.
+func scanCodexIdentities(dir string) (map[string]string, error) {
+	out := make(map[string]string)
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if errors.Is(walkErr, fs.ErrNotExist) && path == dir {
+				return nil
+			}
+			return walkErr
+		}
+		if d.IsDir() || !strings.HasSuffix(strings.ToLower(d.Name()), ".json") {
+			return nil
+		}
+		identity, isCodex, errRead := readCodexIdentity(path)
+		if errors.Is(errRead, fs.ErrNotExist) {
+			return nil
+		}
+		if errRead != nil {
+			return errRead
+		}
+		if !isCodex {
+			return nil
+		}
+		rel, errRel := filepath.Rel(dir, path)
+		if errRel != nil {
+			return errRel
+		}
+		out[rel] = identity
+		return nil
+	})
+	return out, err
+}
+
+// ResolveCodexFileName returns the file name a Codex credential should be saved under.
+// Call it before the record is registered with the runtime manager. The result is the
+// existing file for the same account and user when there is exactly one, so a re-login
+// after a plan change reuses that file. It fails when the default name already holds a
+// different or unverifiable credential, so no file is overwritten. Ambiguous matches
+// fall back to the default name.
+func (s *FileTokenStore) ResolveCodexFileName(auth *cliproxyauth.Auth) (string, error) {
+	if auth == nil {
+		return "", fmt.Errorf("auth filestore: auth is nil")
 	}
+	name := strings.TrimSpace(auth.FileName)
+	if name == "" {
+		name = strings.TrimSpace(auth.ID)
+	}
+	identity := codexAuthIdentity(auth)
+	dir := s.baseDirSnapshot()
+	if !isCodexAuth(auth) || identity == "" || dir == "" || name == "" || filepath.Base(name) != name {
+		return name, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	known, err := scanCodexIdentities(dir)
+	if err != nil {
+		return "", fmt.Errorf("auth filestore: scan codex credentials failed: %w", err)
+	}
+	if _, errStat := os.Stat(filepath.Join(dir, name)); errStat == nil {
+		if known[name] == identity {
+			return name, nil
+		}
+		return "", fmt.Errorf("auth filestore: %s already exists and is not verified as this Codex account; remove or rename it and log in again", name)
+	} else if !errors.Is(errStat, fs.ErrNotExist) {
+		return "", fmt.Errorf("auth filestore: stat %s failed: %w", name, errStat)
+	}
+
+	var matches []string
+	for candidate, candidateIdentity := range known {
+		if candidateIdentity == identity {
+			matches = append(matches, candidate)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return name, nil
+	case 1:
+		return matches[0], nil
+	default:
+		log.Warnf("codex: %d credential files share one account and user; saving %s without merging", len(matches), name)
+		return name, nil
+	}
+}
+
+// verifyCodexTargetLocked refuses a creation save over an existing file that is not
+// verified as the same Codex identity. Runtime refreshes do not carry creation intent
+// and are not checked. Caller holds s.mu.
+func (s *FileTokenStore) verifyCodexTargetLocked(ctx context.Context, auth *cliproxyauth.Auth, path string) error {
+	if !isCodexAuth(auth) || !cliproxyauth.HasAuthCreationIntent(ctx) {
+		return nil
+	}
+	if _, errStat := os.Stat(path); errStat != nil {
+		if errors.Is(errStat, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("auth filestore: stat %s failed: %w", filepath.Base(path), errStat)
+	}
+	identity, isCodex, errRead := readCodexIdentity(path)
+	if errRead != nil {
+		return fmt.Errorf("auth filestore: read %s failed: %w", filepath.Base(path), errRead)
+	}
+	want := codexAuthIdentity(auth)
+	if want == "" {
+		// A login without derivable identity keeps the upstream explicit-replacement behavior.
+		return nil
+	}
+	if !isCodex || identity != want {
+		return fmt.Errorf("auth filestore: refusing to overwrite %s: it is not verified as this Codex account", filepath.Base(path))
+	}
+	return nil
+}
+
+// codexFileNameResolver is implemented by stores that can pick a Codex file name.
+type codexFileNameResolver interface {
+	ResolveCodexFileName(*cliproxyauth.Auth) (string, error)
+}
+
+// ResolveCodexRecordFileName points a new Codex record at the file it should be saved
+// to. It is a no-op for other providers and for stores without a file name resolver.
+// Callers invoke it before registration so the record ID never changes after Save.
+func ResolveCodexRecordFileName(store any, record *cliproxyauth.Auth) error {
+	resolver, ok := store.(codexFileNameResolver)
+	if !ok || !isCodexAuth(record) {
+		return nil
+	}
+	name, err := resolver.ResolveCodexFileName(record)
+	if err != nil {
+		return err
+	}
+	if name != "" {
+		record.FileName = name
+		record.ID = name
+	}
+	return nil
 }
