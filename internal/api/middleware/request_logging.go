@@ -39,7 +39,8 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 			return
 		}
 
-		if shouldSkipMethodForRequestLogging(c.Request) {
+		// The archive records every method, so it must not skip GET requests.
+		if shouldSkipMethodForRequestLogging(c.Request) && !isLosslessStreaming(logger) {
 			c.Next()
 			return
 		}

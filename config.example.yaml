@@ -1309,6 +1309,18 @@ observability:
     # Record proxy request/response logs. Management requests are excluded.
     request-log: false
 
+    # Credential-masked request archive, independent of provider. Off by default.
+    # Turning it on for a server started without it requires a restart. Sizes use decimal GB.
+    # See docs/request-archive.md for limits, retention and masking.
+    request-archive:
+      enabled: false
+      max-size-gb: 30
+      # max-age-days: 0              # 0 keeps files until the size cap removes them
+      # max-capture-mb: 32           # in-memory transcript cap per request
+      # max-concurrent-captures: 16  # streaming requests buffering at once
+      # metadata-only: false         # omit all bodies, keep metadata
+      # directory: /path/to/archive  # default: requests/ under the logs directory
+
   usage:
     # When false, disable in-memory usage statistics aggregation
     usage-statistics-enabled: false
