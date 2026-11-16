@@ -3,6 +3,7 @@ package logging
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -382,6 +383,28 @@ func (w *archiveStream) WriteAPIResponse(body []byte) error {
 }
 func (w *archiveStream) WriteAPIWebsocketTimeline(body []byte) error {
 	return w.StreamingLogWriter.WriteAPIWebsocketTimeline(w.admit(body))
+}
+
+// WriteAPIResponseErrors masks error text before the file writer stores it, because the
+// file writer persists these messages verbatim.
+func (w *archiveStream) WriteAPIResponseErrors(errs []*interfaces.ErrorMessage) error {
+	safe := make([]*interfaces.ErrorMessage, 0, len(errs))
+	for _, item := range errs {
+		if item == nil {
+			continue
+		}
+		entry := &interfaces.ErrorMessage{StatusCode: item.StatusCode}
+		if item.Error != nil {
+			if w.metadataOnly {
+				entry.Error = errors.New(archiveMetadataOnlyMarker)
+			} else {
+				masked := admitRedacted(&w.budget, w.redactor.Bytes([]byte(item.Error.Error())), w.redactor.secrets, w.limitMarker)
+				entry.Error = errors.New(string(masked))
+			}
+		}
+		safe = append(safe, entry)
+	}
+	return w.StreamingLogWriter.WriteAPIResponseErrors(safe)
 }
 
 // admit masks an upstream section and charges it to the same budget as chunks.
