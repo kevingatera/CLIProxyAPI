@@ -7,7 +7,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/MoeForge/moego/json"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
@@ -130,12 +132,34 @@ func scanCodexIdentities(dir string) (map[string]string, error) {
 	return out, err
 }
 
+// codexDirLocks serializes Codex credential resolution and writes per directory within
+// this process. Writers in other processes are not covered.
+var codexDirLocks sync.Map
+
+func lockCodexDir(dir string) func() {
+	key := filepath.Clean(dir)
+	if abs, errAbs := filepath.Abs(key); errAbs == nil {
+		key = abs
+	}
+	value, _ := codexDirLocks.LoadOrStore(key, &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// codexRecordDir returns the directory used for the identity lock and scan.
+func (s *FileTokenStore) codexRecordDir(path string) string {
+	if dir := s.baseDirSnapshot(); dir != "" {
+		return dir
+	}
+	return filepath.Dir(path)
+}
+
 // ResolveCodexFileName returns the file name a Codex credential should be saved under.
-// Call it before the record is registered with the runtime manager. The result is the
-// existing file for the same account and user when there is exactly one, so a re-login
-// after a plan change reuses that file. It fails when the default name already holds a
-// different or unverifiable credential, so no file is overwritten. Ambiguous matches
-// fall back to the default name.
+// Call it before the record is registered with the runtime manager. It returns the one
+// existing file for the account and user when exactly one matches. With several matches
+// it returns a new, unused name, so no existing file is overwritten. It fails when the
+// default name holds a different or unverifiable credential and nothing matches.
 func (s *FileTokenStore) ResolveCodexFileName(auth *cliproxyauth.Auth) (string, error) {
 	if auth == nil {
 		return "", fmt.Errorf("auth filestore: auth is nil")
@@ -150,42 +174,64 @@ func (s *FileTokenStore) ResolveCodexFileName(auth *cliproxyauth.Auth) (string, 
 		return name, nil
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock := lockCodexDir(dir)
+	defer unlock()
 
 	known, err := scanCodexIdentities(dir)
 	if err != nil {
 		return "", fmt.Errorf("auth filestore: scan codex credentials failed: %w", err)
 	}
-	if _, errStat := os.Stat(filepath.Join(dir, name)); errStat == nil {
-		if known[name] == identity {
-			return name, nil
-		}
-		return "", fmt.Errorf("auth filestore: %s already exists and is not verified as this Codex account; remove or rename it and log in again", name)
-	} else if !errors.Is(errStat, fs.ErrNotExist) {
-		return "", fmt.Errorf("auth filestore: stat %s failed: %w", name, errStat)
-	}
-
 	var matches []string
 	for candidate, candidateIdentity := range known {
 		if candidateIdentity == identity {
 			matches = append(matches, candidate)
 		}
 	}
+	sort.Strings(matches)
+
 	switch len(matches) {
 	case 0:
+		if _, errStat := os.Stat(filepath.Join(dir, name)); errStat == nil {
+			return "", fmt.Errorf("auth filestore: %s already exists and is not verified as this Codex account; remove or rename it and log in again", name)
+		} else if !errors.Is(errStat, fs.ErrNotExist) {
+			return "", fmt.Errorf("auth filestore: stat %s failed: %w", name, errStat)
+		}
 		return name, nil
 	case 1:
 		return matches[0], nil
 	default:
-		log.Warnf("codex: %d credential files share one account and user; saving %s without merging", len(matches), name)
-		return name, nil
+		log.Warnf("codex: %d credential files share one account and user; saving a new file without overwriting any of them", len(matches))
+		return unusedCodexFileName(dir, name, known)
 	}
 }
 
+// unusedCodexFileName returns name, or name with a numeric suffix, that neither the scan
+// nor the disk already uses.
+func unusedCodexFileName(dir, name string, known map[string]string) (string, error) {
+	base := strings.TrimSuffix(name, ".json")
+	for i := 1; i <= 1000; i++ {
+		candidate := name
+		if i > 1 {
+			candidate = fmt.Sprintf("%s-%d.json", base, i)
+		}
+		if _, taken := known[candidate]; taken {
+			continue
+		}
+		_, errStat := os.Stat(filepath.Join(dir, candidate))
+		if errors.Is(errStat, fs.ErrNotExist) {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("auth filestore: no unused Codex file name near %s", name)
+}
+
+// beforeCodexPersist runs between the Codex save start and the final identity check. Tests
+// use it to simulate another writer replacing the file in that window.
+var beforeCodexPersist = func(string) {}
+
 // verifyCodexTargetLocked refuses a creation save over an existing file that is not
 // verified as the same Codex identity. Runtime refreshes do not carry creation intent
-// and are not checked. Caller holds s.mu.
+// and are not checked. Caller holds s.mu and the directory lock.
 func (s *FileTokenStore) verifyCodexTargetLocked(ctx context.Context, auth *cliproxyauth.Auth, path string) error {
 	if !isCodexAuth(auth) || !cliproxyauth.HasAuthCreationIntent(ctx) {
 		return nil

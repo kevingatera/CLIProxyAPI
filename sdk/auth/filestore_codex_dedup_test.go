@@ -475,3 +475,81 @@ func TestNonCodexProviderIsNotMerged(t *testing.T) {
 		t.Fatalf("files = %v, want two for a non-codex provider", files)
 	}
 }
+
+// With several same-identity files, one of which holds the default name, a login must not
+// overwrite any of them. It writes a new file instead.
+func TestCodexAmbiguousMatchWithDefaultNameWritesNewFile(t *testing.T) {
+	store, dir := newCodexTestStore(t)
+	defaultRecord := newCodexRecord(t, "acct-3030", "user-a", "a@example.com", "pro")
+	if _, err := store.Save(cliproxyauth.WithAuthCreationIntent(context.Background()), defaultRecord); err != nil {
+		t.Fatalf("seed default file: %v", err)
+	}
+	legacy := newCodexRecord(t, "acct-3030", "user-a", "a@example.com", "plus")
+	legacy.FileName = "legacy-same-identity.json"
+	legacy.ID = legacy.FileName
+	if _, err := store.Save(cliproxyauth.WithAuthCreationIntent(context.Background()), legacy); err != nil {
+		t.Fatalf("seed legacy file: %v", err)
+	}
+	read := func(name string) string {
+		raw, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return string(raw)
+	}
+	defaultBefore := read(defaultRecord.FileName)
+	legacyBefore := read(legacy.FileName)
+
+	login := newCodexRecord(t, "acct-3030", "user-a", "a@example.com", "pro")
+	if err := ResolveCodexRecordFileName(store, login); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if login.FileName == defaultRecord.FileName || login.FileName == legacy.FileName {
+		t.Fatalf("resolved to existing file %q with duplicates present", login.FileName)
+	}
+	if _, err := store.Save(cliproxyauth.WithAuthCreationIntent(context.Background()), login); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if read(defaultRecord.FileName) != defaultBefore {
+		t.Fatalf("default-named duplicate was overwritten")
+	}
+	if read(legacy.FileName) != legacyBefore {
+		t.Fatalf("legacy duplicate was overwritten")
+	}
+	if files := jsonFilesIn(t, dir); len(files) != 3 {
+		t.Fatalf("files = %v, want the two existing files plus one new file", files)
+	}
+}
+
+// Another writer that replaces the target after resolution but before the write must not
+// have its file overwritten by this login.
+func TestCodexTargetReplacedInSaveWindowIsNotOverwritten(t *testing.T) {
+	store, dir := newCodexTestStore(t)
+	login := newCodexRecord(t, "acct-4040", "user-a", "a@example.com", "plus")
+	if err := ResolveCodexRecordFileName(store, login); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	target := filepath.Join(dir, login.FileName)
+	foreign := []byte(`{"type":"codex","account_id":"acct-4040","id_token":"` +
+		fakeCodexIDToken(t, "acct-4040", "user-b", "b@example.com", "plus") + `","access_token":"foreign"}`)
+	previous := beforeCodexPersist
+	beforeCodexPersist = func(path string) {
+		if path == target {
+			if err := os.WriteFile(path, foreign, 0o600); err != nil {
+				t.Fatalf("simulated writer: %v", err)
+			}
+		}
+	}
+	t.Cleanup(func() { beforeCodexPersist = previous })
+
+	if _, err := store.Save(cliproxyauth.WithAuthCreationIntent(context.Background()), login); err == nil {
+		t.Fatalf("save overwrote a file replaced after resolution")
+	}
+	raw, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if string(raw) != string(foreign) {
+		t.Fatalf("foreign writer's file was modified")
+	}
+}
