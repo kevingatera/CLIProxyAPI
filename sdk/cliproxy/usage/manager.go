@@ -646,10 +646,15 @@ type Manager struct {
 	queue  []queueItem
 	closed bool
 	// published counts accepted records; delivered counts records whose plugin
-	// dispatch has finished. Drain waits until delivered catches up.
+	// dispatch has finished. inflight counts publishers past admission but not yet
+	// queued. draining counts Drain calls in progress; while it is non-zero, new
+	// publishers wait at admission.
 	published uint64
 	delivered uint64
+	inflight  int
+	draining  int
 	drained   *sync.Cond
+	admitted  *sync.Cond
 
 	pluginsMu sync.RWMutex
 	plugins   []Plugin
@@ -661,6 +666,7 @@ func NewManager(buffer int) *Manager {
 	m := &Manager{}
 	m.cond = sync.NewCond(&m.mu)
 	m.drained = sync.NewCond(&m.mu)
+	m.admitted = sync.NewCond(&m.mu)
 	return m
 }
 
@@ -692,6 +698,7 @@ func (m *Manager) Stop() {
 		m.closed = true
 		m.mu.Unlock()
 		m.cond.Broadcast()
+		m.admitted.Broadcast()
 	})
 }
 
@@ -777,13 +784,26 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 	ctx = WithCapturedIdentity(ctx, record.APIKey, record.AccessProvider, record.IsNativeKey)
 	// ensure worker is running even if Start was not called explicitly
 	m.Start(context.Background())
+	// Admission: wait while a drain is fencing new publishers, then count this publisher
+	// as in flight so a drain waits for it before taking its target.
 	m.mu.Lock()
+	for m.draining > 0 && !m.closed {
+		m.admitted.Wait()
+	}
 	if m.closed {
 		m.mu.Unlock()
 		return
 	}
+	m.inflight++
+	m.mu.Unlock()
+
+	publishAdmittedHook(record)
+
+	m.mu.Lock()
 	m.queue = append(m.queue, queueItem{ctx: ctx, record: record})
 	m.published++
+	m.inflight--
+	m.drained.Broadcast()
 	m.mu.Unlock()
 	m.cond.Signal()
 }
@@ -810,18 +830,29 @@ func (m *Manager) run(ctx context.Context) {
 	}
 }
 
-// Drain blocks until every record published before the call has been dispatched
-// to all plugins. It does not stop the dispatcher. Records published during the
-// wait are not awaited.
+// publishAdmittedHook runs between admission and queue insertion. Tests replace it to pause
+// a publisher at that point. It is a no-op in production.
+var publishAdmittedHook = func(Record) {}
+
+// Drain fences new publishers, waits for those already admitted to queue their records,
+// then waits until every queued record has been dispatched to all plugins. It does not
+// stop the dispatcher. Publishers that arrive during the drain wait and are queued after
+// it returns.
 func (m *Manager) Drain() {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
+	m.draining++
+	for m.inflight > 0 {
+		m.drained.Wait()
+	}
 	target := m.published
 	for m.delivered < target {
 		m.drained.Wait()
 	}
+	m.draining--
+	m.admitted.Broadcast()
 	m.mu.Unlock()
 }
 

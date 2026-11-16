@@ -87,7 +87,8 @@ func (s *Server) shutdownUsagePersistence() {
 }
 
 // stopUsagePersistenceLocked runs in a fixed order so the final snapshot is complete:
-//  1. Drain the usage queue, so records published before this point reach the aggregate.
+//  1. Drain the usage queue. New publishers wait, and publishers already admitted are
+//     queued first, so every record admitted before this point reaches the aggregate.
 //  2. Fence collection off. SetCollecting waits for plugin calls already recording, and
 //     no record can land after it returns.
 //  3. Stop the persistence handle, which writes the final snapshot.
@@ -95,11 +96,12 @@ func (s *Server) shutdownUsagePersistence() {
 // The caller must hold usagePersistenceMu. Drain never waits on this lock, because
 // plugins do not call back into the server.
 func (s *Server) stopUsagePersistenceLocked() {
-	coreusage.DrainDefault()
-	usage.GetRequestStatistics().SetCollecting(false)
 	if s.usagePersistence == nil {
+		usage.GetRequestStatistics().SetCollecting(false)
 		return
 	}
+	coreusage.DrainDefault()
+	usage.GetRequestStatistics().SetCollecting(false)
 	s.usagePersistence.Stop()
 	s.usagePersistence = nil
 	s.usagePersistenceKey = ""
