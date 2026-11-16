@@ -75,7 +75,6 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	if cfg == nil {
 		return state
 	}
-	state.hostProxyURL = strings.TrimSpace(cfg.ProxyURL)
 
 	switch strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy)) {
 	case "weighted-round-robin", "weightedroundrobin", "wrr":
@@ -84,6 +83,8 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 		state.strategy = "fill-first"
 	case "quota-aware", "quotaaware", "quota", "qa":
 		state.strategy = "quota-aware"
+		// Only quota-aware probes use the global proxy, so only it rebuilds on a proxy change.
+		state.hostProxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {

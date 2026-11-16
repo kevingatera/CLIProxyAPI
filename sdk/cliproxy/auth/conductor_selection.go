@@ -741,8 +741,9 @@ func (m *Manager) SetSelector(selector Selector) {
 		return
 	}
 	m.selector = selector
+	m.creditRecoveryGen++
 	if quota := quotaSelectorOf(selector); quota != nil {
-		quota.setObserver(m.observeQuotaProbe)
+		quota.bindManager(m.observeQuotaProbe, m.probeBudget)
 		if m.creditRecovery != nil {
 			// Read by the recovery sweep under m.mu, so the write must hold m.mu too.
 			m.creditRecovery.hostProxyURL = quota.hostProxyURL
@@ -945,13 +946,14 @@ func (m *Manager) availableAuthsForRouteModelForRequest(ctx context.Context, aut
 // or scheduler additionally receives lower priority tiers.
 func (m *Manager) availableAuthsForSelector(ctx context.Context, selector Selector, auths []*Auth, provider, routeModel string, now time.Time, schedulerAcross bool, clientHeaders ...http.Header) (priorityAuths, selectorAuths []*Auth, err error) {
 	_, sessionAffinity := selector.(*SessionAffinitySelector)
+	quotaAware := quotaSelectorOf(selector) != nil
 	if _, weighted := selector.(*WeightedRoundRobinSelector); weighted {
 		// Exclude zero-weight credentials before priority selection, just as the
 		// scheduler predicate does, including when only a lower tier has weight.
 		auths = positiveWeightAuths(auths)
 	}
 
-	if !sessionAffinity && !schedulerAcross {
+	if !sessionAffinity && !schedulerAcross && !quotaAware {
 		priorityAuths, err = m.availableAuthsForRouteModelForRequest(ctx, auths, provider, routeModel, now, false, clientHeaders...)
 		if err != nil {
 			return nil, nil, err
@@ -967,6 +969,12 @@ func (m *Manager) availableAuthsForSelector(ctx context.Context, selector Select
 		return nil, nil, errAcross
 	}
 	allAuths = cloneAuthSlice(allAuths)
+	if quotaAware {
+		// Passive exhaustion is applied before the priority tier is chosen, so a fully
+		// exhausted tier falls through to the next healthy one. If nothing is left, the
+		// unfiltered list lets the selector report the exhaustion and its reset time.
+		allAuths = dropPassivelyExhausted(allAuths, now)
+	}
 
 	if schedulerAcross {
 		priorityAuths = allAuths
@@ -992,7 +1000,10 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 func selectorContextForAvailableAuths(ctx context.Context, selector Selector, routeModel string) context.Context {
 	ctx = withWeightedSelectorStateModel(ctx, selector, routeModel)
 	if !isBuiltInSelector(selector) {
-		if _, sessionAffinity := selector.(*SessionAffinitySelector); !sessionAffinity {
+		// Custom selectors get the manager's candidates as-is, except the quota selector
+		// (also behind affinity), which must honor them like the built-in strategies do.
+		_, sessionAffinity := selector.(*SessionAffinitySelector)
+		if !sessionAffinity && quotaSelectorOf(selector) == nil {
 			return ctx
 		}
 	}

@@ -1694,6 +1694,11 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if err != nil && !s.rebindOnNever {
 		return nil, err
 	}
+	// Passive exhaustion from the quota selector counts as unavailable for the binding and the fallback.
+	quotaAware := quotaSelectorOf(s) != nil
+	if quotaAware {
+		available = dropPassivelyExhausted(available, now)
+	}
 	fallbackAuths := highestPriorityAuths(available)
 
 	modelKey := canonicalModelKey(model)
@@ -1732,7 +1737,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
-			if auth.ID == cachedAuthID {
+			if auth.ID == cachedAuthID && !(quotaAware && quotaPassivelyExhausted(auth, now)) {
 				bind(auth.ID, true)
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return s.pickWithAffinityReservation(ctx, provider, model, opts, available, auth, &reservation)
@@ -1755,7 +1760,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if auth == nil {
 			return nil, nil
 		}
-		if s.shouldPreserveBindingWhenUnavailable(ctx, availabilityCandidates, model, cachedAuthID, now) {
+		// A passively exhausted binding always rebinds; it is never kept for transient recovery.
+		boundExhausted := quotaAware && quotaPassivelyExhaustedByID(availabilityCandidates, cachedAuthID, now)
+		if !boundExhausted && s.shouldPreserveBindingWhenUnavailable(ctx, availabilityCandidates, model, cachedAuthID, now) {
 			bind(cachedAuthID, false)
 			entry.Infof("session-affinity: cache hit but auth transiently unavailable, failover without rebinding | session=%s bound_auth=%s failover_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, auth.ID, provider, model)
 			return auth, nil

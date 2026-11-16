@@ -44,6 +44,9 @@ type creditQuotaProbe struct {
 	cred         codexUsageCredential
 	coolingSince time.Time
 	recoverAt    time.Time
+	// gen is the strategy generation the probe was scheduled under. A later
+	// strategy change makes the result stale, so it may not change cooldowns.
+	gen uint64
 }
 
 func newCreditQuotaRecovery(hostProxyURL string) *creditQuotaRecovery {
@@ -92,6 +95,7 @@ func (m *Manager) sweepCreditQuotaRecovery(ctx context.Context) []creditQuotaPro
 	}
 	found := make(map[string]cooling)
 	m.mu.RLock()
+	gen := m.creditRecoveryGen
 	// Recovery is part of the quota-aware strategy only. Other strategies never probe usage.
 	if quotaSelectorOf(m.selector) != nil {
 		for id, a := range m.auths {
@@ -123,8 +127,12 @@ func (m *Manager) sweepCreditQuotaRecovery(ctx context.Context) []creditQuotaPro
 		if entry.inflight || now.Before(entry.nextAttempt) || !now.After(entry.coolingSince) {
 			continue
 		}
+		// The probe budget is shared with the selector. A full budget defers the credential to a later sweep.
+		if !m.probeBudget.tryAcquire() {
+			continue
+		}
 		entry.inflight = true
-		due = append(due, creditQuotaProbe{id: id, cred: c.cred, coolingSince: entry.coolingSince, recoverAt: entry.recoverAt})
+		due = append(due, creditQuotaProbe{id: id, cred: c.cred, coolingSince: entry.coolingSince, recoverAt: entry.recoverAt, gen: gen})
 	}
 	return due
 }
@@ -136,6 +144,7 @@ func (m *Manager) runCreditQuotaProbe(ctx context.Context, probe creditQuotaProb
 	if r == nil {
 		return
 	}
+	defer m.probeBudget.release()
 	startedAt := r.now()
 	headers, errFetch := r.fetch(ctx, probe.cred)
 	released := false
@@ -173,6 +182,11 @@ func (m *Manager) applyCreditQuotaProbe(ctx context.Context, probe creditQuotaPr
 	releaseMutation := m.lockAuthMutation(probe.id)
 	defer releaseMutation()
 	m.mu.Lock()
+	// Fence: a strategy change after the probe was scheduled, or a non-quota selector, ends it.
+	if probe.gen != m.creditRecoveryGen || quotaSelectorOf(m.selector) == nil {
+		m.mu.Unlock()
+		return false
+	}
 	auth := m.auths[probe.id]
 	if auth == nil || !isCreditQuotaCooling(auth, now) || !auth.Quota.NextRecoverAt.Equal(probe.recoverAt) {
 		m.mu.Unlock()
@@ -238,6 +252,18 @@ func clearCreditQuotaCooldownForAuth(auth *Auth, now time.Time) bool {
 	}
 	for _, state := range auth.ModelStates {
 		if state == nil || !(state.credentialQuotaPropagated || state.Quota.Reason == "credential_quota") {
+			continue
+		}
+		// The model had its own cooldown before the credential-wide quota propagated.
+		// Restore that independent cooldown while it is still active.
+		if shadow := state.credentialQuotaShadow; shadow != nil && shadow.Unavailable && shadow.NextRetryAfter.After(now) {
+			preservedSeq := state.cooldownRecordedSeq
+			*state = *shadow.cloneShallow()
+			state.cooldownRecordedSeq = preservedSeq
+			state.credentialQuotaPropagated = false
+			state.credentialQuotaShadow = nil
+			state.UpdatedAt = now
+			changed = true
 			continue
 		}
 		if state.NextRetryAfter.IsZero() || !state.NextRetryAfter.After(state.Quota.NextRecoverAt) {

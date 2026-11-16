@@ -23,3 +23,22 @@ func TestQuotaAwareRoutingStrategyAliases(t *testing.T) {
 		quota.Stop()
 	}
 }
+
+// A global proxy-url change rebuilds the selector only for quota-aware routing, whose
+// probes use it. Other strategies keep their selector state and affinity bindings.
+func TestProxyURLOnlyChangesQuotaAwareRoutingState(t *testing.T) {
+	state := func(strategy, proxy string) routingRuntimeState {
+		return normalizedRoutingRuntimeState(&internalconfig.Config{
+			SDKConfig: internalconfig.SDKConfig{ProxyURL: proxy},
+			Routing:   internalconfig.RoutingConfig{Strategy: strategy},
+		})
+	}
+	for _, strategy := range []string{"round-robin", "weighted-round-robin", "fill-first"} {
+		if state(strategy, "http://proxy-a.example:3128") != state(strategy, "http://proxy-b.example:3128") {
+			t.Fatalf("strategy %s: proxy-url change alters routing identity", strategy)
+		}
+	}
+	if state("quota-aware", "http://proxy-a.example:3128") == state("quota-aware", "http://proxy-b.example:3128") {
+		t.Fatal("quota-aware: proxy-url change must rebuild the selector")
+	}
+}

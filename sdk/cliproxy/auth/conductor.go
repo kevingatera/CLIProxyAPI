@@ -249,6 +249,10 @@ type Manager struct {
 	refreshJobs map[string]*authRefreshJob
 	// creditRecovery ends credential_quota cooldowns once usage shows capacity again.
 	creditRecovery *creditQuotaRecovery
+	// probeBudget bounds usage probes shared by the quota selector and the recovery sweep.
+	probeBudget *codexProbeBudget
+	// creditRecoveryGen advances on every selector change under m.mu, fencing stale recovery probes.
+	creditRecoveryGen uint64
 
 	requestPrepareLocks sync.Map
 	// refreshLocks serializes credential refresh per auth ID so concurrent
@@ -297,9 +301,10 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		manager.ApplyHomeInFlightPublisherConfig(defaultInFlightConfig)
 	}
 	manager.scheduler = newAuthScheduler(selector)
+	manager.probeBudget = newCodexProbeBudget(quotaMaxConcurrent)
 	recovery := newCreditQuotaRecovery("")
 	if quota := quotaSelectorOf(selector); quota != nil {
-		quota.setObserver(manager.observeQuotaProbe)
+		quota.bindManager(manager.observeQuotaProbe, manager.probeBudget)
 		recovery.hostProxyURL = quota.hostProxyURL
 	}
 	manager.creditRecovery = recovery

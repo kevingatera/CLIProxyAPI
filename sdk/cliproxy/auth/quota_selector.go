@@ -59,8 +59,35 @@ const (
 //   - unknown: no observation, one older than quotaMaxStaleness, one whose reset
 //     time has passed, or one without usable windows. Always shortlisted next to
 //     the best known candidates, so it is neither starved nor preferred over them.
+//
+// codexProbeBudget caps usage probes in flight. The selector and the recovery
+// sweep share one budget per Manager, so their combined load stays bounded.
+type codexProbeBudget struct {
+	slots chan struct{}
+}
+
+func newCodexProbeBudget(n int) *codexProbeBudget {
+	return &codexProbeBudget{slots: make(chan struct{}, n)}
+}
+
+// tryAcquire takes a probe slot without waiting. It reports false when the budget is full.
+func (b *codexProbeBudget) tryAcquire() bool {
+	select {
+	case b.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *codexProbeBudget) release() {
+	<-b.slots
+}
+
 type QuotaAwareSelector struct {
 	rr RoundRobinSelector
+	// budget is the probe slot pool; the Manager replaces it with its shared pool.
+	budget *codexProbeBudget
 
 	now   func() time.Time
 	fetch func(context.Context, codexUsageCredential) (http.Header, error)
@@ -71,9 +98,8 @@ type QuotaAwareSelector struct {
 	// hostProxyURL is the global proxy-url, used by probes when an auth has no override.
 	hostProxyURL string
 
-	mu       sync.Mutex
-	entries  map[string]*quotaEntry
-	inflight int
+	mu      sync.Mutex
+	entries map[string]*quotaEntry
 
 	startOnce sync.Once
 	stopOnce  sync.Once
@@ -134,6 +160,7 @@ func NewQuotaAwareSelectorWithProxy(hostProxyURL string) *QuotaAwareSelector {
 		entries:      make(map[string]*quotaEntry),
 		wake:         make(chan struct{}, 1),
 		hostProxyURL: strings.TrimSpace(hostProxyURL),
+		budget:       newCodexProbeBudget(quotaMaxConcurrent),
 	}
 }
 
@@ -332,29 +359,31 @@ func (s *QuotaAwareSelector) refreshDue(ctx context.Context) {
 	}
 	now := s.clock()
 	type job struct {
-		id   string
-		cred codexUsageCredential
+		id     string
+		cred   codexUsageCredential
+		budget *codexProbeBudget
 	}
 	var jobs []job
 	s.mu.Lock()
 	s.pruneLocked(now)
 	for id, entry := range s.entries {
-		if s.inflight+len(jobs) >= quotaMaxConcurrent {
-			break
-		}
 		if !entry.needsProbe || entry.fetching || now.Before(entry.nextAttempt) {
 			continue
 		}
+		if !s.budget.tryAcquire() {
+			break
+		}
 		entry.fetching = true
-		jobs = append(jobs, job{id: id, cred: entry.cred})
+		jobs = append(jobs, job{id: id, cred: entry.cred, budget: s.budget})
 	}
-	s.inflight += len(jobs)
 	s.mu.Unlock()
 
 	for _, j := range jobs {
 		s.wg.Add(1)
 		go func(j job) {
 			defer s.wg.Done()
+			// Release the slot to the budget it was taken from, even if the selector was rebound since.
+			defer j.budget.release()
 			headers, errFetch := s.fetch(ctx, j.cred)
 			s.record(j.id, now, headers, errFetch)
 		}(j)
@@ -366,7 +395,6 @@ func (s *QuotaAwareSelector) refreshDue(ctx context.Context) {
 func (s *QuotaAwareSelector) record(id string, observedAt time.Time, headers http.Header, errFetch error) {
 	now := s.clock()
 	s.mu.Lock()
-	s.inflight--
 	entry, ok := s.entries[id]
 	if ok {
 		entry.fetching = false
@@ -395,10 +423,14 @@ func (s *QuotaAwareSelector) record(id string, observedAt time.Time, headers htt
 	}
 }
 
-func (s *QuotaAwareSelector) setObserver(observe func(string, http.Header, time.Time)) {
+// bindManager attaches the Manager's probe observer and shared probe budget.
+func (s *QuotaAwareSelector) bindManager(observe func(string, http.Header, time.Time), budget *codexProbeBudget) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.observe = observe
+	if budget != nil {
+		s.budget = budget
+	}
 }
 
 // quotaSelectorOf returns the quota selector behind selector, looking through a
@@ -642,4 +674,38 @@ func firstResult(node ojson.Result, paths ...string) ojson.Result {
 		}
 	}
 	return ojson.Result{}
+}
+
+// quotaPassivelyExhausted reports whether a fresh passive observation leaves a Codex
+// credential with no usable window. Other credentials are never exhausted here.
+func quotaPassivelyExhausted(a *Auth, now time.Time) bool {
+	if !isCodexQuotaAuth(a) {
+		return false
+	}
+	state, _, _ := classifyCodexSnapshot(codexSnapshotOf(a.Quota, now), now)
+	return state == quotaExhausted
+}
+
+func quotaPassivelyExhaustedByID(auths []*Auth, id string, now time.Time) bool {
+	for _, a := range auths {
+		if a != nil && a.ID == id {
+			return quotaPassivelyExhausted(a, now)
+		}
+	}
+	return false
+}
+
+// dropPassivelyExhausted removes passively exhausted Codex credentials. If that would
+// leave no candidate, it returns the input so the caller can report the cooldown.
+func dropPassivelyExhausted(auths []*Auth, now time.Time) []*Auth {
+	kept := make([]*Auth, 0, len(auths))
+	for _, a := range auths {
+		if !quotaPassivelyExhausted(a, now) {
+			kept = append(kept, a)
+		}
+	}
+	if len(kept) == 0 {
+		return auths
+	}
+	return kept
 }
