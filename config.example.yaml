@@ -1313,6 +1313,18 @@ observability:
     # When false, disable in-memory usage statistics aggregation
     usage-statistics-enabled: false
 
+    # Keep usage statistics across restarts. Requires usage-statistics-enabled.
+    # The snapshot stores API keys only as SHA-256 fingerprints (key:sha256:<16 hex>).
+    # Snapshots are written atomically. Off by default.
+    usage-statistics-persist: false
+
+    # Snapshot path. Relative paths resolve against the config file directory.
+    # Empty means usage_stats.json beside the config file.
+    usage-statistics-file: ""
+
+    # How often the snapshot is written to disk, in seconds. A final write runs on shutdown.
+    usage-statistics-save-interval-seconds: 60
+
     # How long (in seconds) usage queue items are retained in memory for the Management API.
     # The local Redis RESP usage output is disabled.
     # Default: 60. Max: 3600.
