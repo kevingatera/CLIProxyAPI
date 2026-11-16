@@ -37,6 +37,9 @@ const (
 	// archiveDirMarkerFile marks a directory the archive created. Retention only
 	// runs in such a directory, so unrelated logs are never deleted.
 	archiveDirMarkerFile = ".cpa-request-archive"
+	// archiveFilePrefix starts every archive log name. Retention matches this
+	// prefix, so a log another tool places in the directory is never deleted.
+	archiveFilePrefix = "cpa-archive-"
 	// archiveCaptureContextKey stores the per-request ArchiveCaptureBudget on the Gin context.
 	archiveCaptureContextKey = "ARCHIVE_CAPTURE_BUDGET"
 	// archiveCredentialTailWindow bounds how far back a cut looks for a partial credential prefix.
@@ -91,6 +94,7 @@ func NewRequestArchive(cfg *config.Config, configDir, logsDir string) *RequestAr
 		dir = filepath.Join(configDir, dir)
 	}
 	a := &RequestArchive{file: NewFileRequestLogger(true, dir, "", 0), clock: time.Now}
+	a.file.filePrefix = archiveFilePrefix
 	a.startupErr = prepareArchiveDir(dir)
 	if a.startupErr != nil {
 		log.WithError(a.startupErr).Error("request archive disabled")
@@ -104,25 +108,26 @@ func NewRequestArchive(cfg *config.Config, configDir, logsDir string) *RequestAr
 
 // prepareArchiveDir creates the archive directory and its marker file. An existing
 // directory without the marker is refused, so retention cannot reach foreign files.
+// Permissions change only after the directory is verified, so a refused directory
+// keeps its mode.
 func prepareArchiveDir(dir string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	if err := os.Chmod(dir, 0700); err != nil {
-		return err
-	}
 	marker := filepath.Join(dir, archiveDirMarkerFile)
-	if _, err := os.Stat(marker); err == nil {
-		return nil
+	if _, err := os.Stat(marker); err != nil {
+		entries, errRead := os.ReadDir(dir)
+		if errRead != nil {
+			return errRead
+		}
+		if len(entries) > 0 {
+			return fmt.Errorf("request archive directory %s is not empty and is not an archive directory; use an empty directory", dir)
+		}
+		if errWrite := os.WriteFile(marker, []byte("CLIProxyAPI request archive. Retention only deletes archive log files in this directory.\n"), 0600); errWrite != nil {
+			return errWrite
+		}
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return err
-	}
-	if len(entries) > 0 {
-		return fmt.Errorf("request archive directory %s is not empty and is not an archive directory; use an empty directory", dir)
-	}
-	return os.WriteFile(marker, []byte("CLIProxyAPI request archive. Retention only deletes log files in this directory.\n"), 0600)
+	return os.Chmod(dir, 0700)
 }
 
 // SetConfig applies the live config. The archive records when either request-log
@@ -325,12 +330,21 @@ func (a *RequestArchive) retainLocked() error {
 	if gb <= 0 {
 		gb = defaultArchiveMaxSizeGB
 	}
-	_, err := enforceLogDirSizeLimit(a.file.logsDir, int64(gb)*1000000000, "")
+	_, err := enforceLogDirSizeLimitMatching(a.file.logsDir, int64(gb)*1000000000, "", isArchiveLogFileName)
 	return err
 }
 
+// isArchiveLogFileName matches completed archive logs, including error-prefixed
+// ones. Logs without the archive prefix are never retention candidates.
+func isArchiveLogFileName(name string) bool {
+	if !isLogFileName(name) {
+		return false
+	}
+	return strings.HasPrefix(name, archiveFilePrefix) || strings.HasPrefix(name, "error-"+archiveFilePrefix)
+}
+
 // removeArchiveFilesBefore deletes completed archive files last modified before
-// cutoff. Temporary captures and non-log files are never matched.
+// cutoff. Temporary captures and non-archive files are never matched.
 func removeArchiveFilesBefore(dir string, cutoff time.Time) (int, error) {
 	entries, errRead := os.ReadDir(dir)
 	if errRead != nil {
@@ -341,7 +355,7 @@ func removeArchiveFilesBefore(dir string, cutoff time.Time) (int, error) {
 	}
 	deleted := 0
 	for _, entry := range entries {
-		if entry.IsDir() || !isLogFileName(entry.Name()) {
+		if entry.IsDir() || !isArchiveLogFileName(entry.Name()) {
 			continue
 		}
 		info, errInfo := entry.Info()
@@ -361,6 +375,19 @@ func removeArchiveFilesBefore(dir string, cutoff time.Time) (int, error) {
 // archiveBudget bounds the raw bytes one request may hold in memory.
 type archiveBudget struct {
 	remaining int64
+}
+
+// reserve charges up to n bytes the caller has not copied yet and returns how many
+// leading bytes fit. A shortfall ends the budget, so later bytes are never kept
+// after a gap and the transcript stays a prefix.
+func (b *archiveBudget) reserve(n int) int {
+	if int64(n) <= b.remaining {
+		b.remaining -= int64(n)
+		return n
+	}
+	kept := int(b.remaining)
+	b.remaining = 0
+	return kept
 }
 
 // take returns the prefix of data that still fits and reports whether data was cut.
@@ -671,8 +698,11 @@ type archiveStream struct {
 	archive  *RequestArchive
 	capture  *ArchiveCaptureBudget
 	// owned means LogStreamingRequest began the capture, so the stream releases it.
-	owned        bool
-	pending      []byte
+	owned   bool
+	pending []byte
+	// mu guards budget, pending and pendingCut. The response writer reserves
+	// chunks on the request goroutine while the drain goroutine appends them.
+	mu           sync.Mutex
 	budget       archiveBudget
 	pendingCut   bool
 	counted      bool
@@ -681,14 +711,26 @@ type archiveStream struct {
 	finished     bool
 }
 
-// WriteChunkAsync keeps raw chunks in memory until Close. SSE deltas can split a
-// credential across records, so masking needs the whole transcript.
-func (w *archiveStream) WriteChunkAsync(chunk []byte) {
-	kept, cut := w.budget.take(chunk)
-	w.pending = append(w.pending, kept...)
-	if cut {
+// ReserveChunk charges n raw bytes before the response writer copies a chunk into
+// the queue. It returns how many leading bytes may be queued, so queued bytes stay
+// within the capture limit. A shortfall records a cut.
+func (w *archiveStream) ReserveChunk(n int) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	kept := w.budget.reserve(n)
+	if kept < n {
 		w.pendingCut = true
 	}
+	return kept
+}
+
+// WriteChunkAsync keeps raw chunks in memory until Close. SSE deltas can split a
+// credential across records, so masking needs the whole transcript. The bytes were
+// already charged by ReserveChunk, so this only appends them.
+func (w *archiveStream) WriteChunkAsync(chunk []byte) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.pending = append(w.pending, chunk...)
 }
 
 func (w *archiveStream) WriteStatus(status int, headers map[string][]string) error {
@@ -738,6 +780,8 @@ func (w *archiveStream) admit(body []byte) []byte {
 		return []byte(archiveMetadataOnlyMarker)
 	}
 	masked := w.redactor.Transcript(body)
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	return admitRedacted(&w.budget, masked, w.redactor.secrets, w.limitMarker)
 }
 
@@ -749,7 +793,10 @@ func (w *archiveStream) admitRequestBody(body []byte) []byte {
 	if w.metadataOnly {
 		return []byte(archiveMetadataOnlyMarker)
 	}
-	return admitRedacted(&w.budget, w.redactor.Bytes(body), w.redactor.secrets, w.limitMarker)
+	masked := w.redactor.Bytes(body)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return admitRedacted(&w.budget, masked, w.redactor.secrets, w.limitMarker)
 }
 
 // Close writes the masked transcript. A stream that was in flight when the archive
@@ -764,15 +811,18 @@ func (w *archiveStream) Close() error {
 		return w.discardUnderlying()
 	}
 	w.redactor = NewArchiveRedactor(append(w.redactor.secrets, w.archive.redactor(nil).secrets...))
-	if len(w.pending) > 0 || w.pendingCut {
-		chunk := w.redactor.Transcript(w.pending)
-		if w.pendingCut {
+	w.mu.Lock()
+	pending, pendingCut := w.pending, w.pendingCut
+	w.pending = nil
+	w.mu.Unlock()
+	if len(pending) > 0 || pendingCut {
+		chunk := w.redactor.Transcript(pending)
+		if pendingCut {
 			chunk = markCut(chunk, w.redactor.secrets, w.limitMarker)
 		}
 		if len(chunk) > 0 {
 			w.StreamingLogWriter.WriteChunkAsync(chunk)
 		}
-		w.pending = nil
 	}
 	w.archive.retentionMu.Lock()
 	defer w.archive.retentionMu.Unlock()
@@ -794,8 +844,10 @@ func (w *archiveStream) Discard() error {
 }
 
 func (w *archiveStream) discardUnderlying() error {
+	w.mu.Lock()
 	w.pending = nil
 	w.pendingCut = false
+	w.mu.Unlock()
 	if discarder, ok := w.StreamingLogWriter.(interface{ Discard() error }); ok {
 		return discarder.Discard()
 	}

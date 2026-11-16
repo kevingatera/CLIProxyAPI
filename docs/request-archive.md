@@ -32,10 +32,11 @@ recorded. Commercial mode turns upstream-attempt capture off.
 ## Directory
 
 The archive creates a marker file in its directory. A directory that is not
-empty and has no marker is refused at startup, and nothing is written there.
-Use a directory that only the archive writes to. Retention deletes completed
-`.log` and `.log.gz` files in that directory, so any other log file placed
-there can be deleted.
+empty and has no marker is refused at startup. Nothing is written there and
+its permissions are not changed. Use a directory that only the archive writes
+to. Retention deletes only archive files, whose names start with
+`cpa-archive-` (or `error-cpa-archive-` for error records). Other files in the
+directory are never deleted.
 
 ## Reload and restart
 
@@ -51,8 +52,8 @@ there can be deleted.
 
 ## Retention
 
-Completed `.log` and `.log.gz` files in the archive directory are removed at
-startup and after each completed request. Expired files go first, then the
+Completed archive files (`cpa-archive-*.log` and `error-cpa-archive-*.log`) in
+the archive directory are removed at startup and after each completed request. Expired files go first, then the
 oldest files until the directory fits `max-size-gb`. `max-size-gb` uses
 decimal bytes: 30 GB is 30,000,000,000 bytes.
 
@@ -65,8 +66,9 @@ Files are created with mode 0600 and the directory with mode 0700.
 
 Each archived request has two in-memory buffers, and each is capped at
 `max-capture-mb`: upstream bodies buffered by the executors, and the client
-transcript held until the stream closes for masking. Bytes past a cap are
-dropped, and the record ends with a marker:
+transcript held until the stream closes for masking. Stream bytes are charged
+to the budget before they are queued, so queued bytes never exceed the cap.
+Bytes past a cap are dropped, and the record ends with a marker:
 
 - `[ARCHIVE TRUNCATED: per-request capture limit reached]` when the budget runs out.
 - `[ARCHIVE OMITTED: concurrent capture limit reached]` when the request was
@@ -97,6 +99,11 @@ It covers:
 - URL userinfo
 - recognizable API key and JWT formats
 - labelled credentials in plain text
+
+Structured JSON is edited field by field through an `ojson` document, so
+untouched fields keep their key order and number formatting. A document that
+cannot be edited safely, such as one with duplicate keys, is replaced by
+`[REDACTED]` rather than written unmasked.
 
 Known secrets are matched after JSON escape decoding and across streamed
 chunk boundaries. At every cut, the archive trims the tail of the kept text

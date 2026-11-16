@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 )
@@ -98,7 +99,7 @@ func TestRequestArchiveStreamingMasksSplitCredentialsWithoutDroppingChunks(t *te
 		transcript += fmt.Sprintf("data: {\"delta\":\"stream-marker-%d\"}\n\n", i)
 	}
 	for _, b := range []byte(transcript) {
-		w.WriteChunkAsync([]byte{b})
+		archiveWriteChunk(w, []byte{b})
 	}
 	// Inspect spools before Close, not only the completed artifact.
 	before := readArchive(t, a)
@@ -197,6 +198,15 @@ func TestArchiveRedactorDecodedEscapesCannotHideKnownCredentials(t *testing.T) {
 	}
 }
 
+// archiveWriteChunk mirrors the response writer: it reserves the chunk first and
+// queues only the prefix the archive admits.
+func archiveWriteChunk(w StreamingLogWriter, chunk []byte) {
+	stream := w.(*archiveStream)
+	if kept := stream.ReserveChunk(len(chunk)); kept > 0 {
+		stream.WriteChunkAsync(chunk[:kept])
+	}
+}
+
 func newLimitedArchive(t *testing.T, rc config.RequestArchiveConfig) *RequestArchive {
 	t.Helper()
 	rc.Enabled = true
@@ -214,7 +224,7 @@ func TestRequestArchiveStreamingCaptureCapWritesMarker(t *testing.T) {
 	_ = w.WriteStatus(200, nil)
 	chunk := []byte(strings.Repeat("a", 64<<10))
 	for i := 0; i < 64; i++ {
-		w.WriteChunkAsync(chunk)
+		archiveWriteChunk(w, chunk)
 	}
 	stream := w.(*archiveStream)
 	// The request body is charged to the same per-request budget as chunks.
@@ -240,7 +250,7 @@ func TestRequestArchiveCaptureCutDropsSecretFragment(t *testing.T) {
 		t.Fatal(err)
 	}
 	filler := strings.Repeat("b", (1<<20)-10)
-	w.WriteChunkAsync([]byte(filler + "consumer-secret-123456789"))
+	archiveWriteChunk(w, []byte(filler+"consumer-secret-123456789"))
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -263,14 +273,14 @@ func TestRequestArchiveConcurrentCaptureLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	second.WriteChunkAsync([]byte("second-body-marker"))
+	archiveWriteChunk(second, []byte("second-body-marker"))
 	if len(second.(*archiveStream).pending) != 0 {
 		t.Fatal("over-limit capture buffered bytes")
 	}
 	if err := second.Close(); err != nil {
 		t.Fatal(err)
 	}
-	first.WriteChunkAsync([]byte("first-body-marker"))
+	archiveWriteChunk(first, []byte("first-body-marker"))
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +329,7 @@ func TestRequestArchiveMetadataOnlyOmitsBodies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.WriteChunkAsync([]byte("stream-marker"))
+	archiveWriteChunk(w, []byte("stream-marker"))
 	_ = w.WriteAPIResponse([]byte("upstream-marker"))
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
@@ -340,7 +350,7 @@ func TestRequestArchiveAgeRetentionUsesClock(t *testing.T) {
 	now := time.Date(2026, 1, 20, 0, 0, 0, 0, time.UTC)
 	a.clock = func() time.Time { return now }
 	dir := a.file.logsDir
-	for name, age := range map[string]time.Duration{"expired.log": 8 * 24 * time.Hour, "fresh.log": 6 * 24 * time.Hour, "expired.tmp": 30 * 24 * time.Hour} {
+	for name, age := range map[string]time.Duration{archiveFilePrefix + "expired.log": 8 * 24 * time.Hour, archiveFilePrefix + "fresh.log": 6 * 24 * time.Hour, "expired.tmp": 30 * 24 * time.Hour} {
 		p := filepath.Join(dir, name)
 		if err := os.WriteFile(p, []byte("x"), 0600); err != nil {
 			t.Fatal(err)
@@ -350,10 +360,10 @@ func TestRequestArchiveAgeRetentionUsesClock(t *testing.T) {
 	if err := a.retain(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "expired.log")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dir, archiveFilePrefix+"expired.log")); !os.IsNotExist(err) {
 		t.Fatal("expired log retained")
 	}
-	for _, name := range []string{"fresh.log", "expired.tmp"} {
+	for _, name := range []string{archiveFilePrefix + "fresh.log", "expired.tmp"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
 			t.Fatalf("removed %s", name)
 		}
@@ -486,11 +496,11 @@ func TestArchiveRedactorKeepsLargeNumbersWhenMasking(t *testing.T) {
 	}
 }
 
-func TestDecodeArchiveJSONRejectsTrailingData(t *testing.T) {
-	if _, ok := decodeArchiveJSON([]byte(`{"a":1} {"b":2}`)); ok {
+func TestArchiveJSONValidityRejectsTrailingData(t *testing.T) {
+	if ojson.Valid(`{"a":1} {"b":2}`) {
 		t.Fatal("accepted two documents as one")
 	}
-	if _, ok := decodeArchiveJSON([]byte(" {\"a\":1} \n")); !ok {
+	if !ojson.Valid(" {\"a\":1} \n") {
 		t.Fatal("rejected surrounding whitespace")
 	}
 }

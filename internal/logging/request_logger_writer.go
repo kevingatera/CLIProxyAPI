@@ -312,7 +312,7 @@ func (l *FileRequestLogger) generateFilename(url string, requestID ...string) st
 
 	// Defense in depth: the sanitizer already removes both separators, but the
 	// final component must never be able to climb out of the log directory.
-	name := fmt.Sprintf("%s-%s-%s.log", sanitized, timestamp, idPart)
+	name := fmt.Sprintf("%s%s-%s-%s.log", l.filePrefix, sanitized, timestamp, idPart)
 	return filepath.Base(name)
 }
 

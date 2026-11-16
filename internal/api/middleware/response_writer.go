@@ -114,7 +114,10 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 			w.firstChunkTimestamp = time.Now()
 		}
 		if w.losslessStreaming() {
-			w.chunkChannel <- append([]byte(nil), data...)
+			// The client already has the bytes. Only the prefix the archive admits is copied and queued.
+			if keep := w.reserveStreamChunk(len(data)); keep > 0 {
+				w.chunkChannel <- append([]byte(nil), data[:keep]...)
+			}
 			return n, err
 		}
 		// For streaming responses: Send to async logging channel (non-blocking)
@@ -206,7 +209,9 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 			w.firstChunkTimestamp = time.Now()
 		}
 		if w.losslessStreaming() {
-			w.chunkChannel <- []byte(data)
+			if keep := w.reserveStreamChunk(len(data)); keep > 0 {
+				w.chunkChannel <- []byte(data[:keep])
+			}
 			return n, err
 		}
 		select {
@@ -1053,4 +1058,21 @@ func isLosslessStreaming(logger logging.RequestLogger) bool {
 
 func (w *ResponseWriterWrapper) losslessStreaming() bool {
 	return isLosslessStreaming(w.logger)
+}
+
+// streamChunkReserver is implemented by stream writers that bound queued chunk
+// bytes, such as the request archive's stream.
+type streamChunkReserver interface {
+	ReserveChunk(n int) int
+}
+
+// reserveStreamChunk asks the stream writer how many leading bytes of an n-byte
+// chunk may be queued, before the chunk is copied. Writers without a reservation
+// accept every byte.
+func (w *ResponseWriterWrapper) reserveStreamChunk(n int) int {
+	reserver, ok := w.streamWriter.(streamChunkReserver)
+	if !ok {
+		return n
+	}
+	return reserver.ReserveChunk(n)
 }

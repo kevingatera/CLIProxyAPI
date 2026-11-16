@@ -40,7 +40,7 @@ func TestArchiveDisabledMidStreamWritesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = w.WriteStatus(200, nil)
-	w.WriteChunkAsync([]byte("mid-stream chunk marker"))
+	archiveWriteChunk(w, []byte("mid-stream chunk marker"))
 
 	// Config reload that turns the archive off while the stream is open.
 	a.SetConfig(&config.Config{})
@@ -61,7 +61,7 @@ func TestArchiveStreamDiscardWritesNothingAndReleasesSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.WriteChunkAsync([]byte("discarded chunk"))
+	archiveWriteChunk(w, []byte("discarded chunk"))
 	discarder, ok := w.(interface{ Discard() error })
 	if !ok {
 		t.Fatalf("archive stream %T does not implement Discard", w)
@@ -215,7 +215,7 @@ func TestArchiveStreamCutOneByteIntoSecretIsTrimmed(t *testing.T) {
 		t.Fatal(err)
 	}
 	filler := strings.Repeat("b", (1<<20)-1)
-	w.WriteChunkAsync([]byte(filler + "consumer-secret-123456789"))
+	archiveWriteChunk(w, []byte(filler+"consumer-secret-123456789"))
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}

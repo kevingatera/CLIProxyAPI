@@ -72,6 +72,12 @@ func runLogDirCleaner(ctx context.Context, logDir string, maxBytes int64, protec
 }
 
 func enforceLogDirSizeLimit(logDir string, maxBytes int64, protectedPath string) (int, error) {
+	return enforceLogDirSizeLimitMatching(logDir, maxBytes, protectedPath, isLogFileName)
+}
+
+// enforceLogDirSizeLimitMatching deletes the oldest files that match, until the
+// matching files fit in maxBytes. Files that do not match are never touched.
+func enforceLogDirSizeLimitMatching(logDir string, maxBytes int64, protectedPath string, match func(string) bool) (int, error) {
 	if maxBytes <= 0 {
 		return 0, nil
 	}
@@ -110,7 +116,7 @@ func enforceLogDirSizeLimit(logDir string, maxBytes int64, protectedPath string)
 			continue
 		}
 		name := entry.Name()
-		if !isLogFileName(name) {
+		if !match(name) {
 			continue
 		}
 		info, errInfo := entry.Info()

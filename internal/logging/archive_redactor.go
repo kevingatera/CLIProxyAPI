@@ -2,12 +2,14 @@ package logging
 
 import (
 	"bytes"
-	"io"
+	"errors"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/ojson"
 	"github.com/MoeForge/moego/regexp"
 )
 
@@ -60,80 +62,97 @@ func NewArchiveRedactor(secrets []string) *ArchiveRedactor {
 	return &ArchiveRedactor{replacements: strings.NewReplacer(pairs...), secrets: keys}
 }
 
-// decodeArchiveJSON decodes one JSON document. Numbers stay exact, so a record
-// that is re-encoded after masking differs only where a secret was replaced.
-func decodeArchiveJSON(data []byte) (any, bool) {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	var value any
-	if err := dec.Decode(&value); err != nil {
-		return nil, false
+// errArchiveEdit reports a JSON path that cannot be edited safely.
+var errArchiveEdit = errors.New("archive: JSON path cannot be edited")
+
+// archiveSetPath replaces the value at path in doc. The path must resolve to an
+// existing value, so an escaped key cannot make the editor add a new member next
+// to an unmasked original.
+func archiveSetPath(doc *ojson.Doc, path, value string) error {
+	if path == "" || !doc.Get(path).Exists() {
+		return errArchiveEdit
 	}
-	if _, err := dec.Token(); err != io.EOF {
-		return nil, false
+	return doc.Set(path, value)
+}
+
+// archiveJoin appends one already escaped path component.
+func archiveJoin(parent, comp string) string {
+	if parent == "" {
+		return comp
 	}
-	return value, true
+	return parent + "." + comp
+}
+
+// splitArchiveDataPrefix separates an SSE "data:" prefix from a line.
+func splitArchiveDataPrefix(line string) (string, string) {
+	switch {
+	case strings.HasPrefix(line, "data: "):
+		return "data: ", strings.TrimPrefix(line, "data: ")
+	case strings.HasPrefix(line, "data:"):
+		return "data:", strings.TrimPrefix(line, "data:")
+	}
+	return "", line
 }
 
 // Transcript also masks a credential emitted across separate JSON delta
-// records, in addition to credentials split across transport chunks.
+// records, in addition to credentials split across transport chunks. Each record
+// is edited through its own ojson.Doc, so untouched fields keep their order and
+// number formatting.
 func (r *ArchiveRedactor) Transcript(data []byte) []byte {
 	lines := strings.Split(string(data), "\n")
 	type record struct {
-		value   any
+		doc     *ojson.Doc
 		prefix  string
 		changed bool
+		failed  bool
 	}
 	type span struct {
 		text       string
 		start, end int
 		record     int
-		set        func()
+		path       string
 	}
 	records := make(map[int]*record)
 	lanes := make(map[string][]span)
 	lengths := make(map[string]int)
 	for index, line := range lines {
-		prefix := ""
-		if strings.HasPrefix(line, "data:") {
-			prefix = "data:"
-			if strings.HasPrefix(line, "data: ") {
-				prefix = "data: "
-			}
-			line = strings.TrimPrefix(line, prefix)
-		}
-		value, ok := decodeArchiveJSON([]byte(line))
-		if !ok {
+		prefix, body := splitArchiveDataPrefix(line)
+		if !ojson.Valid(body) {
 			continue
 		}
-		records[index] = &record{value: value, prefix: prefix}
-		var visit func(any)
-		visit = func(v any) {
-			switch x := v.(type) {
-			case map[string]any:
-				keys := make([]string, 0, len(x))
-				for k := range x {
-					keys = append(keys, k)
-				}
-				sort.Strings(keys)
-				for _, key := range keys {
-					item := x[key]
-					text, ok := item.(string)
-					if ok && archiveTextField(key) {
-						start := lengths[key]
-						lengths[key] += len(text)
-						lanes[key] = append(lanes[key], span{text: text, start: start, end: lengths[key], record: index, set: func() { x[key] = archiveRedacted }})
-					} else {
-						visit(item)
+		rec := &record{doc: ojson.NewDocString(body), prefix: prefix}
+		records[index] = rec
+		var visit func(ojson.Result, string)
+		visit = func(v ojson.Result, path string) {
+			switch {
+			case v.IsObject():
+				seen := make(map[string]bool)
+				v.ForEach(func(key, item ojson.Result) bool {
+					name := key.String()
+					if seen[name] {
+						// A duplicate key cannot be addressed by path, so the record fails closed.
+						rec.failed = true
+						return false
 					}
-				}
-			case []any:
-				for _, item := range x {
-					visit(item)
+					seen[name] = true
+					childPath := archiveJoin(path, ojson.Escape(name))
+					if archiveTextField(name) && item.Type == ojson.String {
+						text := item.String()
+						start := lengths[name]
+						lengths[name] += len(text)
+						lanes[name] = append(lanes[name], span{text: text, start: start, end: lengths[name], record: index, path: childPath})
+						return true
+					}
+					visit(item, childPath)
+					return true
+				})
+			case v.IsArray():
+				for i, item := range v.Array() {
+					visit(item, archiveJoin(path, strconv.Itoa(i)))
 				}
 			}
 		}
-		visit(value)
+		visit(ojson.Parse(body), "")
 	}
 	for _, spans := range lanes {
 		var joined strings.Builder
@@ -161,17 +180,23 @@ func (r *ArchiveRedactor) Transcript(data []byte) []byte {
 		for _, s := range spans {
 			for _, match := range matches {
 				if s.start < match[1] && s.end > match[0] {
-					s.set()
-					records[s.record].changed = true
+					rec := records[s.record]
+					if err := archiveSetPath(rec.doc, s.path, archiveRedacted); err != nil {
+						rec.failed = true
+					} else {
+						rec.changed = true
+					}
 					break
 				}
 			}
 		}
 	}
-	for index, record := range records {
-		if record.changed {
-			encoded, _ := json.Marshal(record.value)
-			lines[index] = record.prefix + string(encoded)
+	for index, rec := range records {
+		switch {
+		case rec.failed:
+			lines[index] = rec.prefix + archiveRedacted
+		case rec.changed:
+			lines[index] = rec.prefix + string(rec.doc.Bytes())
 		}
 	}
 	return r.Bytes([]byte(strings.Join(lines, "\n")))
@@ -209,64 +234,104 @@ func (r *ArchiveRedactor) Bytes(data []byte) []byte {
 }
 
 func (r *ArchiveRedactor) redactArchiveJSON(s string) string {
-	if value, ok := decodeArchiveJSON([]byte(s)); ok {
-		if masked, known := maskArchiveFields(value), r.maskKnownArchiveValues(value); masked || known {
-			encoded, _ := json.Marshal(value)
-			return string(encoded)
-		}
-		return s
+	if out, changed := r.redactJSONDocument(s); changed {
+		return out
 	}
 	lines := strings.Split(s, "\n")
 	for i, line := range lines {
-		prefix := ""
-		if strings.HasPrefix(line, "data:") {
-			prefix = "data:"
-			if strings.HasPrefix(line, "data: ") {
-				prefix = "data: "
-			}
-			line = strings.TrimPrefix(line, prefix)
+		prefix, body := splitArchiveDataPrefix(line)
+		if out, changed := r.redactJSONDocument(body); changed {
+			lines[i] = prefix + out
 		}
-		value, ok := decodeArchiveJSON([]byte(line))
-		if !ok {
-			continue
-		}
-		if masked, known := maskArchiveFields(value), r.maskKnownArchiveValues(value); !(masked || known) {
-			continue
-		}
-		encoded, _ := json.Marshal(value)
-		lines[i] = prefix + string(encoded)
 	}
 	return strings.Join(lines, "\n")
 }
 
-// maskArchiveFields replaces values under sensitive JSON keys. It also looks
-// inside string values that hold JSON, which some clients send as escaped text.
-func maskArchiveFields(value any) bool {
-	changed := false
-	switch x := value.(type) {
-	case map[string]any:
-		for key, v := range x {
-			if archiveSensitiveName(key) {
-				x[key] = archiveRedacted
-				changed = true
-			} else if maskArchiveFields(v) {
-				changed = true
-			} else if text, ok := v.(string); ok {
-				if nested, ok := decodeArchiveJSON([]byte(text)); ok && maskArchiveFields(nested) {
-					encoded, _ := json.Marshal(nested)
-					x[key] = string(encoded)
-					changed = true
-				}
+// redactJSONDocument masks sensitive fields and known secrets in one JSON object or
+// array. It reports changed=false when text is not such a document or needs no edits.
+// If an edit cannot be applied safely, the whole document is replaced by [REDACTED].
+func (r *ArchiveRedactor) redactJSONDocument(text string) (string, bool) {
+	if !ojson.Valid(text) {
+		return text, false
+	}
+	root := ojson.Parse(text)
+	if !root.IsObject() && !root.IsArray() {
+		return text, false
+	}
+	e := &archiveEdit{r: r, doc: ojson.NewDocString(text)}
+	e.walk(root, "")
+	switch {
+	case e.failed:
+		return archiveRedacted, true
+	case e.changed:
+		return string(e.doc.Bytes()), true
+	}
+	return text, false
+}
+
+// archiveEdit applies masking edits to one document. Every edit is a path set on
+// ojson.Doc, so untouched bytes are preserved exactly.
+type archiveEdit struct {
+	r       *ArchiveRedactor
+	doc     *ojson.Doc
+	changed bool
+	failed  bool
+}
+
+// set replaces the value at path. An edit that cannot be applied marks the document failed.
+func (e *archiveEdit) set(path, value string) {
+	if e.failed {
+		return
+	}
+	if err := archiveSetPath(e.doc, path, value); err != nil {
+		e.failed = true
+		return
+	}
+	e.changed = true
+}
+
+// walk visits the members of the object or array v, which sits at path.
+func (e *archiveEdit) walk(v ojson.Result, path string) {
+	switch {
+	case v.IsObject():
+		seen := make(map[string]bool)
+		v.ForEach(func(key, item ojson.Result) bool {
+			name := key.String()
+			if seen[name] {
+				// A duplicate key cannot be addressed by path, so the document fails closed.
+				e.failed = true
+				return false
 			}
-		}
-	case []any:
-		for _, v := range x {
-			if maskArchiveFields(v) {
-				changed = true
-			}
+			seen[name] = true
+			e.value(item, archiveJoin(path, ojson.Escape(name)), name)
+			return !e.failed
+		})
+	case v.IsArray():
+		for i, item := range v.Array() {
+			e.value(item, archiveJoin(path, strconv.Itoa(i)), "")
 		}
 	}
-	return changed
+}
+
+// value masks one member. name is the object key, empty for array items.
+func (e *archiveEdit) value(v ojson.Result, path, name string) {
+	if archiveSensitiveName(name) {
+		e.set(path, archiveRedacted)
+		return
+	}
+	if v.Type == ojson.String {
+		text := v.String()
+		// Some clients send JSON as escaped text, so look inside string values too.
+		if inner, changed := e.r.redactJSONDocument(text); changed {
+			e.set(path, inner)
+			return
+		}
+		if safe := e.r.replacements.Replace(text); safe != text {
+			e.set(path, safe)
+		}
+		return
+	}
+	e.walk(v, path)
 }
 
 func archiveSensitiveName(name string) bool {
@@ -325,37 +390,4 @@ func (r *ArchiveRedactor) Headers(headers map[string][]string) map[string][]stri
 		}
 	}
 	return out
-}
-
-// maskKnownArchiveValues matches known secrets against decoded string values, so
-// JSON unicode escapes cannot hide a configured key from the archive masker.
-func (r *ArchiveRedactor) maskKnownArchiveValues(value any) bool {
-	changed := false
-	switch x := value.(type) {
-	case map[string]any:
-		for key, item := range x {
-			if text, ok := item.(string); ok {
-				safe := r.replacements.Replace(text)
-				if safe != text {
-					x[key] = safe
-					changed = true
-				}
-			} else if r.maskKnownArchiveValues(item) {
-				changed = true
-			}
-		}
-	case []any:
-		for i, item := range x {
-			if text, ok := item.(string); ok {
-				safe := r.replacements.Replace(text)
-				if safe != text {
-					x[i] = safe
-					changed = true
-				}
-			} else if r.maskKnownArchiveValues(item) {
-				changed = true
-			}
-		}
-	}
-	return changed
 }
