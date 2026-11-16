@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
@@ -35,8 +36,10 @@ import (
 //
 // Storage: <WRITABLE_PATH, or the config directory>/management-api-key-labels.json,
 // written with mode 0600 through a temp file and rename. Back it up with config.yaml.
-// The mutex serializes requests in one process only. Run one server process per
-// labels file; two processes can each pass If-Match and lose an update.
+// Requests that share a labels file serialize on a lock keyed by its cleaned
+// absolute path, so independent handlers in one process cannot both pass If-Match.
+// The lock does not span processes. Run one server process per labels file; two
+// processes can each pass If-Match and lose an update.
 
 const (
 	apiKeyLabelsFileName    = "management-api-key-labels.json"
@@ -46,6 +49,30 @@ const (
 )
 
 var errInvalidAPIKeyFingerprint = errors.New("invalid fingerprint: expected key:sha256: followed by 16 lowercase hex digits")
+
+// apiKeyLabelsLocks maps a cleaned absolute labels path to its lock. One entry
+// exists per path, so the map stays small.
+var apiKeyLabelsLocks = struct {
+	mu     sync.Mutex
+	byPath map[string]*sync.Mutex
+}{byPath: make(map[string]*sync.Mutex)}
+
+// lockAPIKeyLabelsPath locks the labels file at path and returns the unlock func.
+func lockAPIKeyLabelsPath(path string) func() {
+	key := filepath.Clean(path)
+	if abs, err := filepath.Abs(key); err == nil {
+		key = abs
+	}
+	apiKeyLabelsLocks.mu.Lock()
+	lock, ok := apiKeyLabelsLocks.byPath[key]
+	if !ok {
+		lock = &sync.Mutex{}
+		apiKeyLabelsLocks.byPath[key] = lock
+	}
+	apiKeyLabelsLocks.mu.Unlock()
+	lock.Lock()
+	return lock.Unlock
+}
 
 func (h *Handler) apiKeyLabelsPath() string {
 	if h == nil {
@@ -195,8 +222,8 @@ func (h *Handler) GetAPIKeyLabels(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
 		return
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	unlock := lockAPIKeyLabelsPath(h.apiKeyLabelsPath())
+	defer unlock()
 	labels, err := h.loadAPIKeyLabelsLocked()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "read_failed", "message": err.Error()})
@@ -231,8 +258,8 @@ func (h *Handler) PutAPIKeyLabels(c *gin.Context) {
 		return
 	}
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	unlock := lockAPIKeyLabelsPath(h.apiKeyLabelsPath())
+	defer unlock()
 	current, err := h.loadAPIKeyLabelsLocked()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "read_failed", "message": err.Error()})

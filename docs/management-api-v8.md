@@ -176,8 +176,9 @@ fingerprint, so raw keys are never sent.
   Without `If-Match` the write is unconditional.
 - Storage is `management-api-key-labels.json` in `WRITABLE_PATH`, or next to `config.yaml`,
   written with mode 0600. A null, empty, or invalid file returns 500 until it is fixed or removed.
-- Run one server process per labels file. Locking is in-process only, so two processes can
-  each pass `If-Match` and lose an update.
+- Requests in one process serialize per labels file, so concurrent handlers on the same path
+  cannot both pass `If-Match`. Run one server process per labels file: locking does not span
+  processes, and two processes can each pass `If-Match` and lose an update.
 - Back it up with `config.yaml`.
 
 ## OAuth

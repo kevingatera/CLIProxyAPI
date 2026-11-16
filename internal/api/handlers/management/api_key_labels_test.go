@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/MoeForge/moego/json"
@@ -236,5 +238,50 @@ func TestAPIKeyLabelsFileIsPrivate(t *testing.T) {
 	}
 	if mode := info.Mode().Perm(); mode != 0o600 {
 		t.Fatalf("labels file mode = %o, want 600", mode)
+	}
+}
+
+// Two handler instances on one labels path must not both win a conditional
+// write. Each round starts from the same revision and sends two If-Match PUTs at
+// once. Exactly one may succeed; the other must get 412.
+func TestAPIKeyLabelsIndependentHandlersSerializeIfMatch(t *testing.T) {
+	first, configDir := setupAPIKeyLabelsHandler(t)
+	second := &Handler{configFilePath: filepath.Join(configDir, "config.yaml")}
+	routerA := newAPIKeyLabelsRouter(first)
+	routerB := newAPIKeyLabelsRouter(second)
+
+	for round := 0; round < 100; round++ {
+		etag := doAPIKeyLabels(routerA, http.MethodGet, "").Header().Get("ETag")
+		start := make(chan struct{})
+		codes := make(chan int, 2)
+		var wg sync.WaitGroup
+		for i, router := range []*gin.Engine{routerA, routerB} {
+			wg.Add(1)
+			// The ETag is content-based, so each write needs distinct content.
+			// Otherwise an identical write would legitimately match the revision.
+			body := `{"` + fpA + `":"writer-` + strconv.Itoa(round) + "-" + strconv.Itoa(i) + `"}`
+			go func(router *gin.Engine, body string) {
+				defer wg.Done()
+				<-start
+				codes <- doAPIKeyLabels(router, http.MethodPut, body, etag).Code
+			}(router, body)
+		}
+		close(start)
+		wg.Wait()
+		close(codes)
+		ok, precond := 0, 0
+		for code := range codes {
+			switch code {
+			case http.StatusOK:
+				ok++
+			case http.StatusPreconditionFailed:
+				precond++
+			default:
+				t.Fatalf("round %d: unexpected status %d", round, code)
+			}
+		}
+		if ok != 1 || precond != 1 {
+			t.Fatalf("round %d: %d writes succeeded and %d got 412, want exactly one of each", round, ok, precond)
+		}
 	}
 }
