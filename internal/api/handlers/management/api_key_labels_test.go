@@ -7,13 +7,18 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
 )
 
-const apiKeyLabelsTestPath = "/v8/management/api-key-labels"
+const (
+	apiKeyLabelsTestPath = "/v8/management/api-key-labels"
+	fpA                  = "key:sha256:0123456789abcdef"
+	fpB                  = "key:sha256:fedcba9876543210"
+)
 
 func setupAPIKeyLabelsHandler(t *testing.T) (*Handler, string) {
 	t.Helper()
@@ -67,36 +72,118 @@ func TestAPIKeyLabelsRoundTrip(t *testing.T) {
 		t.Fatal("GET missing ETag")
 	}
 
-	w = doAPIKeyLabels(router, http.MethodPut, `{"api-key-labels":{"key:sha256:0123456789abcdef":"Build bot","key:sha256:fedcba9876543210":"Team laptop"}}`)
+	body := `{"api-key-labels":{"` + fpA + `":"Build bot","` + fpB + `":"Team laptop"}}`
+	w = doAPIKeyLabels(router, http.MethodPut, body)
 	if w.Code != http.StatusOK {
 		t.Fatalf("PUT status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
 	got := decodeAPIKeyLabels(t, doAPIKeyLabels(router, http.MethodGet, ""))
-	if got["key:sha256:0123456789abcdef"] != "Build bot" || got["key:sha256:fedcba9876543210"] != "Team laptop" {
+	if got[fpA] != "Build bot" || got[fpB] != "Team laptop" {
 		t.Fatalf("labels = %v", got)
 	}
 }
 
-func TestAPIKeyLabelsDropsEmptyEntriesAndAcceptsBareMap(t *testing.T) {
+func TestAPIKeyLabelsDropsBlankLabelsAndAcceptsBareMap(t *testing.T) {
 	h, _ := setupAPIKeyLabelsHandler(t)
 	router := newAPIKeyLabelsRouter(h)
 
-	w := doAPIKeyLabels(router, http.MethodPut, `{"":"dropped","valid":"Kept","blank":"   "}`)
+	w := doAPIKeyLabels(router, http.MethodPut, `{"`+fpA+`":"Kept","`+fpB+`":"   "}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("PUT status = %d, want 200", w.Code)
 	}
 	got := decodeAPIKeyLabels(t, w)
-	if _, ok := got[""]; ok || got["valid"] != "Kept" || len(got) != 1 {
+	if got[fpA] != "Kept" || len(got) != 1 {
 		t.Fatalf("labels = %v", got)
 	}
 }
 
-func TestAPIKeyLabelsRejectsInvalidBody(t *testing.T) {
-	h, _ := setupAPIKeyLabelsHandler(t)
+// Fingerprints outside the documented syntax are rejected, including raw keys.
+// The response must not echo the rejected value.
+func TestAPIKeyLabelsRejectsInvalidFingerprints(t *testing.T) {
+	h, configDir := setupAPIKeyLabelsHandler(t)
 	router := newAPIKeyLabelsRouter(h)
 
-	if w := doAPIKeyLabels(router, http.MethodPut, `["not","a","map"]`); w.Code != http.StatusBadRequest {
-		t.Fatalf("invalid body status = %d, want 400", w.Code)
+	for _, bad := range []string{
+		"",
+		"  ",
+		"sk-live-raw-secret-123456",
+		"key:sha256:ABCDEF0123456789",
+		"key:sha256:0123",
+		"key:sha256:0123456789abcdef0",
+		"KEY:sha256:0123456789abcdef",
+	} {
+		w := doAPIKeyLabels(router, http.MethodPut, `{"`+bad+`":"Label"}`)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("PUT with fingerprint %q status = %d, want 400", bad, w.Code)
+		}
+		if strings.TrimSpace(bad) != "" && strings.Contains(w.Body.String(), bad) {
+			t.Fatalf("400 response echoed the rejected value %q: %s", bad, w.Body.String())
+		}
+	}
+	if _, err := os.Stat(filepath.Join(configDir, apiKeyLabelsFileName)); !os.IsNotExist(err) {
+		t.Fatalf("rejected writes created the labels file (err=%v)", err)
+	}
+}
+
+// Empty, null and non-object bodies must not replace stored labels.
+func TestAPIKeyLabelsRejectsEmptyAndNullBodiesWithoutLoss(t *testing.T) {
+	h, _ := setupAPIKeyLabelsHandler(t)
+	router := newAPIKeyLabelsRouter(h)
+	if w := doAPIKeyLabels(router, http.MethodPut, `{"`+fpA+`":"Keep me"}`); w.Code != http.StatusOK {
+		t.Fatalf("seed PUT status = %d", w.Code)
+	}
+
+	for _, body := range []string{"", "   \n", "null", `{"api-key-labels":null}`, `{"api-key-labels":"x"}`, `"text"`, `[]`} {
+		if w := doAPIKeyLabels(router, http.MethodPut, body); w.Code != http.StatusBadRequest {
+			t.Fatalf("PUT %q status = %d, want 400", body, w.Code)
+		}
+	}
+	if got := decodeAPIKeyLabels(t, doAPIKeyLabels(router, http.MethodGet, "")); got[fpA] != "Keep me" || len(got) != 1 {
+		t.Fatalf("rejected bodies changed labels: %v", got)
+	}
+}
+
+// A null, empty or corrupt labels file is an error. It is not an empty label set,
+// and a write must not overwrite it.
+func TestAPIKeyLabelsRejectsInvalidPersistedFile(t *testing.T) {
+	h, configDir := setupAPIKeyLabelsHandler(t)
+	router := newAPIKeyLabelsRouter(h)
+	path := filepath.Join(configDir, apiKeyLabelsFileName)
+
+	for _, content := range []string{"null", "", `{"api-key-labels":null}`, `{"sk-raw":"x"}`} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if w := doAPIKeyLabels(router, http.MethodGet, ""); w.Code != http.StatusInternalServerError {
+			t.Fatalf("GET with file %q status = %d, want 500", content, w.Code)
+		}
+		if w := doAPIKeyLabels(router, http.MethodPut, `{"`+fpB+`":"New"}`); w.Code != http.StatusInternalServerError {
+			t.Fatalf("PUT with file %q status = %d, want 500", content, w.Code)
+		}
+		if data, _ := os.ReadFile(path); string(data) != content {
+			t.Fatalf("file %q was overwritten with %q", content, data)
+		}
+	}
+}
+
+// A failed rename must not leave the temp file behind. A directory at the target
+// path makes the rename fail while the temp file is already written.
+func TestAPIKeyLabelsRemovesTempFileOnFailedRename(t *testing.T) {
+	h, configDir := setupAPIKeyLabelsHandler(t)
+	target := filepath.Join(configDir, apiKeyLabelsFileName)
+	if err := os.MkdirAll(filepath.Join(target, "blocker"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.saveAPIKeyLabelsLocked(map[string]string{fpA: "Label"}); err == nil {
+		t.Fatal("save succeeded, want rename failure")
+	}
+	leftovers, err := filepath.Glob(filepath.Join(configDir, "api-key-labels-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("temp files left behind after failed rename: %v", leftovers)
 	}
 }
 
@@ -105,12 +192,12 @@ func TestAPIKeyLabelsRejectsStaleIfMatch(t *testing.T) {
 	router := newAPIKeyLabelsRouter(h)
 
 	first := doAPIKeyLabels(router, http.MethodGet, "").Header().Get("ETag")
-	if w := doAPIKeyLabels(router, http.MethodPut, `{"a":"One"}`, first); w.Code != http.StatusOK {
+	if w := doAPIKeyLabels(router, http.MethodPut, `{"`+fpA+`":"One"}`, first); w.Code != http.StatusOK {
 		t.Fatalf("matching If-Match status = %d, want 200", w.Code)
 	}
 
 	// A second client still holds the first revision.
-	stale := doAPIKeyLabels(router, http.MethodPut, `{"b":"Two"}`, first)
+	stale := doAPIKeyLabels(router, http.MethodPut, `{"`+fpB+`":"Two"}`, first)
 	if stale.Code != http.StatusPreconditionFailed {
 		t.Fatalf("stale If-Match status = %d, want 412", stale.Code)
 	}
@@ -118,17 +205,17 @@ func TestAPIKeyLabelsRejectsStaleIfMatch(t *testing.T) {
 	if current == "" || current == first {
 		t.Fatalf("412 ETag = %q, want current revision", current)
 	}
-	if got := decodeAPIKeyLabels(t, doAPIKeyLabels(router, http.MethodGet, "")); got["b"] != "" || got["a"] != "One" {
+	if got := decodeAPIKeyLabels(t, doAPIKeyLabels(router, http.MethodGet, "")); got[fpB] != "" || got[fpA] != "One" {
 		t.Fatalf("stale write changed labels: %v", got)
 	}
 
-	if w := doAPIKeyLabels(router, http.MethodPut, `{"b":"Two"}`, current); w.Code != http.StatusOK {
+	if w := doAPIKeyLabels(router, http.MethodPut, `{"`+fpB+`":"Two"}`, current); w.Code != http.StatusOK {
 		t.Fatalf("current If-Match status = %d, want 200", w.Code)
 	}
-	if w := doAPIKeyLabels(router, http.MethodPut, `{"c":"Three"}`, "*"); w.Code != http.StatusOK {
+	if w := doAPIKeyLabels(router, http.MethodPut, `{"`+fpA+`":"Three"}`, "*"); w.Code != http.StatusOK {
 		t.Fatalf("wildcard If-Match status = %d, want 200", w.Code)
 	}
-	if w := doAPIKeyLabels(router, http.MethodPut, `{"d":"Four"}`); w.Code != http.StatusOK {
+	if w := doAPIKeyLabels(router, http.MethodPut, `{"`+fpA+`":"Four"}`); w.Code != http.StatusOK {
 		t.Fatalf("unconditional PUT status = %d, want 200", w.Code)
 	}
 }
@@ -140,7 +227,7 @@ func TestAPIKeyLabelsFileIsPrivate(t *testing.T) {
 	h, configDir := setupAPIKeyLabelsHandler(t)
 	router := newAPIKeyLabelsRouter(h)
 
-	if w := doAPIKeyLabels(router, http.MethodPut, `{"a":"One"}`); w.Code != http.StatusOK {
+	if w := doAPIKeyLabels(router, http.MethodPut, `{"`+fpA+`":"One"}`); w.Code != http.StatusOK {
 		t.Fatalf("PUT status = %d", w.Code)
 	}
 	info, err := os.Stat(filepath.Join(configDir, apiKeyLabelsFileName))

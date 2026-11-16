@@ -2,6 +2,8 @@ package management
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -11,24 +13,39 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	log "github.com/sirupsen/logrus"
 )
 
 // API key labels give client API keys human-readable names such as "Team laptop".
-// Keys are identified by a fingerprint computed by the caller, so raw keys never
+// Keys are addressed by a fingerprint computed by the caller, so raw keys never
 // reach these endpoints.
 //
-// Fingerprint format: "key:sha256:" followed by the first 16 lowercase hex digits
-// of SHA-256 over the raw key bytes. The server stores any non-empty trimmed
-// fingerprint string as given; the format is a client contract.
+// Fingerprint syntax: "key:sha256:" followed by exactly 16 lowercase hex digits,
+// the first half of SHA-256 over the raw key bytes. The server checks only this
+// syntax. It cannot prove that a value is a hash, so a client that sends a
+// fingerprint-shaped raw key would still store it.
 //
-// Wire format: { "api-key-labels": { "<fingerprint>": "<label>", ... } }
-// Served at /v8/management/api-key-labels. Reads return an ETag; writes honour
+// Wire format: { "api-key-labels": { "<fingerprint>": "<label>", ... } }. A bare map
+// of the same shape is also accepted. A PUT body must be a JSON object: empty
+// input, null, and non-object JSON get 400. {} clears every label on purpose.
+// Blank labels are dropped, which removes that key's label.
+//
+// Served at /v8/management/api-key-labels. Reads return an ETag. Writes honour
 // If-Match exactly like v8 config writes and answer 412 on a stale revision.
 //
 // Storage: <WRITABLE_PATH, or the config directory>/management-api-key-labels.json,
 // written with mode 0600 through a temp file and rename. Back it up with config.yaml.
+// The mutex serializes requests in one process only. Run one server process per
+// labels file; two processes can each pass If-Match and lose an update.
 
-const apiKeyLabelsFileName = "management-api-key-labels.json"
+const (
+	apiKeyLabelsFileName    = "management-api-key-labels.json"
+	apiKeyLabelsJSONKey     = "api-key-labels"
+	apiKeyFingerprintPrefix = "key:sha256:"
+	apiKeyFingerprintDigits = 16
+)
+
+var errInvalidAPIKeyFingerprint = errors.New("invalid fingerprint: expected key:sha256: followed by 16 lowercase hex digits")
 
 func (h *Handler) apiKeyLabelsPath() string {
 	if h == nil {
@@ -43,6 +60,24 @@ func (h *Handler) apiKeyLabelsPath() string {
 	return apiKeyLabelsFileName
 }
 
+// validAPIKeyFingerprint reports whether fingerprint matches the documented syntax.
+// It never echoes its input, so a raw key cannot leak through an error message.
+func validAPIKeyFingerprint(fingerprint string) bool {
+	digest, ok := strings.CutPrefix(fingerprint, apiKeyFingerprintPrefix)
+	if !ok || len(digest) != apiKeyFingerprintDigits {
+		return false
+	}
+	for i := 0; i < len(digest); i++ {
+		c := digest[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// loadAPIKeyLabelsLocked returns an empty map when the file does not exist yet.
+// An empty, null, or otherwise invalid file is an error, not an empty label set.
 func (h *Handler) loadAPIKeyLabelsLocked() (map[string]string, error) {
 	data, err := os.ReadFile(h.apiKeyLabelsPath())
 	if err != nil {
@@ -51,42 +86,54 @@ func (h *Handler) loadAPIKeyLabelsLocked() (map[string]string, error) {
 		}
 		return nil, err
 	}
-	return parseAPIKeyLabels(data)
+	labels, errParse := parseAPIKeyLabels(data)
+	if errParse != nil {
+		return nil, fmt.Errorf("parse api-key-labels file: %w", errParse)
+	}
+	return labels, nil
 }
 
-// parseAPIKeyLabels accepts the wire envelope and a bare fingerprint-to-label map.
+// parseAPIKeyLabels decodes the envelope or a bare fingerprint-to-label map.
 func parseAPIKeyLabels(data []byte) (map[string]string, error) {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 {
-		return map[string]string{}, nil
+		return nil, errors.New("empty document")
 	}
-
-	var envelope struct {
-		Labels map[string]string `json:"api-key-labels"`
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &fields); err != nil {
+		return nil, err
 	}
-	if err := json.Unmarshal(trimmed, &envelope); err == nil && envelope.Labels != nil {
-		return normalizeAPIKeyLabels(envelope.Labels), nil
+	if fields == nil {
+		return nil, errors.New("expected a JSON object")
 	}
-
+	if raw, ok := fields[apiKeyLabelsJSONKey]; ok {
+		var labels map[string]string
+		if err := json.Unmarshal(raw, &labels); err != nil || labels == nil {
+			return nil, errors.New("api-key-labels must be a JSON object")
+		}
+		return normalizeAPIKeyLabels(labels)
+	}
 	var bare map[string]string
 	if err := json.Unmarshal(trimmed, &bare); err != nil {
 		return nil, err
 	}
-	return normalizeAPIKeyLabels(bare), nil
+	return normalizeAPIKeyLabels(bare)
 }
 
-// normalizeAPIKeyLabels trims both sides and drops entries with an empty fingerprint or label.
-func normalizeAPIKeyLabels(in map[string]string) map[string]string {
+// normalizeAPIKeyLabels trims fingerprints, rejects any that break the syntax,
+// and drops entries whose label is blank.
+func normalizeAPIKeyLabels(in map[string]string) (map[string]string, error) {
 	out := make(map[string]string, len(in))
 	for fingerprint, label := range in {
 		fp := strings.TrimSpace(fingerprint)
-		l := strings.TrimSpace(label)
-		if fp == "" || l == "" {
-			continue
+		if !validAPIKeyFingerprint(fp) {
+			return nil, errInvalidAPIKeyFingerprint
 		}
-		out[fp] = l
+		if l := strings.TrimSpace(label); l != "" {
+			out[fp] = l
+		}
 	}
-	return out
+	return out, nil
 }
 
 // apiKeyLabelsRevision hashes the canonical labels encoding. Map keys are sorted
@@ -119,16 +166,27 @@ func (h *Handler) saveAPIKeyLabelsLocked(labels map[string]string) error {
 		return err
 	}
 	tmpPath := tmp.Name()
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		if errRemove := os.Remove(tmpPath); errRemove != nil && !os.IsNotExist(errRemove) {
+			log.Warnf("remove unused api-key-labels temp file: %v", errRemove)
+		}
+	}()
 	if _, err = tmp.Write(encoded); err != nil {
 		_ = tmp.Close()
-		_ = os.Remove(tmpPath)
 		return err
 	}
 	if err = tmp.Close(); err != nil {
-		_ = os.Remove(tmpPath)
 		return err
 	}
-	return os.Rename(tmpPath, path)
+	if err = os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 // GetAPIKeyLabels returns the api-key-labels map and its ETag.
@@ -169,7 +227,7 @@ func (h *Handler) PutAPIKeyLabels(c *gin.Context) {
 	}
 	labels, err := parseAPIKeyLabels(body)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": "body must be a JSON object of fingerprint to label"})
 		return
 	}
 

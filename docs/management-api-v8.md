@@ -164,15 +164,21 @@ retain the corresponding business operation's fields.
 ### API key labels
 
 `/api-key-labels` stores display names for client API keys. Keys are addressed by a
-fingerprint, so raw keys are never sent. A fingerprint is `key:sha256:` followed by
-the first 16 lowercase hex digits of SHA-256 over the raw key bytes. The server stores
-any non-empty trimmed fingerprint as given.
+fingerprint, so raw keys are never sent.
 
+- Fingerprint syntax: `key:sha256:` followed by exactly 16 lowercase hex digits (the first
+  half of SHA-256 over the raw key bytes). Other values get 400. The server checks syntax
+  only and cannot tell a hash from a fingerprint-shaped raw key.
 - `GET` returns `{"api-key-labels": {"<fingerprint>": "<label>"}}` with an `ETag`.
-- `PUT` replaces the whole map. Send `If-Match` with the last ETag; a stale value gets 412
-  and the current `ETag`. Without `If-Match` the write is unconditional.
-- Storage is `management-api-key-labels.json` in `WRITABLE_PATH`, or next to `config.yaml`.
-  The file is written with mode 0600. Back it up with `config.yaml`.
+- `PUT` replaces the whole map. The body must be a JSON object. Empty, `null`, and non-object
+  bodies get 400. `{}` clears all labels. A blank label removes that key's label.
+- `PUT` with `If-Match` must name the current `ETag`, or it gets 412 and the current `ETag`.
+  Without `If-Match` the write is unconditional.
+- Storage is `management-api-key-labels.json` in `WRITABLE_PATH`, or next to `config.yaml`,
+  written with mode 0600. A null, empty, or invalid file returns 500 until it is fixed or removed.
+- Run one server process per labels file. Locking is in-process only, so two processes can
+  each pass `If-Match` and lose an update.
+- Back it up with `config.yaml`.
 
 ## OAuth
 
