@@ -92,9 +92,12 @@ func (m *Manager) sweepCreditQuotaRecovery(ctx context.Context) []creditQuotaPro
 	}
 	found := make(map[string]cooling)
 	m.mu.RLock()
-	for id, a := range m.auths {
-		if isCreditQuotaCooling(a, now) {
-			found[id] = cooling{cred: codexCredentialOf(a, r.hostProxyURL), recoverAt: a.Quota.NextRecoverAt}
+	// Recovery is part of the quota-aware strategy only. Other strategies never probe usage.
+	if quotaSelectorOf(m.selector) != nil {
+		for id, a := range m.auths {
+			if isCreditQuotaCooling(a, now) {
+				found[id] = cooling{cred: codexCredentialOf(a, r.hostProxyURL), recoverAt: a.Quota.NextRecoverAt}
+			}
 		}
 	}
 	m.mu.RUnlock()

@@ -12,7 +12,11 @@ import (
 // creditRecoveryFixture registers one Codex credential and returns a clock the test can move.
 func creditRecoveryFixture(t *testing.T) (*Manager, string, *time.Time) {
 	t.Helper()
-	manager := NewManager(nil, nil, nil)
+	// Recovery runs only under the quota-aware strategy, so the fixture selects with it.
+	selector := NewQuotaAwareSelector()
+	selector.manualRefresh = true
+	t.Cleanup(selector.Stop)
+	manager := NewManager(nil, selector, nil)
 	auth := &Auth{ID: "codex-credit-recovery", Provider: "codex", Status: StatusActive}
 	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
@@ -241,5 +245,18 @@ func TestCreditQuotaRecoveryLeavesOtherCooldownsAlone(t *testing.T) {
 	}
 	if blocked, _, _ := isAuthBlockedForModel(updated, "gpt-6-luna", *clock); !blocked {
 		t.Fatal("model with an unrelated cooldown became schedulable")
+	}
+}
+
+// Recovery probes only under the quota-aware strategy; round-robin never reads usage.
+func TestCreditQuotaRecoveryIsScopedToQuotaAware(t *testing.T) {
+	manager, id, clock := creditRecoveryFixture(t)
+	manager.mu.Lock()
+	manager.selector = &RoundRobinSelector{}
+	manager.mu.Unlock()
+	setCreditQuotaCooldown(t, manager, id, clock.Add(time.Hour))
+
+	if due := manager.sweepCreditQuotaRecovery(context.Background()); len(due) != 0 {
+		t.Fatalf("round-robin scheduled %d usage probes, want 0", len(due))
 	}
 }
