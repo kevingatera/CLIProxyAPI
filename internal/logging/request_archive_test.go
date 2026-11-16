@@ -449,3 +449,28 @@ func TestRequestArchiveStreamingRequestBodyIsBoundedAndOmitted(t *testing.T) {
 		}
 	})
 }
+
+func TestRequestArchiveStreamingErrorTextIsMasked(t *testing.T) {
+	a := newTestArchive(t)
+	w, err := a.LogStreamingRequest("/v1/responses", "POST", nil, []byte("error stream prompt"), "stream-error")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = w.WriteStatus(502, nil)
+	errs := []*interfaces.ErrorMessage{{StatusCode: 502, Error: errors.New("upstream rejected oauth-secret-987654321 and consumer-secret-123456789")}}
+	if err := w.WriteAPIResponseErrors(errs); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	log := readArchive(t, a)
+	for _, secret := range []string{"oauth-secret-987654321", "consumer-secret-123456789"} {
+		if strings.Contains(log, secret) {
+			t.Errorf("streaming error text leaked %q", secret)
+		}
+	}
+	if !strings.Contains(log, "API ERROR RESPONSE") || !strings.Contains(log, "upstream rejected") {
+		t.Fatal("masked error section missing")
+	}
+}
