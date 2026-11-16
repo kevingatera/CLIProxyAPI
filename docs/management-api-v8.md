@@ -139,6 +139,7 @@ retain the corresponding business operation's fields.
 | `/observability/logs/errors/<name>` | GET | Download an error-log file. |
 | `/observability/logs/requests/<id>` | GET | Get a request log. |
 | `/observability/usage/api-keys` | GET | Get API-key usage. |
+| `/api-key-labels` | GET, PUT | Read or replace display labels for client API keys. See [API key labels](#api-key-labels). |
 | `/observability/usage/queue` | GET | Get queued usage events. |
 | `/credentials` | GET, POST, DELETE | List, upload, or delete credential files. |
 | `/credentials/models` | GET | Get credential models. |
@@ -159,6 +160,19 @@ retain the corresponding business operation's fields.
 | `/plugins/store` | GET | List the plugin store (supports optional `?refresh=true` to bypass cached release checks). |
 | `/plugins/store/<id>/install` | POST | Install or update a plugin. |
 | `/plugins/<id>/quota` | GET, POST, DELETE | Read, fetch, or reset plugin quota. |
+
+### API key labels
+
+`/api-key-labels` stores display names for client API keys. Keys are addressed by a
+fingerprint, so raw keys are never sent. A fingerprint is `key:sha256:` followed by
+the first 16 lowercase hex digits of SHA-256 over the raw key bytes. The server stores
+any non-empty trimmed fingerprint as given.
+
+- `GET` returns `{"api-key-labels": {"<fingerprint>": "<label>"}}` with an `ETag`.
+- `PUT` replaces the whole map. Send `If-Match` with the last ETag; a stale value gets 412
+  and the current `ETag`. Without `If-Match` the write is unconditional.
+- Storage is `management-api-key-labels.json` in `WRITABLE_PATH`, or next to `config.yaml`.
+  The file is written with mode 0600. Back it up with `config.yaml`.
 
 ## OAuth
 
