@@ -71,16 +71,39 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		_ = yaml.Unmarshal(oldConfigYaml, &oldCfg)
 	}
 
+	// A legacy file logger cannot become the archive while the server runs. Config loading
+	// turns request-log on for the archive, so keep the legacy logger and upstream capture
+	// off and warn. Otherwise unmasked traffic would be written until a restart.
+	if _, isArchive := s.requestLogger.(*logging.RequestArchive); !isArchive && cfg.RequestArchive.Enabled {
+		if oldCfg == nil || !oldCfg.RequestArchive.Enabled {
+			log.Warn("request-archive was enabled on a running server; restart to start it. Request logging stays off until then")
+		}
+		cfg.RequestLog = false
+	}
+	if archive, ok := s.requestLogger.(*logging.RequestArchive); ok {
+		archive.SetConfig(cfg)
+	}
 	// Update request logger enabled state if it has changed
 	previousRequestLog := false
+	previousArchiveEnabled := false
 	if oldCfg != nil {
 		previousRequestLog = oldCfg.RequestLog
+		previousArchiveEnabled = oldCfg.RequestArchive.Enabled
 	}
-	if s.requestLogger != nil && (oldCfg == nil || previousRequestLog != cfg.RequestLog) {
+	// The archive is enabled by request-log or request-archive. Apply that combined state only to the
+	// archive, so request-log alone cannot disable an explicitly enabled archive. The legacy file logger
+	// keeps following request-log alone; archive mode is chosen at startup.
+	loggerEnabled := cfg.RequestLog
+	previousLoggerEnabled := previousRequestLog
+	if _, ok := s.requestLogger.(*logging.RequestArchive); ok {
+		loggerEnabled = cfg.RequestLog || cfg.RequestArchive.Enabled
+		previousLoggerEnabled = previousRequestLog || previousArchiveEnabled
+	}
+	if s.requestLogger != nil && (oldCfg == nil || previousLoggerEnabled != loggerEnabled) {
 		if s.loggerToggle != nil {
-			s.loggerToggle(cfg.RequestLog)
+			s.loggerToggle(loggerEnabled)
 		} else if toggler, ok := s.requestLogger.(interface{ SetEnabled(bool) }); ok {
-			toggler.SetEnabled(cfg.RequestLog)
+			toggler.SetEnabled(loggerEnabled)
 		}
 	}
 

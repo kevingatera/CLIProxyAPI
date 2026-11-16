@@ -113,6 +113,13 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 		if w.firstChunkTimestamp.IsZero() {
 			w.firstChunkTimestamp = time.Now()
 		}
+		if w.losslessStreaming() {
+			// The client already has the bytes. Only the prefix the archive admits is copied and queued.
+			if keep := w.reserveStreamChunk(len(data)); keep > 0 {
+				w.chunkChannel <- append([]byte(nil), data[:keep]...)
+			}
+			return n, err
+		}
 		// For streaming responses: Send to async logging channel (non-blocking)
 		select {
 		case w.chunkChannel <- append([]byte(nil), data...): // Non-blocking send with copy
@@ -200,6 +207,12 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 		// Capture TTFB on first chunk (synchronous, before async channel send)
 		if w.firstChunkTimestamp.IsZero() {
 			w.firstChunkTimestamp = time.Now()
+		}
+		if w.losslessStreaming() {
+			if keep := w.reserveStreamChunk(len(data)); keep > 0 {
+				w.chunkChannel <- []byte(data[:keep])
+			}
+			return n, err
 		}
 		select {
 		case w.chunkChannel <- []byte(data):
@@ -1032,4 +1045,34 @@ func hasActionableError(c *gin.Context, statusCode int, apiErrors []*interfaces.
 		return false
 	}
 	return statusCode >= http.StatusBadRequest
+}
+
+// losslessStreamingLogger is implemented by loggers that must receive every streamed chunk.
+type losslessStreamingLogger interface{ LosslessStreaming() bool }
+
+// isLosslessStreaming reports whether logger must receive every streamed chunk.
+func isLosslessStreaming(logger logging.RequestLogger) bool {
+	lossless, ok := logger.(losslessStreamingLogger)
+	return ok && lossless.LosslessStreaming()
+}
+
+func (w *ResponseWriterWrapper) losslessStreaming() bool {
+	return isLosslessStreaming(w.logger)
+}
+
+// streamChunkReserver is implemented by stream writers that bound queued chunk
+// bytes, such as the request archive's stream.
+type streamChunkReserver interface {
+	ReserveChunk(n int) int
+}
+
+// reserveStreamChunk asks the stream writer how many leading bytes of an n-byte
+// chunk may be queued, before the chunk is copied. Writers without a reservation
+// accept every byte.
+func (w *ResponseWriterWrapper) reserveStreamChunk(n int) int {
+	reserver, ok := w.streamWriter.(streamChunkReserver)
+	if !ok {
+		return n
+	}
+	return reserver.ReserveChunk(n)
 }

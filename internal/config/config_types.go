@@ -13,6 +13,22 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// RequestArchiveConfig controls the opt-in, credential-masked request archive.
+type RequestArchiveConfig struct {
+	Enabled   bool   `yaml:"enabled" json:"enabled"`
+	Directory string `yaml:"directory,omitempty" json:"directory,omitempty"`
+	// MaxSizeGB caps the archive directory in decimal GB. Zero uses 30.
+	MaxSizeGB int `yaml:"max-size-gb,omitempty" json:"max-size-gb,omitempty"`
+	// MaxAgeDays deletes completed archive files older than this many days. Zero keeps them until the size cap removes them.
+	MaxAgeDays int `yaml:"max-age-days,omitempty" json:"max-age-days,omitempty"`
+	// MaxCaptureMB bounds the transcript bytes held in memory for one request. Zero uses 32.
+	MaxCaptureMB int `yaml:"max-capture-mb,omitempty" json:"max-capture-mb,omitempty"`
+	// MaxConcurrentCaptures bounds streaming requests that buffer transcripts at once. Zero uses 16.
+	MaxConcurrentCaptures int `yaml:"max-concurrent-captures,omitempty" json:"max-concurrent-captures,omitempty"`
+	// MetadataOnly keeps URL, headers, status and timing, and omits all bodies and transcripts.
+	MetadataOnly bool `yaml:"metadata-only,omitempty" json:"metadata-only,omitempty"`
+}
+
 // RequestScopedErrorRule configures custom classification and handling for upstream errors.
 type RequestScopedErrorRule struct {
 	// Status matches the HTTP status code of the upstream response (e.g. 400).

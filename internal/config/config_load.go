@@ -287,6 +287,22 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	cfg.NormalizePluginsConfig()
 	cfg.NormalizeClaudeConfig()
+	if cfg.RequestArchive.MaxSizeGB < 0 || cfg.RequestArchive.MaxSizeGB > 1000000 {
+		return nil, fmt.Errorf("request-archive.max-size-gb must be between 0 and 1000000")
+	}
+	if cfg.RequestArchive.MaxAgeDays < 0 || cfg.RequestArchive.MaxAgeDays > 36500 {
+		return nil, fmt.Errorf("request-archive.max-age-days must be between 0 and 36500")
+	}
+	if cfg.RequestArchive.MaxCaptureMB < 0 || cfg.RequestArchive.MaxCaptureMB > 4096 {
+		return nil, fmt.Errorf("request-archive.max-capture-mb must be between 0 and 4096")
+	}
+	if cfg.RequestArchive.MaxConcurrentCaptures < 0 || cfg.RequestArchive.MaxConcurrentCaptures > 1000 {
+		return nil, fmt.Errorf("request-archive.max-concurrent-captures must be between 0 and 1000")
+	}
+	// Executors record upstream attempts only when request-log is on, so the archive turns it on.
+	if cfg.RequestArchive.Enabled {
+		cfg.RequestLog = true
+	}
 	if errResolvePluginsDir := cfg.ResolvePluginsDir(); errResolvePluginsDir != nil && cfg.Plugins.Enabled {
 		return nil, errResolvePluginsDir
 	}

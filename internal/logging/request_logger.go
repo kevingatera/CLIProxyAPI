@@ -147,6 +147,10 @@ type FileRequestLogger struct {
 	// errorLogsMaxFiles limits the number of error log files retained.
 	errorLogsMaxFiles int
 
+	// filePrefix is prepended to every generated log file name. The request
+	// archive sets it so its retention can match archive files only.
+	filePrefix string
+
 	homeEnabled bool
 }
 
