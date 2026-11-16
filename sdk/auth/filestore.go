@@ -101,6 +101,11 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if isCodexAuth(auth) && cliproxyauth.HasAuthCreationIntent(ctx) {
+		unlockCodexDir := lockCodexDir(s.codexRecordDir(path))
+		defer unlockCodexDir()
+	}
+
 	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
 	}
@@ -108,6 +113,14 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	// metadataSetter is a private interface for TokenStorage implementations that support metadata injection.
 	type metadataSetter interface {
 		SetMetadata(map[string]any)
+	}
+
+	if isCodexAuth(auth) {
+		beforeCodexPersist(path)
+		// Re-check immediately before writing, after the window opened by the hook above.
+		if errVerify := s.verifyCodexTargetLocked(ctx, auth, path); errVerify != nil {
+			return "", errVerify
+		}
 	}
 
 	if handled, errCodex := cliproxyauth.PersistCodexAuthFile(ctx, path, auth); handled {
