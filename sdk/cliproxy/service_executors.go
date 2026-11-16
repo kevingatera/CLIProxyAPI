@@ -563,6 +563,12 @@ func (s *Service) registerResolvedModelsForAuthFenced(a *coreauth.Auth, fence mo
 	if len(normalizedModels) == 0 {
 		return s.unregisterModelsForAuthFenced(a, fence)
 	}
+	// Filter with the list captured in the fence. Publication rejects the result
+	// if the live list changed after the fence was taken.
+	normalizedModels = filterGlobalExcludedModels(normalizedModels, fence.prefix, fence.globalExcludedModels)
+	if len(normalizedModels) == 0 {
+		return s.unregisterModelsForAuthFenced(a, fence)
+	}
 	if !fence.publishModels(s, a.ID, providerKey, normalizedModels) {
 		log.WithFields(log.Fields{"auth_id": a.ID, "provider": providerKey, "models": len(normalizedModels)}).Warnf("model registration for auth %s was superseded during computation; discarded the stale publication instead of overwriting the latest auth state", a.ID)
 		return false

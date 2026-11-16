@@ -689,6 +689,37 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 	return filtered
 }
 
+// filterGlobalExcludedModels drops models whose name, without the credential
+// prefix, matches a global pattern. Patterns match the names clients see, so
+// OAuth aliases count as names. Callers pass the prefixed list.
+func filterGlobalExcludedModels(models []*ModelInfo, prefix string, patterns []string) []*ModelInfo {
+	if len(models) == 0 || len(patterns) == 0 {
+		return models
+	}
+	trimmedPrefix := strings.TrimSpace(prefix)
+	filtered := make([]*ModelInfo, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		name := strings.TrimSpace(model.ID)
+		if trimmedPrefix != "" {
+			name = strings.TrimPrefix(name, trimmedPrefix+"/")
+		}
+		blocked := false
+		for _, pattern := range patterns {
+			if matchWildcard(pattern, name) {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			filtered = append(filtered, model)
+		}
+	}
+	return filtered
+}
+
 func cloneModelInfoForCatalogRoute(model *ModelInfo) ModelInfo {
 	clone := *model
 	if model.NativeCapabilities != nil {

@@ -268,6 +268,12 @@ routing:
     # Set to 0 to keep the legacy 60-second cooldown; set to -1 to disable transient error cooldowns.
     transient-error-cooldown-seconds: 0
 
+  # Global excluded models: wildcard patterns hidden from every provider and auth kind,
+  # including API keys and credentials with their own excluded_models. Patterns match model
+  # names without the credential prefix. Changes take effect on config reload.
+  # excluded-models:
+  #   - "*-preview"
+
 # Shared request/response behavior.
 requests:
   # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/

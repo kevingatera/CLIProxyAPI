@@ -524,7 +524,10 @@ func (s *Service) antigravityModelsForHintsWithConfig(auth *coreauth.Auth, hints
 	models = applyOAuthModelAliasForAuth(cfg, "antigravity", auth.AuthKind(), auth.Attributes, models)
 	models = s.appendPluginModels("antigravity", models, excluded)
 	models = applyOAuthSettingsForAuth(cfg, "antigravity", auth.AuthKind(), models)
-	return applyModelPrefixes(models, auth.Prefix, cfg.ForceModelPrefix)
+	models = applyModelPrefixes(models, auth.Prefix, cfg.ForceModelPrefix)
+	// Publishers hold the cfgMu read lock across this call and the registry write,
+	// so the global list used here stays current until publication.
+	return filterGlobalExcludedModels(models, auth.Prefix, cfg.GlobalExcludedModels)
 }
 
 func (s *Service) asyncProbeAntigravityCapabilities(ctx context.Context, auth *coreauth.Auth, providerKey string) {

@@ -398,3 +398,96 @@ func TestRegisterModelsForAuth_DevinSWE16SlowIncluded(t *testing.T) {
 		t.Errorf("DisplayName = %q, want 'SWE-1.6 Slow'", foundSlow.DisplayName)
 	}
 }
+
+func TestRegisterModelsForAuth_GlobalExcludedModelsWildcardSuffix(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			GlobalExcludedModels: []string{"*-preview"},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:         "auth-gemini-global-suffix",
+		Provider:   "gemini",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"auth_kind": "apikey"},
+	}
+
+	registry := GlobalModelRegistry()
+	registry.UnregisterClient(auth.ID)
+	t.Cleanup(func() { registry.UnregisterClient(auth.ID) })
+
+	service.registerModelsForAuth(context.Background(), auth)
+
+	models := registry.GetModelsForClient(auth.ID)
+	if len(models) == 0 {
+		t.Fatal("expected gemini models to be registered")
+	}
+	for _, model := range models {
+		if strings.HasSuffix(strings.ToLower(model.ID), "-preview") {
+			t.Fatalf("model %q matches *-preview and should be excluded", model.ID)
+		}
+	}
+}
+
+// A credential's own excluded_models replaces the per-provider list, but the
+// global list still applies.
+func TestRegisterModelsForAuth_GlobalExcludedModelsSurviveCredentialOverride(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			GlobalExcludedModels: []string{"gemini-2.5-flash"},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:         "auth-gemini-global-credential-override",
+		Provider:   "gemini",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"auth_kind": "oauth", "excluded_models": "gemini-2.5-pro"},
+	}
+
+	registry := GlobalModelRegistry()
+	registry.UnregisterClient(auth.ID)
+	t.Cleanup(func() { registry.UnregisterClient(auth.ID) })
+
+	service.registerModelsForAuth(context.Background(), auth)
+
+	if registry.ClientSupportsModel(auth.ID, "gemini-2.5-flash") {
+		t.Fatal("gemini-2.5-flash is globally excluded but was registered")
+	}
+	if registry.ClientSupportsModel(auth.ID, "gemini-2.5-pro") {
+		t.Fatal("gemini-2.5-pro is excluded by the credential but was registered")
+	}
+	if !registry.ClientSupportsModel(auth.ID, "gemini-2.5-flash-lite") {
+		t.Fatal("gemini-2.5-flash-lite should remain registered")
+	}
+}
+
+// Patterns match the name clients see without the credential prefix, so a
+// prefixed model is excluded by its bare name.
+func TestRegisterModelsForAuth_GlobalExcludedModelsMatchUnprefixedName(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			SDKConfig:            config.SDKConfig{ForceModelPrefix: true},
+			GlobalExcludedModels: []string{"gemini-2.5-flash"},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:         "auth-gemini-global-prefix",
+		Provider:   "gemini",
+		Prefix:     "team",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"auth_kind": "apikey"},
+	}
+
+	registry := GlobalModelRegistry()
+	registry.UnregisterClient(auth.ID)
+	t.Cleanup(func() { registry.UnregisterClient(auth.ID) })
+
+	service.registerModelsForAuth(context.Background(), auth)
+
+	if registry.ClientSupportsModel(auth.ID, "team/gemini-2.5-flash") {
+		t.Fatal("team/gemini-2.5-flash is globally excluded but was registered")
+	}
+	if !registry.ClientSupportsModel(auth.ID, "team/gemini-2.5-flash-lite") {
+		t.Fatal("team/gemini-2.5-flash-lite should remain registered")
+	}
+}
