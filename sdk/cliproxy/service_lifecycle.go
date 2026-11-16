@@ -381,7 +381,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 				watcher.SetPluginAuthParser(nil)
 			}
 			s.pluginHost.ApplyConfig(ctx, &config.Config{})
-			s.pluginHost.RegisterModels(ctx, registry.GetGlobalRegistry())
+			s.pluginHost.RegisterModels(ctx, s.pluginCatalogRegistry())
 			s.registerAvailableExecutors(ctx, executorRegistrationOptions{
 				includePlugins: true,
 			})

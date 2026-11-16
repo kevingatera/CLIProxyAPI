@@ -39,7 +39,7 @@ func TestModelRegistrationRejectsObsoleteGlobalExcludedModels(t *testing.T) {
 			if commit := service.commitConfigUpdate(newCfg); commit.cfg == nil {
 				t.Fatal("config update was rejected")
 			}
-			if service.registerResolvedModelsForAuthFenced(auth, fence, "claude", []*ModelInfo{{ID: "model-a"}, {ID: "model-b"}}) {
+			if service.registerResolvedModelsForAuthFenced(auth, fence, "claude", prefixedModelsForFence(fence, []*ModelInfo{{ID: "model-a"}, {ID: "model-b"}}, "", false)) {
 				t.Fatal("result computed under obsolete global exclusions was published")
 			}
 			if got := reg.ClientRegistrationEpoch(auth.ID); got != epoch {
@@ -47,7 +47,7 @@ func TestModelRegistrationRejectsObsoleteGlobalExcludedModels(t *testing.T) {
 			}
 
 			current := newModelRegistrationFence(auth, newCfg)
-			if !service.registerResolvedModelsForAuthFenced(auth, current, "claude", []*ModelInfo{{ID: "model-a"}, {ID: "model-b"}}) {
+			if !service.registerResolvedModelsForAuthFenced(auth, current, "claude", prefixedModelsForFence(current, []*ModelInfo{{ID: "model-a"}, {ID: "model-b"}}, "", false)) {
 				t.Fatal("current global exclusions could not publish")
 			}
 			if !reg.ClientSupportsModel(auth.ID, "model-a") || reg.ClientSupportsModel(auth.ID, "model-b") {

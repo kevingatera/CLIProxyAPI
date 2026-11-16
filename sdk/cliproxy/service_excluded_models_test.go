@@ -491,3 +491,47 @@ func TestRegisterModelsForAuth_GlobalExcludedModelsMatchUnprefixedName(t *testin
 		t.Fatal("team/gemini-2.5-flash-lite should remain registered")
 	}
 }
+
+func TestFilterGlobalExcludedModels_IsCaseInsensitive(t *testing.T) {
+	models := []*ModelInfo{{ID: "Vendor-A/Model-One"}, {ID: "keep-me"}}
+	got := filterGlobalExcludedModels(models, []string{"VENDOR-a/*"})
+	if len(got) != 1 || got[0].ID != "keep-me" {
+		t.Fatalf("filtered = %v, want only keep-me", got)
+	}
+}
+
+// A native ID that already starts with the credential prefix is a base model,
+// not a generated variant, so patterns must match it as written.
+func TestPrefixedModelsForFence_NativeIDMatchesAsWritten(t *testing.T) {
+	native := []*ModelInfo{{ID: "team/x"}}
+
+	got := prefixedModelsForFence(modelRegistrationFence{globalExcludedModels: []string{"x"}}, native, "team", false)
+	if ids := modelIDsForTest(got); !equalStrings(ids, []string{"team/x", "team/team/x"}) {
+		t.Fatalf("pattern x kept ids %v, want [team/x team/team/x]", ids)
+	}
+
+	got = prefixedModelsForFence(modelRegistrationFence{globalExcludedModels: []string{"team/x"}}, native, "team", false)
+	if ids := modelIDsForTest(got); len(ids) != 0 {
+		t.Fatalf("pattern team/x kept ids %v, want none", ids)
+	}
+}
+
+func modelIDsForTest(models []*ModelInfo) []string {
+	ids := make([]string, 0, len(models))
+	for _, model := range models {
+		ids = append(ids, model.ID)
+	}
+	return ids
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
