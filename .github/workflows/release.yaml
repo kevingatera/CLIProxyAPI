@@ -137,11 +137,20 @@ jobs:
       - name: Fetch tags
         shell: bash
         run: git fetch --force --tags
+      - name: Resolve Go cache paths
+        id: go-cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "gocache=$(go env GOCACHE)"
+            echo "gomodcache=$(go env GOMODCACHE)"
+          } >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v4
         with:
           path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
+            ${{ steps.go-cache.outputs.gocache }}
+            ${{ steps.go-cache.outputs.gomodcache }}
           key: go-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('go.sum') }}
           restore-keys: |
             go-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-
@@ -212,45 +221,6 @@ jobs:
             echo "release assets upload attempt $attempt failed; retrying in $((15 * (1 << (attempt - 1))))s..." >&2
             sleep $((15 * (1 << (attempt - 1))))
           done
-      - name: Refresh release checksums
-        continue-on-error: true
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          tmp_dir="$(mktemp -d)"
-          trap 'rm -rf "$tmp_dir"' EXIT
-          gh release download "$GITHUB_REF_NAME" \
-            --pattern 'CLIProxyAPI_*.tar.gz' \
-            --pattern 'CLIProxyAPI_*.zip' \
-            --dir "$tmp_dir" \
-            --clobber
-          (
-            cd "$tmp_dir"
-            shopt -s nullglob
-            archives=(CLIProxyAPI_*.tar.gz CLIProxyAPI_*.zip)
-            if [[ ${#archives[@]} -eq 0 ]]; then
-              echo "No release archives found"
-              exit 0
-            fi
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "${archives[@]}" | sort -k2 > checksums.txt
-            else
-              shasum -a 256 "${archives[@]}" | sort -k2 > checksums.txt
-            fi
-          )
-          for attempt in 1 2 3 4 5; do
-            if gh release upload "$GITHUB_REF_NAME" "$tmp_dir/checksums.txt" --clobber; then
-              break
-            fi
-            if [[ "$attempt" == "5" ]]; then
-              echo "exhausted retries uploading checksums" >&2
-              exit 1
-            fi
-            echo "checksums upload attempt $attempt failed; retrying in $((15 * (1 << (attempt - 1))))s..." >&2
-            sleep $((15 * (1 << (attempt - 1))))
-          done
 
   build-linux-glibc:
     name: build linux-${{ matrix.goarch }} glibc
@@ -277,7 +247,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: false
+          cache: true
       - name: Refresh models catalog
         shell: bash
         run: bash .github/scripts/refresh-model-catalogs.sh
@@ -366,45 +336,6 @@ jobs:
               exit 1
             fi
             echo "release assets upload attempt $attempt failed; retrying in $((15 * (1 << (attempt - 1))))s..." >&2
-            sleep $((15 * (1 << (attempt - 1))))
-          done
-      - name: Refresh release checksums
-        continue-on-error: true
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          tmp_dir="$(mktemp -d)"
-          trap 'rm -rf "$tmp_dir"' EXIT
-          gh release download "$GITHUB_REF_NAME" \
-            --pattern 'CLIProxyAPI_*.tar.gz' \
-            --pattern 'CLIProxyAPI_*.zip' \
-            --dir "$tmp_dir" \
-            --clobber
-          (
-            cd "$tmp_dir"
-            shopt -s nullglob
-            archives=(CLIProxyAPI_*.tar.gz CLIProxyAPI_*.zip)
-            if [[ ${#archives[@]} -eq 0 ]]; then
-              echo "No release archives found"
-              exit 0
-            fi
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "${archives[@]}" | sort -k2 > checksums.txt
-            else
-              shasum -a 256 "${archives[@]}" | sort -k2 > checksums.txt
-            fi
-          )
-          for attempt in 1 2 3 4 5; do
-            if gh release upload "$GITHUB_REF_NAME" "$tmp_dir/checksums.txt" --clobber; then
-              break
-            fi
-            if [[ "$attempt" == "5" ]]; then
-              echo "exhausted retries uploading checksums" >&2
-              exit 1
-            fi
-            echo "checksums upload attempt $attempt failed; retrying in $((15 * (1 << (attempt - 1))))s..." >&2
             sleep $((15 * (1 << (attempt - 1))))
           done
 
@@ -505,45 +436,6 @@ jobs:
               exit 1
             fi
             echo "release assets upload attempt $attempt failed; retrying in $((15 * (1 << (attempt - 1))))s..." >&2
-            sleep $((15 * (1 << (attempt - 1))))
-          done
-      - name: Refresh release checksums
-        continue-on-error: true
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          tmp_dir="$(mktemp -d)"
-          trap 'rm -rf "$tmp_dir"' EXIT
-          gh release download "$GITHUB_REF_NAME" \
-            --pattern 'CLIProxyAPI_*.tar.gz' \
-            --pattern 'CLIProxyAPI_*.zip' \
-            --dir "$tmp_dir" \
-            --clobber
-          (
-            cd "$tmp_dir"
-            shopt -s nullglob
-            archives=(CLIProxyAPI_*.tar.gz CLIProxyAPI_*.zip)
-            if [[ ${#archives[@]} -eq 0 ]]; then
-              echo "No release archives found"
-              exit 0
-            fi
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "${archives[@]}" | sort -k2 > checksums.txt
-            else
-              shasum -a 256 "${archives[@]}" | sort -k2 > checksums.txt
-            fi
-          )
-          for attempt in 1 2 3 4 5; do
-            if gh release upload "$GITHUB_REF_NAME" "$tmp_dir/checksums.txt" --clobber; then
-              break
-            fi
-            if [[ "$attempt" == "5" ]]; then
-              echo "exhausted retries uploading checksums" >&2
-              exit 1
-            fi
-            echo "checksums upload attempt $attempt failed; retrying in $((15 * (1 << (attempt - 1))))s..." >&2
             sleep $((15 * (1 << (attempt - 1))))
           done
 
@@ -728,49 +620,9 @@ jobs:
             echo "release assets upload attempt $attempt failed; retrying in $((15 * (1 << (attempt - 1))))s..." >&2
             sleep $((15 * (1 << (attempt - 1))))
           done
-      - name: Refresh release checksums
-        continue-on-error: true
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          tmp_dir="$(mktemp -d)"
-          trap 'rm -rf "$tmp_dir"' EXIT
-          gh release download "$GITHUB_REF_NAME" \
-            --pattern 'CLIProxyAPI_*.tar.gz' \
-            --pattern 'CLIProxyAPI_*.zip' \
-            --dir "$tmp_dir" \
-            --clobber
-          (
-            cd "$tmp_dir"
-            shopt -s nullglob
-            archives=(CLIProxyAPI_*.tar.gz CLIProxyAPI_*.zip)
-            if [[ ${#archives[@]} -eq 0 ]]; then
-              echo "No release archives found"
-              exit 0
-            fi
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "${archives[@]}" | sort -k2 > checksums.txt
-            else
-              shasum -a 256 "${archives[@]}" | sort -k2 > checksums.txt
-            fi
-          )
-          for attempt in 1 2 3 4 5; do
-            if gh release upload "$GITHUB_REF_NAME" "$tmp_dir/checksums.txt" --clobber; then
-              break
-            fi
-            if [[ "$attempt" == "5" ]]; then
-              echo "exhausted retries uploading checksums" >&2
-              exit 1
-            fi
-            echo "checksums upload attempt $attempt failed; retrying in $((15 * (1 << (attempt - 1))))s..." >&2
-            sleep $((15 * (1 << (attempt - 1))))
-          done
 
   publish-checksums:
     runs-on: ubuntu-latest
-    if: always()
     needs:
       - build-hosted
       - build-linux-glibc
