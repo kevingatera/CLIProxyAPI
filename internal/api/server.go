@@ -28,6 +28,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/wstunnel"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
@@ -118,6 +119,15 @@ type Server struct {
 
 	exampleAPIKeySafeModeEnabled bool
 	exampleAPIKeySafeModeActive  atomic.Bool
+
+	// usagePersistenceMu guards the persistence handle. Config reloads and shutdown both replace it.
+	usagePersistenceMu     sync.Mutex
+	usagePersistenceClosed bool
+	usagePersistence       *usage.Persistence
+	usagePersistenceKey    string
+	// usagePersistencePath is the snapshot path last used. A change to it starts the
+	// aggregate empty from the new file; the old file keeps its history.
+	usagePersistencePath string
 }
 
 // NewServer creates and initializes a new API server instance.
@@ -264,6 +274,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		s.mgmt.SetPostAuthPersistHook(optionState.postAuthPersistHook)
 	}
 	s.localPassword = optionState.localPassword
+	s.configureUsagePersistence(cfg)
 
 	// Home heartbeat gate: when home is enabled, block all endpoints with 503 until the
 	// subscribe-config heartbeat connection is healthy.
@@ -511,6 +522,8 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.tunnelHub != nil {
 		s.tunnelHub.Close()
 	}
+	// Flush usage recorded since the last periodic write before returning.
+	s.shutdownUsagePersistence()
 	if errCloseServer != nil {
 		return fmt.Errorf("failed to shutdown HTTP server: %v", errCloseServer)
 	}
