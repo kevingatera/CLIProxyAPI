@@ -71,6 +71,15 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		_ = yaml.Unmarshal(oldConfigYaml, &oldCfg)
 	}
 
+	// A legacy file logger cannot become the archive while the server runs. Config loading
+	// turns request-log on for the archive, so keep the legacy logger and upstream capture
+	// off and warn. Otherwise unmasked traffic would be written until a restart.
+	if _, isArchive := s.requestLogger.(*logging.RequestArchive); !isArchive && cfg.RequestArchive.Enabled {
+		if oldCfg == nil || !oldCfg.RequestArchive.Enabled {
+			log.Warn("request-archive was enabled on a running server; restart to start it. Request logging stays off until then")
+		}
+		cfg.RequestLog = false
+	}
 	if archive, ok := s.requestLogger.(*logging.RequestArchive); ok {
 		archive.SetConfig(cfg)
 	}

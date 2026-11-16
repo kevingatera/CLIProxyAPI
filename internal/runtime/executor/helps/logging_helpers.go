@@ -89,6 +89,7 @@ func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequ
 		return
 	}
 
+	info.Body = logging.AdmitArchiveCapture(ginCtx, info.Body)
 	attempts := getAttempts(ginCtx)
 	index := len(attempts) + 1
 	builder := newAPIRequestLogBuilder(index, info, time.Now())
@@ -342,7 +343,7 @@ func RecordAPIResponseError(ctx context.Context, cfg *config.Config, err error) 
 	if attempt.errorWritten {
 		writeAttemptResponse(ginCtx, attempt, []byte("\n"))
 	}
-	writeAttemptResponse(ginCtx, attempt, []byte(fmt.Sprintf("Error: %s\n", err.Error())))
+	writeAttemptResponse(ginCtx, attempt, logging.AdmitArchiveCapture(ginCtx, []byte(fmt.Sprintf("Error: %s\n", err.Error()))))
 	attempt.errorWritten = true
 
 	updateAggregatedResponseIfMemoryBacked(ginCtx, attempts)
@@ -360,6 +361,11 @@ func AppendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 	}
 	ginCtx := ginContextFrom(ctx)
 	if ginCtx == nil {
+		return
+	}
+	// Admit before any framing is written, so a capped stream adds nothing per chunk.
+	data = logging.AdmitArchiveCapture(ginCtx, data)
+	if len(data) == 0 {
 		return
 	}
 	attempts, attempt := ensureAttempt(ginCtx)
@@ -420,7 +426,7 @@ func RecordAPIWebsocketRequest(ctx context.Context, cfg *config.Config, info Ups
 	writeHeaders(builder, info.Headers)
 	builder.WriteString("\nBody:\n")
 	if len(info.Body) > 0 {
-		builder.Write(info.Body)
+		builder.Write(logging.AdmitArchiveCapture(ginCtx, info.Body))
 	} else {
 		builder.WriteString("<empty>")
 	}
@@ -511,6 +517,10 @@ func AppendAPIWebsocketResponse(ctx context.Context, cfg *config.Config, payload
 	}
 	ginCtx := ginContextFrom(ctx)
 	if ginCtx == nil {
+		return
+	}
+	data = logging.AdmitArchiveCapture(ginCtx, data)
+	if len(data) == 0 {
 		return
 	}
 	markAPIResponseTimestamp(ginCtx)

@@ -67,6 +67,8 @@ func TestReloadEnablingArchiveKeepsLegacyLoggerDisabled(t *testing.T) {
 	// Reload with the archive enabled while request-log stays off.
 	newCfg := oldCfg
 	newCfg.RequestArchive = config.RequestArchiveConfig{Enabled: true, Directory: t.TempDir()}
+	// Config loading turns request-log on whenever the archive is enabled.
+	newCfg.RequestLog = true
 
 	if okUpdate := server.UpdateClientsContext(context.Background(), &newCfg); !okUpdate {
 		t.Fatal("UpdateClientsContext returned false")
@@ -81,6 +83,9 @@ func TestReloadEnablingArchiveKeepsLegacyLoggerDisabled(t *testing.T) {
 	server.cfgMu.RUnlock()
 	if active == nil || !active.RequestArchive.Enabled {
 		t.Fatal("reload dropped the enabled request archive")
+	}
+	if active.RequestLog {
+		t.Fatal("reload left request-log on, so upstream capture and the legacy logger would run unmasked")
 	}
 	restarted, ok := defaultRequestLoggerFactory(active, "config.yaml").(*logging.RequestArchive)
 	if !ok {

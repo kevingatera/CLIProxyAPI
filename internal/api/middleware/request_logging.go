@@ -72,6 +72,13 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 			c.Request = c.Request.WithContext(logging.WithDeferredAPICapture(c.Request.Context(), deferredAPICapture))
 			c.Set(logging.DeferredAPIResponseContextKey, deferredAPICapture)
 		}
+		// Archive mode admits the request before any upstream capture starts. The release is
+		// deferred before the finalizer, so it runs after the stream has been written or discarded.
+		if begin, ok := logger.(archiveCaptureBeginner); ok {
+			budget := begin.BeginCapture(requestInfo.RequestID)
+			logging.AttachArchiveCapture(c, budget)
+			defer budget.Release()
+		}
 		c.Writer = wrapper
 		attachRequestLogSources(c, logger, loggerEnabled && hasMatchedRoute)
 		deferredCapture := attachDeferredRequestBodyCapture(c.Request, logger, requestInfo, false, false)
@@ -123,6 +130,11 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 func isAbortHandlerPanic(recovered any) bool {
 	err, ok := recovered.(error)
 	return ok && errors.Is(err, http.ErrAbortHandler)
+}
+
+// archiveCaptureBeginner is implemented by the request archive.
+type archiveCaptureBeginner interface {
+	BeginCapture(requestID string) *logging.ArchiveCaptureBudget
 }
 
 type fileBodySourceFactory interface {
