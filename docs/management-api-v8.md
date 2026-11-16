@@ -139,6 +139,7 @@ retain the corresponding business operation's fields.
 | `/observability/logs/errors/<name>` | GET | Download an error-log file. |
 | `/observability/logs/requests/<id>` | GET | Get a request log. |
 | `/observability/usage/api-keys` | GET | Get API-key usage. |
+| `/api-key-labels` | GET, PUT | Read or replace display labels for client API keys. See [API key labels](#api-key-labels). |
 | `/observability/usage/queue` | GET | Get queued usage events. |
 | `/credentials` | GET, POST, DELETE | List, upload, or delete credential files. |
 | `/credentials/models` | GET | Get credential models. |
@@ -159,6 +160,26 @@ retain the corresponding business operation's fields.
 | `/plugins/store` | GET | List the plugin store (supports optional `?refresh=true` to bypass cached release checks). |
 | `/plugins/store/<id>/install` | POST | Install or update a plugin. |
 | `/plugins/<id>/quota` | GET, POST, DELETE | Read, fetch, or reset plugin quota. |
+
+### API key labels
+
+`/api-key-labels` stores display names for client API keys. Keys are addressed by a
+fingerprint, so raw keys are never sent.
+
+- Fingerprint syntax: `key:sha256:` followed by exactly 16 lowercase hex digits (the first
+  half of SHA-256 over the raw key bytes). Other values get 400. The server checks syntax
+  only and cannot tell a hash from a fingerprint-shaped raw key.
+- `GET` returns `{"api-key-labels": {"<fingerprint>": "<label>"}}` with an `ETag`.
+- `PUT` replaces the whole map. The body must be a JSON object. Empty, `null`, and non-object
+  bodies get 400. `{}` clears all labels. A blank label removes that key's label.
+- `PUT` with `If-Match` must name the current `ETag`, or it gets 412 and the current `ETag`.
+  Without `If-Match` the write is unconditional.
+- Storage is `management-api-key-labels.json` in `WRITABLE_PATH`, or next to `config.yaml`,
+  written with mode 0600. A null, empty, or invalid file returns 500 until it is fixed or removed.
+- Requests in one process serialize per labels file, so concurrent handlers on the same path
+  cannot both pass `If-Match`. Run one server process per labels file: locking does not span
+  processes, and two processes can each pass `If-Match` and lose an update.
+- Back it up with `config.yaml`.
 
 ## OAuth
 
