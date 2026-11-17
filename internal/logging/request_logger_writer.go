@@ -165,6 +165,7 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		requestTimestamp,
 		apiResponseTimestamp,
 	)
+	reportLogFileSize(logFile, l.onWritten)
 	if errClose := logFile.Close(); errClose != nil {
 		log.WithError(errClose).Warn("failed to close request log file")
 		if writeErr == nil {
@@ -239,6 +240,7 @@ func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[
 	// Create streaming writer
 	writer := &FileStreamingLogWriter{
 		logsDir:          l.logsDir,
+		onWritten:        l.onWritten,
 		logFilename:      filename,
 		url:              url,
 		method:           method,
@@ -314,6 +316,16 @@ func (l *FileRequestLogger) generateFilename(url string, requestID ...string) st
 	// final component must never be able to climb out of the log directory.
 	name := fmt.Sprintf("%s%s-%s-%s.log", l.filePrefix, sanitized, timestamp, idPart)
 	return filepath.Base(name)
+}
+
+// reportLogFileSize passes the size of a written, still open log file to fn.
+func reportLogFileSize(logFile *os.File, fn func(size int64)) {
+	if fn == nil {
+		return
+	}
+	if info, errStat := logFile.Stat(); errStat == nil {
+		fn(info.Size())
+	}
 }
 
 // createUniqueLogFile atomically opens a unique log file within dir. If a file with filename already exists,

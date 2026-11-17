@@ -16,6 +16,8 @@ import (
 // It spools streaming response chunks to a temporary file to avoid retaining large responses in memory.
 // The final log file is assembled when Close is called.
 type FileStreamingLogWriter struct {
+	// onWritten, when set, receives the size of the completed log file.
+	onWritten func(size int64)
 	// lossless queues every chunk instead of dropping under load. Set only by the request archive.
 	lossless bool
 	// logsDir is the target directory for log files.
@@ -253,6 +255,7 @@ func (w *FileStreamingLogWriter) Close() error {
 	}
 
 	writeErr := w.writeFinalLog(logFile)
+	reportLogFileSize(logFile, w.onWritten)
 	if errClose := logFile.Close(); errClose != nil {
 		log.WithError(errClose).Warn("failed to close request log file")
 		if writeErr == nil {
