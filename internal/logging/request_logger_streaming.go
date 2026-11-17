@@ -17,6 +17,8 @@ import (
 // The final log file is assembled when Close is called.
 type FileStreamingLogWriter struct {
 	lossless bool
+	// onWritten, when set, receives the size of the completed log file.
+	onWritten func(size int64)
 	// logsDir is the target directory for log files.
 	logsDir string
 
@@ -252,6 +254,7 @@ func (w *FileStreamingLogWriter) Close() error {
 	}
 
 	writeErr := w.writeFinalLog(logFile)
+	reportLogFileSize(logFile, w.onWritten)
 	if errClose := logFile.Close(); errClose != nil {
 		log.WithError(errClose).Warn("failed to close request log file")
 		if writeErr == nil {

@@ -148,6 +148,9 @@ type FileRequestLogger struct {
 	errorLogsMaxFiles int
 
 	homeEnabled bool
+
+	// onWritten, when set, receives the size of each completed log file.
+	onWritten func(size int64)
 }
 
 // NewFileRequestLogger creates a new file-based request logger.
