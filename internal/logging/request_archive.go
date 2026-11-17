@@ -40,6 +40,11 @@ const (
 	// archiveFilePrefix starts every archive log name. Retention matches this
 	// prefix, so a log another tool places in the directory is never deleted.
 	archiveFilePrefix = "cpa-archive-"
+	// archiveAgeSweepInterval is the shortest gap between age-retention sweeps.
+	archiveAgeSweepInterval = 5 * time.Minute
+	// archivePruneHeadroomDivisor makes a size sweep free limit/20 below the
+	// limit, so an archive at its cap is not rescanned after every write.
+	archivePruneHeadroomDivisor = 20
 	// archiveCaptureContextKey stores the per-request ArchiveCaptureBudget on the Gin context.
 	archiveCaptureContextKey = "ARCHIVE_CAPTURE_BUDGET"
 	// archiveCredentialTailWindow bounds how far back a cut looks for a partial credential prefix.
@@ -66,13 +71,23 @@ var archiveDecompressAttempts atomic.Int64
 // does not expose FileBodySource: upstream sections stay in memory until they
 // can be redacted, so unmasked credentials never enter temporary log files.
 type RequestArchive struct {
-	file        *FileRequestLogger
-	cfg         atomic.Pointer[config.Config]
-	enabled     atomic.Bool
-	secretsMu   sync.RWMutex
-	secrets     func() []string
+	file       *FileRequestLogger
+	cfg        atomic.Pointer[config.Config]
+	enabled    atomic.Bool
+	secretsMu  sync.RWMutex
+	secrets    func() []string
+	startupErr error
+	// retentionMu serializes retention sweeps. Requests never take it.
 	retentionMu sync.Mutex
-	startupErr  error
+	// totalBytes is the running size of completed archive files. Each write adds
+	// to it and each sweep resynchronizes it with the directory.
+	totalBytes atomic.Int64
+	// sweeping is set while a background sweep runs, so triggers coalesce.
+	sweeping atomic.Bool
+	// sweeps tracks background sweeps so tests can wait for them.
+	sweeps sync.WaitGroup
+	// lastSweep is the clock time of the latest sweep, in Unix nanoseconds.
+	lastSweep atomic.Int64
 	// activeCaptures counts requests that hold a capture slot.
 	activeCaptures atomic.Int64
 	// begunMu guards begun, the captures started by the middleware and keyed by request ID.
@@ -95,6 +110,7 @@ func NewRequestArchive(cfg *config.Config, configDir, logsDir string) *RequestAr
 	}
 	a := &RequestArchive{file: NewFileRequestLogger(true, dir, "", 0), clock: time.Now}
 	a.file.filePrefix = archiveFilePrefix
+	a.file.onWritten = func(size int64) { a.totalBytes.Add(size) }
 	a.startupErr = prepareArchiveDir(dir)
 	if a.startupErr != nil {
 		log.WithError(a.startupErr).Error("request archive disabled")
@@ -312,26 +328,58 @@ func (a *RequestArchive) redactor(headers map[string][]string) *ArchiveRedactor 
 	return NewArchiveRedactor(secrets)
 }
 
+func archiveSizeLimitBytes(cfg *config.Config) int64 {
+	gb := cfg.RequestArchive.MaxSizeGB
+	if gb <= 0 {
+		gb = defaultArchiveMaxSizeGB
+	}
+	return int64(gb) * 1000000000
+}
+
+// retain runs one full retention sweep: it scans the archive directory, removes
+// expired and over-limit files, and resynchronizes the running byte total.
 func (a *RequestArchive) retain() error {
 	a.retentionMu.Lock()
 	defer a.retentionMu.Unlock()
-	return a.retainLocked()
-}
-
-func (a *RequestArchive) retainLocked() error {
 	cfg := a.cfg.Load()
+	a.lastSweep.Store(a.clock().UnixNano())
 	if days := cfg.RequestArchive.MaxAgeDays; days > 0 {
 		cutoff := a.clock().Add(-time.Duration(days) * 24 * time.Hour)
 		if _, err := removeArchiveFilesBefore(a.file.logsDir, cutoff); err != nil {
 			return err
 		}
 	}
-	gb := cfg.RequestArchive.MaxSizeGB
-	if gb <= 0 {
-		gb = defaultArchiveMaxSizeGB
+	limit := archiveSizeLimitBytes(cfg)
+	before := a.totalBytes.Load()
+	_, total, err := pruneLogDir(a.file.logsDir, limit, limit-limit/archivePruneHeadroomDivisor, "", isArchiveLogFileName)
+	if err != nil {
+		return err
 	}
-	_, err := enforceLogDirSizeLimitMatching(a.file.logsDir, int64(gb)*1000000000, "", isArchiveLogFileName)
-	return err
+	// Adjust by the difference, so writes counted during the scan are kept.
+	a.totalBytes.Add(total - before)
+	return nil
+}
+
+// scheduleRetention starts a background sweep when the running total is over
+// the size limit or an age sweep is due. The check is O(1) and at most one
+// sweep runs at a time, so the request path never scans the directory.
+func (a *RequestArchive) scheduleRetention() {
+	cfg := a.cfg.Load()
+	due := a.totalBytes.Load() > archiveSizeLimitBytes(cfg)
+	if !due && cfg.RequestArchive.MaxAgeDays > 0 {
+		due = a.clock().UnixNano()-a.lastSweep.Load() >= int64(archiveAgeSweepInterval)
+	}
+	if !due || !a.sweeping.CompareAndSwap(false, true) {
+		return
+	}
+	a.sweeps.Add(1)
+	go func() {
+		defer a.sweeps.Done()
+		defer a.sweeping.Store(false)
+		if err := a.retain(); err != nil {
+			log.WithError(err).Warn("logging: request archive retention failed")
+		}
+	}()
 }
 
 // isArchiveLogFileName matches completed archive logs, including error-prefixed
@@ -586,13 +634,12 @@ func (a *RequestArchive) LogRequestWithOptions(url, method string, headers map[s
 		}
 		return admitRedacted(&budget, data, r.secrets, marker)
 	}
-	a.retentionMu.Lock()
-	defer a.retentionMu.Unlock()
 	err := a.file.LogRequest(string(r.Bytes([]byte(url))), method, r.Headers(headers), bounded(r.Bytes(body)), status, safeHeaders, bounded(r.Transcript(decoded)), bounded(r.Transcript(ws)), bounded(r.Bytes(upstreamRequest)), bounded(r.Transcript(upstreamResponse)), bounded(r.Transcript(upstreamWS)), nil, string(r.Bytes([]byte(id))), started, received)
 	if err != nil {
 		return err
 	}
-	return a.retainLocked()
+	a.scheduleRetention()
+	return nil
 }
 
 // decompressArchiveBody decodes a compressed non-streaming body for masking. Output
@@ -824,12 +871,11 @@ func (w *archiveStream) Close() error {
 			w.StreamingLogWriter.WriteChunkAsync(chunk)
 		}
 	}
-	w.archive.retentionMu.Lock()
-	defer w.archive.retentionMu.Unlock()
 	if err := w.StreamingLogWriter.Close(); err != nil {
 		return err
 	}
-	return w.archive.retainLocked()
+	w.archive.scheduleRetention()
+	return nil
 }
 
 // Discard drops the stream without writing a log file. The response writer calls

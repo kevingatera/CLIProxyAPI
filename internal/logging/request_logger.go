@@ -151,6 +151,9 @@ type FileRequestLogger struct {
 	// archive sets it so its retention can match archive files only.
 	filePrefix string
 
+	// onWritten, when set, receives the size of each completed log file.
+	onWritten func(size int64)
+
 	homeEnabled bool
 }
 

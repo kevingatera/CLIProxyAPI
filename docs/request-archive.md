@@ -53,9 +53,13 @@ directory are never deleted.
 ## Retention
 
 Completed archive files (`cpa-archive-*.log` and `error-cpa-archive-*.log`) in
-the archive directory are removed at startup and after each completed request. Expired files go first, then the
-oldest files until the directory fits `max-size-gb`. `max-size-gb` uses
-decimal bytes: 30 GB is 30,000,000,000 bytes.
+the archive directory are removed at startup and by a background sweep, never
+on the request path. Each completed request adds its file size to a running
+total. When the total passes `max-size-gb`, one sweep scans the directory and
+removes the oldest files until it is 5% under the limit. With `max-age-days`
+set, a sweep also runs after a request once five minutes have passed since the
+last one, and removes expired files first. `max-size-gb` uses decimal bytes:
+30 GB is 30,000,000,000 bytes.
 
 Temporary capture files and the marker file are never removed by retention.
 With no traffic, expired files stay until the next request or restart.

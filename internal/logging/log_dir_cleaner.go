@@ -78,22 +78,30 @@ func enforceLogDirSizeLimit(logDir string, maxBytes int64, protectedPath string)
 // enforceLogDirSizeLimitMatching deletes the oldest files that match, until the
 // matching files fit in maxBytes. Files that do not match are never touched.
 func enforceLogDirSizeLimitMatching(logDir string, maxBytes int64, protectedPath string, match func(string) bool) (int, error) {
+	deleted, _, err := pruneLogDir(logDir, maxBytes, maxBytes, protectedPath, match)
+	return deleted, err
+}
+
+// pruneLogDir deletes the oldest files that match until they fit in targetBytes,
+// but only when they hold more than maxBytes. Files that do not match are never
+// touched. It also returns the bytes the matching files still hold.
+func pruneLogDir(logDir string, maxBytes, targetBytes int64, protectedPath string, match func(string) bool) (int, int64, error) {
 	if maxBytes <= 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 
 	dir := strings.TrimSpace(logDir)
 	if dir == "" {
-		return 0, nil
+		return 0, 0, nil
 	}
 	dir = filepath.Clean(dir)
 
 	entries, errRead := os.ReadDir(dir)
 	if errRead != nil {
 		if os.IsNotExist(errRead) {
-			return 0, nil
+			return 0, 0, nil
 		}
-		return 0, errRead
+		return 0, 0, errRead
 	}
 
 	protected := strings.TrimSpace(protectedPath)
@@ -136,7 +144,7 @@ func enforceLogDirSizeLimitMatching(logDir string, maxBytes int64, protectedPath
 	}
 
 	if total <= maxBytes {
-		return 0, nil
+		return 0, total, nil
 	}
 
 	sort.Slice(files, func(i, j int) bool {
@@ -145,7 +153,7 @@ func enforceLogDirSizeLimitMatching(logDir string, maxBytes int64, protectedPath
 
 	deleted := 0
 	for _, file := range files {
-		if total <= maxBytes {
+		if total <= targetBytes {
 			break
 		}
 		if protected != "" && filepath.Clean(file.path) == protected {
@@ -159,7 +167,7 @@ func enforceLogDirSizeLimitMatching(logDir string, maxBytes int64, protectedPath
 		deleted++
 	}
 
-	return deleted, nil
+	return deleted, total, nil
 }
 
 func isLogFileName(name string) bool {
