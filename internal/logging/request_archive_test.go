@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -472,5 +473,112 @@ func TestRequestArchiveStreamingErrorTextIsMasked(t *testing.T) {
 	}
 	if !strings.Contains(log, "API ERROR RESPONSE") || !strings.Contains(log, "upstream rejected") {
 		t.Fatal("masked error section missing")
+	}
+}
+
+func TestRequestArchiveConcurrentWritesDoNotWaitForRetention(t *testing.T) {
+	cfg := &config.Config{RequestArchive: config.RequestArchiveConfig{Enabled: true, MaxSizeGB: 30}}
+	logsDir := t.TempDir()
+	dir := filepath.Join(logsDir, "requests")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	const existing, writers = 3000, 32
+	for i := range existing {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("old-%d.log", i)), []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := NewRequestArchive(cfg, "", logsDir)
+	if got := a.totalBytes.Load(); got != existing {
+		t.Fatalf("startup total %d, want %d", got, existing)
+	}
+	startupSweep := a.lastSweep.Load()
+
+	// Hold the retention lock as a running sweep would. Writers that needed it,
+	// or that queued behind each other, could not finish.
+	a.retentionMu.Lock()
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for i := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- a.LogRequest("/v1/models", "GET", nil, nil, 401, nil, []byte("denied"), nil, nil, nil, nil, nil, fmt.Sprintf("id%d", i), time.Now(), time.Now())
+		}()
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("writers blocked behind the retention lock")
+	}
+	a.retentionMu.Unlock()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != existing+writers {
+		t.Fatalf("files %d, want %d", len(entries), existing+writers)
+	}
+	// Under the limit no write scans the directory.
+	if a.sweeping.Load() || a.lastSweep.Load() != startupSweep {
+		t.Fatal("a write under the size limit started a retention sweep")
+	}
+	if got := a.totalBytes.Load(); got <= existing {
+		t.Fatalf("running total %d did not grow", got)
+	}
+}
+
+func TestRequestArchiveBackgroundRetentionPrunesOverLimit(t *testing.T) {
+	cfg := &config.Config{RequestArchive: config.RequestArchiveConfig{Enabled: true, MaxSizeGB: 1}}
+	logsDir := t.TempDir()
+	dir := filepath.Join(logsDir, "requests")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// Two sparse files sit just under the 1 GB limit, so the next write crosses it.
+	old := time.Now().Add(-time.Hour)
+	for i, name := range []string{"oldest.log", "older.log"} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Truncate(p, 499999990); err != nil {
+			t.Fatal(err)
+		}
+		ts := old.Add(time.Duration(i) * time.Minute)
+		_ = os.Chtimes(p, ts, ts)
+	}
+	a := NewRequestArchive(cfg, "", logsDir)
+	if _, err := os.Stat(filepath.Join(dir, "oldest.log")); err != nil {
+		t.Fatal("startup pruned an archive under its limit")
+	}
+	if err := a.LogRequest("/v1/chat/completions", "POST", nil, []byte("request"), 200, nil, []byte("response"), nil, nil, nil, nil, nil, "id", time.Now(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	a.sweeps.Wait()
+	if _, err := os.Stat(filepath.Join(dir, "oldest.log")); !os.IsNotExist(err) {
+		t.Fatal("oldest log retained over the size limit")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "older.log")); err != nil {
+		t.Fatal("retention removed more than it needed")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("files %d, want older.log and the new record", len(entries))
+	}
+	if got := a.totalBytes.Load(); got <= 499999990 || got > 500100000 {
+		t.Fatalf("running total %d not resynchronized", got)
 	}
 }

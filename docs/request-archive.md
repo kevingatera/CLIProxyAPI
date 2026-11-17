@@ -34,12 +34,15 @@ GB uses decimal bytes: 30 GB is 30,000,000,000 bytes.
 
 ## Retention
 
-Completed logs are removed at startup and after each completed request: first
-any file older than `max-age-days`, then the oldest files until the directory
-fits `max-size-gb`. Retention applies only to `.log` and `.log.gz` files in the
-dedicated archive directory. Active temporary captures and unrelated metadata
-are not removed. With no traffic, expired files stay until the next request or
-restart. Files are owner-only (0600) and the directory is 0700.
+Retention runs at startup and in the background, never on the request path.
+Each completed request adds its file size to a running total. When the total
+passes `max-size-gb`, one background sweep scans the directory and removes the
+oldest files until it is 5% under the limit. With `max-age-days` set, a sweep
+also runs after a request once five minutes have passed since the last one, and
+removes older files first. Retention applies only to `.log` and `.log.gz` files
+in the dedicated archive directory. Active temporary captures and unrelated
+metadata are not removed. With no traffic, expired files stay until the next
+request or restart. Files are owner-only (0600) and the directory is 0700.
 
 ## Memory bounds
 
